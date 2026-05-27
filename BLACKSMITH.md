@@ -4,6 +4,8 @@ This repository is the Blacksmith-owned fork of
 `github.com/buchgr/bazel-remote/v2` used by the FA agent's embedded Buck2
 cache.
 
+Repository location: `github.com/useblacksmith/bazel-remote`.
+
 ## Upstream base
 
 - Module: `github.com/buchgr/bazel-remote/v2`
