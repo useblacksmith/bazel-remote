@@ -1,0 +1,11 @@
+Blacksmith local fork notice
+
+This repository contains a local fork of github.com/buchgr/bazel-remote/v2.
+The fork was initialized from upstream version v2.4.4 at commit
+54d1782d72b291937988edad32c9752abe269d8e.
+
+The upstream project is licensed under the Apache License, Version 2.0. See
+LICENSE in this repository.
+
+Blacksmith-specific changes should preserve this notice and document any
+updated upstream base or applied security patch in BLACKSMITH.md.
