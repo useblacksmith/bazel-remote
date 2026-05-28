@@ -16,13 +16,13 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
-	asset "github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/remote/asset/v1"
-	pb "github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
-	"github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/semver"
+	asset "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/asset/v1"
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+	"github.com/buchgr/bazel-remote/v2/genproto/build/bazel/semver"
 
-	"github.com/useblacksmith/bazel-remote/v2/cache"
-	"github.com/useblacksmith/bazel-remote/v2/cache/disk"
-	"github.com/useblacksmith/bazel-remote/v2/utils/validate"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk"
+	"github.com/buchgr/bazel-remote/v2/utils/validate"
 
 	_ "github.com/mostynb/go-grpc-compression/snappy" // Register snappy
 	_ "github.com/mostynb/go-grpc-compression/zstd"   // and zstd support.

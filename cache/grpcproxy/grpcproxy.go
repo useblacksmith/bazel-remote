@@ -10,16 +10,16 @@ import (
 	"io"
 	"strings"
 
-	"github.com/useblacksmith/bazel-remote/v2/cache"
-	"github.com/useblacksmith/bazel-remote/v2/utils/backendproxy"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	asset "github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/remote/asset/v1"
-	pb "github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+	asset "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/asset/v1"
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 	bs "google.golang.org/genproto/googleapis/bytestream"
 )
 

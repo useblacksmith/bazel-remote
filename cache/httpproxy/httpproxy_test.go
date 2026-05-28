@@ -16,11 +16,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/useblacksmith/bazel-remote/v2/cache"
-	"github.com/useblacksmith/bazel-remote/v2/cache/disk"
-	"github.com/useblacksmith/bazel-remote/v2/cache/disk/casblob"
-	"github.com/useblacksmith/bazel-remote/v2/cache/disk/zstdimpl"
-	testutils "github.com/useblacksmith/bazel-remote/v2/utils"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
+	testutils "github.com/buchgr/bazel-remote/v2/utils"
 )
 
 type testServer struct {

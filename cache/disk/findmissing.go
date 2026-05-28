@@ -5,9 +5,9 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/useblacksmith/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache"
 
-	pb "github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/useblacksmith/bazel-remote/v2/utils/tempfile"
+	"github.com/buchgr/bazel-remote/v2/utils/tempfile"
 )
 
 func TestTempfileCreator(t *testing.T) {

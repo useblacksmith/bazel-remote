@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/useblacksmith/bazel-remote/v2/utils/idle"
+	"github.com/buchgr/bazel-remote/v2/utils/idle"
 )
 
 func TestIdleTimer(t *testing.T) {

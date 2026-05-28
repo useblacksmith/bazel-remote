@@ -10,11 +10,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/useblacksmith/bazel-remote/v2/cache"
-	testutils "github.com/useblacksmith/bazel-remote/v2/utils"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	testutils "github.com/buchgr/bazel-remote/v2/utils"
 	"google.golang.org/protobuf/proto"
 
-	pb "github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 )
 
 func TestFilterNonNIl(t *testing.T) {

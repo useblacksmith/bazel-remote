@@ -14,11 +14,11 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/useblacksmith/bazel-remote/v2/cache"
-	"github.com/useblacksmith/bazel-remote/v2/cache/disk"
-	"github.com/useblacksmith/bazel-remote/v2/utils"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk"
+	"github.com/buchgr/bazel-remote/v2/utils"
 
-	pb "github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 	"google.golang.org/protobuf/proto"
 )
 

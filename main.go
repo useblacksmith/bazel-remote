@@ -15,13 +15,13 @@ import (
 
 	auth "github.com/abbot/go-http-auth"
 
-	"github.com/useblacksmith/bazel-remote/v2/cache/disk"
+	"github.com/buchgr/bazel-remote/v2/cache/disk"
 
-	"github.com/useblacksmith/bazel-remote/v2/config"
-	"github.com/useblacksmith/bazel-remote/v2/server"
-	"github.com/useblacksmith/bazel-remote/v2/utils/flags"
-	"github.com/useblacksmith/bazel-remote/v2/utils/idle"
-	"github.com/useblacksmith/bazel-remote/v2/utils/rlimit"
+	"github.com/buchgr/bazel-remote/v2/config"
+	"github.com/buchgr/bazel-remote/v2/server"
+	"github.com/buchgr/bazel-remote/v2/utils/flags"
+	"github.com/buchgr/bazel-remote/v2/utils/idle"
+	"github.com/buchgr/bazel-remote/v2/utils/rlimit"
 
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"

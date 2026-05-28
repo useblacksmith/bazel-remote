@@ -5,7 +5,7 @@ This repository is the Blacksmith-owned fork of upstream
 cache.
 
 Repository location: `github.com/useblacksmith/bazel-remote`.
-Published module path: `github.com/useblacksmith/bazel-remote/v2`.
+Go module path: `github.com/buchgr/bazel-remote/v2`.
 
 ## Upstream base
 
@@ -18,9 +18,10 @@ Published module path: `github.com/useblacksmith/bazel-remote/v2`.
 
 ## Local use
 
-FA replaces `github.com/buchgr/bazel-remote/v2` with a tagged version of this
-module. Existing FA imports intentionally keep the upstream import path so this
-fork remains behavior-preserving until Blacksmith-specific changes are needed.
+FA replaces `github.com/buchgr/bazel-remote/v2` with a tagged version fetched
+from `github.com/useblacksmith/bazel-remote/v2`. Existing FA imports
+intentionally keep the upstream import path so this fork remains
+behavior-preserving until Blacksmith-specific changes are needed.
 
 ## Security and upstream patch tracking
 

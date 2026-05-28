@@ -4,9 +4,9 @@ import (
 	"context"
 	"io"
 
-	"github.com/useblacksmith/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache"
 
-	pb "github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
