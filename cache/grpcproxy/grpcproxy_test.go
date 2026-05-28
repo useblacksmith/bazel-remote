@@ -14,17 +14,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/buchgr/bazel-remote/v2/cache"
-	"github.com/buchgr/bazel-remote/v2/cache/disk"
-	"github.com/buchgr/bazel-remote/v2/server"
+	"github.com/useblacksmith/bazel-remote/v2/cache"
+	"github.com/useblacksmith/bazel-remote/v2/cache/disk"
+	"github.com/useblacksmith/bazel-remote/v2/server"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
 
-	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
-	testutils "github.com/buchgr/bazel-remote/v2/utils"
+	pb "github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+	testutils "github.com/useblacksmith/bazel-remote/v2/utils"
 	bs "google.golang.org/genproto/googleapis/bytestream"
 )
 

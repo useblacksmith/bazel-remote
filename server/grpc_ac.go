@@ -10,10 +10,10 @@ import (
 	"net"
 	"strings"
 
-	"github.com/buchgr/bazel-remote/v2/cache"
-	"github.com/buchgr/bazel-remote/v2/utils/validate"
+	"github.com/useblacksmith/bazel-remote/v2/cache"
+	"github.com/useblacksmith/bazel-remote/v2/utils/validate"
 
-	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+	pb "github.com/useblacksmith/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"

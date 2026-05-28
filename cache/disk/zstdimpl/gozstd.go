@@ -4,7 +4,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/buchgr/bazel-remote/v2/utils/zstdpool"
+	"github.com/useblacksmith/bazel-remote/v2/utils/zstdpool"
 
 	"github.com/klauspost/compress/zstd"
 	syncpool "github.com/mostynb/zstdpool-syncpool"

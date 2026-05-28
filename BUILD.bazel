@@ -5,7 +5,7 @@ load("@rules_pkg//:pkg.bzl", "pkg_tar")
 
 gazelle(
     name = "gazelle",
-    prefix = "github.com/buchgr/bazel-remote/v2",
+    prefix = "github.com/useblacksmith/bazel-remote/v2",
 )
 
 gazelle(
@@ -21,7 +21,7 @@ gazelle(
 go_library(
     name = "go_default_library",
     srcs = ["main.go"],
-    importpath = "github.com/buchgr/bazel-remote/v2",
+    importpath = "github.com/useblacksmith/bazel-remote/v2",
     visibility = ["//visibility:private"],
     deps = [
         "//cache/disk:go_default_library",

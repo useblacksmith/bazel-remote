@@ -3,7 +3,7 @@ package backendproxy
 import (
 	"io"
 
-	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/useblacksmith/bazel-remote/v2/cache"
 )
 
 type UploadReq struct {

@@ -5,7 +5,7 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/buchgr/bazel-remote/v2/utils/idle"
+	"github.com/useblacksmith/bazel-remote/v2/utils/idle"
 )
 
 // GrpcIdleTimer wraps an idle.Timer, and provides gRPC interceptors that

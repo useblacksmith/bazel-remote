@@ -8,7 +8,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 
-	"github.com/buchgr/bazel-remote/v2/cache/azblobproxy"
+	"github.com/useblacksmith/bazel-remote/v2/cache/azblobproxy"
 )
 
 type AzBlobStorageConfig struct {
