@@ -27,7 +27,7 @@ type s3Cache struct {
 	errorLogger      cache.Logger
 	v2mode           bool
 	updateTimestamps bool
-	objectKey        func(hash string, kind cache.EntryKind) string
+	objectKey        func(prefix string, hash string, kind cache.EntryKind) string
 }
 
 var (
@@ -97,13 +97,9 @@ func New(
 	}
 
 	if c.v2mode {
-		c.objectKey = func(hash string, kind cache.EntryKind) string {
-			return objectKeyV2(c.prefix, hash, kind)
-		}
+		c.objectKey = objectKeyV2
 	} else {
-		c.objectKey = func(hash string, kind cache.EntryKind) string {
-			return objectKeyV1(c.prefix, hash, kind)
-		}
+		c.objectKey = objectKeyV1
 	}
 
 	c.uploadQueue = backendproxy.StartUploaders(c, numUploaders, maxQueuedUploads)
@@ -135,6 +131,38 @@ func objectKeyV1(prefix string, hash string, kind cache.EntryKind) string {
 	return path.Join(prefix, kind.String(), hash[:2], hash)
 }
 
+func (c *s3Cache) prefixForContext(ctx context.Context, kind cache.EntryKind) (string, bool, bool) {
+	if kind == cache.CAS {
+		if prefix, ok := cache.StoragePrefixFromContext(ctx); ok {
+			return prefix, true, cache.StoragePrefixRequiredFromContext(ctx)
+		}
+		return c.prefix, false, cache.StoragePrefixRequiredFromContext(ctx)
+	}
+	return c.prefix, false, false
+}
+
+func (c *s3Cache) objectKeyForPrefix(prefix string, hash string, kind cache.EntryKind) string {
+	return c.objectKey(prefix, hash, kind)
+}
+
+func (c *s3Cache) objectKeyForContext(ctx context.Context, hash string, kind cache.EntryKind) string {
+	prefix, _, _ := c.prefixForContext(ctx, kind)
+	return c.objectKeyForPrefix(prefix, hash, kind)
+}
+
+func (c *s3Cache) logMissingRequiredStoragePrefix(operation string, kind cache.EntryKind, hash string) {
+	if c.errorLogger == nil {
+		return
+	}
+	c.errorLogger.Printf(
+		"S3 %s missing request-scoped storage prefix for %s %s; using configured prefix %q",
+		operation,
+		kind.String(),
+		hash,
+		c.prefix,
+	)
+}
+
 // Helper function for logging responses
 func logResponse(log cache.Logger, method, bucket, key string, err error) {
 	status := "OK"
@@ -146,14 +174,29 @@ func logResponse(log cache.Logger, method, bucket, key string, err error) {
 }
 
 func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
+	prefix := item.StoragePrefix
+	requestScopedPrefix := item.RequestScopedStoragePrefix
+	requirePrefix := item.RequireStoragePrefix
+	if item.Kind != cache.CAS {
+		prefix = c.prefix
+		requestScopedPrefix = false
+		requirePrefix = false
+	}
+	if prefix == "" {
+		prefix = c.prefix
+	}
+	if requirePrefix && !requestScopedPrefix {
+		c.logMissingRequiredStoragePrefix("UPLOAD", item.Kind, item.Hash)
+	}
+	objectKey := c.objectKeyForPrefix(prefix, item.Hash, item.Kind)
 	_, err := c.mcore.PutObject(
 		context.Background(),
-		c.bucket,                          // bucketName
-		c.objectKey(item.Hash, item.Kind), // objectName
-		item.Rc,                           // reader
-		item.SizeOnDisk,                   // objectSize
-		"",                                // md5base64
-		"",                                // sha256
+		c.bucket,        // bucketName
+		objectKey,       // objectName
+		item.Rc,         // reader
+		item.SizeOnDisk, // objectSize
+		"",              // md5base64
+		"",              // sha256
 		minio.PutObjectOptions{
 			UserMetadata: map[string]string{
 				"Content-Type": "application/octet-stream",
@@ -161,7 +204,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 		}, // metadata
 	)
 
-	logResponse(c.accessLogger, "UPLOAD", c.bucket, c.objectKey(item.Hash, item.Kind), err)
+	logResponse(c.accessLogger, "UPLOAD", c.bucket, objectKey, err)
 
 	item.Rc.Close()
 }
@@ -171,14 +214,18 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		rc.Close()
 		return
 	}
+	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
 
 	select {
 	case c.uploadQueue <- backendproxy.UploadReq{
-		Hash:        hash,
-		LogicalSize: logicalSize,
-		SizeOnDisk:  sizeOnDisk,
-		Kind:        kind,
-		Rc:          rc,
+		Hash:                       hash,
+		LogicalSize:                logicalSize,
+		SizeOnDisk:                 sizeOnDisk,
+		Kind:                       kind,
+		Rc:                         rc,
+		StoragePrefix:              prefix,
+		RequestScopedStoragePrefix: requestScopedPrefix,
+		RequireStoragePrefix:       requirePrefix,
 	}:
 	default:
 		c.errorLogger.Printf("too many uploads queued\n")
@@ -204,30 +251,35 @@ func (c *s3Cache) UpdateModificationTimestamp(ctx context.Context, bucket string
 }
 
 func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (io.ReadCloser, int64, error) {
+	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
+	if requirePrefix && !requestScopedPrefix {
+		c.logMissingRequiredStoragePrefix("DOWNLOAD", kind, hash)
+	}
+	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 
 	rc, info, _, err := c.mcore.GetObject(
 		ctx,
 		c.bucket,                 // bucketName
-		c.objectKey(hash, kind),  // objectName
+		objectKey,                // objectName
 		minio.GetObjectOptions{}, // opts
 	)
 	if err != nil {
 		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
 			cacheMisses.Inc()
-			logResponse(c.accessLogger, "DOWNLOAD", c.bucket, c.objectKey(hash, kind), errNotFound)
+			logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, errNotFound)
 			return nil, -1, nil
 		}
 		cacheMisses.Inc()
-		logResponse(c.accessLogger, "DOWNLOAD", c.bucket, c.objectKey(hash, kind), err)
+		logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, err)
 		return nil, -1, err
 	}
 	cacheHits.Inc()
 
 	if c.updateTimestamps {
-		c.UpdateModificationTimestamp(ctx, c.bucket, c.objectKey(hash, kind))
+		c.UpdateModificationTimestamp(ctx, c.bucket, objectKey)
 	}
 
-	logResponse(c.accessLogger, "DOWNLOAD", c.bucket, c.objectKey(hash, kind), nil)
+	logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, nil)
 
 	if kind == cache.CAS && c.v2mode {
 		return casblob.ExtractLogicalSize(rc)
@@ -239,11 +291,16 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (bool, int64) {
 	size := int64(-1)
 	exists := false
+	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
+	if requirePrefix && !requestScopedPrefix {
+		c.logMissingRequiredStoragePrefix("CONTAINS", kind, hash)
+	}
+	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 
 	s, err := c.mcore.StatObject(
 		ctx,
 		c.bucket,                  // bucketName
-		c.objectKey(hash, kind),   // objectName
+		objectKey,                 // objectName
 		minio.StatObjectOptions{}, // opts
 	)
 
@@ -254,7 +311,7 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 		size = s.Size
 	}
 
-	logResponse(c.accessLogger, "CONTAINS", c.bucket, c.objectKey(hash, kind), err)
+	logResponse(c.accessLogger, "CONTAINS", c.bucket, objectKey, err)
 
 	return exists, size
 }
