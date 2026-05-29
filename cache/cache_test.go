@@ -18,7 +18,7 @@ func TestLookupKeyForContextIncludesStoragePrefix(t *testing.T) {
 	ctx := WithStoragePrefix(context.Background(), prefix)
 
 	result := LookupKeyForContext(ctx, CAS, "hash")
-	expected := "cas/hash/storage_prefix/" + StoragePrefixID(prefix)
+	expected := "cas/hash/" + StoragePrefixID(prefix)
 	if result != expected {
 		t.Fatalf("LookupKeyForContext() = %q, want %q", result, expected)
 	}
@@ -29,7 +29,7 @@ func TestLookupKeyForContextIncludesStoragePrefixForActionCache(t *testing.T) {
 	ctx := WithStoragePrefix(context.Background(), prefix)
 
 	result := LookupKeyForContext(ctx, AC, "hash")
-	expected := "ac/hash/storage_prefix/" + StoragePrefixID(prefix)
+	expected := "ac/hash/" + StoragePrefixID(prefix)
 	if result != expected {
 		t.Fatalf("LookupKeyForContext() = %q, want %q", result, expected)
 	}

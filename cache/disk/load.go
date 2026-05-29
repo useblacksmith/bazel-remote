@@ -403,7 +403,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 
 				storagePrefixID := ""
 				cacheDir := d
-				if strings.HasPrefix(d, "storage_prefix/") {
+				if strings.HasPrefix(d, scopedStorageRootDir+"/") {
 					parts := strings.SplitN(d, "/", 3)
 					if len(parts) != 3 {
 						return fmt.Errorf("Unrecognised storage prefix cache dir: %q", dirName)
@@ -505,7 +505,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 		if rootRel != "" {
 			root = path.Join(c.dir, rootRel)
 		}
-		scopedRoot := strings.HasPrefix(rootRel, "storage_prefix/")
+		scopedRoot := strings.HasPrefix(rootRel, scopedStorageRootDir+"/")
 		des, err := os.ReadDir(root)
 		if err != nil {
 			return err
@@ -525,7 +525,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 			if name == lostAndFound {
 				continue
 			}
-			if rootRel == "" && name == "storage_prefix" {
+			if rootRel == "" && name == scopedStorageRootDir {
 				continue
 			}
 
@@ -578,7 +578,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 	for _, de := range des {
 		name := de.Name()
 
-		if name == "storage_prefix" {
+		if name == scopedStorageRootDir {
 			storagePrefixRoot := path.Join(c.dir, name)
 			prefixDirs, err := os.ReadDir(storagePrefixRoot)
 			if err != nil {
