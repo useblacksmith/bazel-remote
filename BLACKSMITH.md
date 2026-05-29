@@ -37,11 +37,13 @@ resolve the authorized VM/job namespace to the full physical prefix:
 ```
 
 and attach it with `cache.WithStoragePrefix`. The S3 proxy then uses that
-request-scoped prefix when constructing CAS object keys. Action Cache remains
-isolated by bazel-remote's existing instance-name key remapping. The local disk
-cache CAS key also includes the request-scoped prefix, so a new repo/generation
-namespace does not hit stale CAS entries before reaching the S3 backend. This
-lets a single shared bazel-remote process route CAS puts/gets to the correct
+request-scoped prefix when constructing Action Cache and CAS object keys. Action
+Cache also remains isolated by bazel-remote's existing instance-name key
+remapping, so the physical prefix is additive and gives cache-clear/delete
+operations a visible repo/generation boundary. The local disk cache AC/CAS keys
+also include the request-scoped prefix, so a new repo/generation namespace does
+not hit stale local entries before reaching the S3 backend. This lets a single
+shared bazel-remote process route AC/CAS puts/gets to the correct
 repo/generation namespace while preserving existing Buck2 behavior.
 
 For Bazel requests, FA should also mark the request with

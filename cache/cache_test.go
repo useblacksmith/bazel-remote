@@ -24,11 +24,22 @@ func TestLookupKeyForContextIncludesStoragePrefix(t *testing.T) {
 	}
 }
 
-func TestLookupKeyForContextIgnoresStoragePrefixForActionCache(t *testing.T) {
-	ctx := WithStoragePrefix(context.Background(), "bazel/production/us-east-1/42/987654/v0")
+func TestLookupKeyForContextIncludesStoragePrefixForActionCache(t *testing.T) {
+	prefix := "bazel/production/us-east-1/42/987654/v0"
+	ctx := WithStoragePrefix(context.Background(), prefix)
 
 	result := LookupKeyForContext(ctx, AC, "hash")
-	expected := "ac/hash"
+	expected := "ac/hash/storage_prefix/" + StoragePrefixID(prefix)
+	if result != expected {
+		t.Fatalf("LookupKeyForContext() = %q, want %q", result, expected)
+	}
+}
+
+func TestLookupKeyForContextIgnoresStoragePrefixForRaw(t *testing.T) {
+	ctx := WithStoragePrefix(context.Background(), "bazel/production/us-east-1/42/987654/v0")
+
+	result := LookupKeyForContext(ctx, RAW, "hash")
+	expected := "raw/hash"
 	if result != expected {
 		t.Fatalf("LookupKeyForContext() = %q, want %q", result, expected)
 	}

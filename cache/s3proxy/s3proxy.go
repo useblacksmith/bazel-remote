@@ -132,7 +132,7 @@ func objectKeyV1(prefix string, hash string, kind cache.EntryKind) string {
 }
 
 func (c *s3Cache) prefixForContext(ctx context.Context, kind cache.EntryKind) (string, bool, bool) {
-	if kind == cache.CAS {
+	if kind != cache.RAW {
 		if prefix, ok := cache.StoragePrefixFromContext(ctx); ok {
 			return prefix, true, cache.StoragePrefixRequiredFromContext(ctx)
 		}
@@ -177,7 +177,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	prefix := item.StoragePrefix
 	requestScopedPrefix := item.RequestScopedStoragePrefix
 	requirePrefix := item.RequireStoragePrefix
-	if item.Kind != cache.CAS {
+	if item.Kind == cache.RAW {
 		prefix = c.prefix
 		requestScopedPrefix = false
 		requirePrefix = false

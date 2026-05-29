@@ -505,7 +505,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 		if rootRel != "" {
 			root = path.Join(c.dir, rootRel)
 		}
-		scopedCASRoot := strings.HasPrefix(rootRel, "storage_prefix/")
+		scopedRoot := strings.HasPrefix(rootRel, "storage_prefix/")
 		des, err := os.ReadDir(root)
 		if err != nil {
 			return err
@@ -529,7 +529,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 				continue
 			}
 
-			if scopedCASRoot && name != "cas.v2" {
+			if scopedRoot && name != "ac.v2" && name != "cas.v2" {
 				return fmt.Errorf("Unexpected dir: %s", path.Join(rootRel, name))
 			}
 			if name != "ac.v2" && name != "cas.v2" && name != "raw.v2" {
