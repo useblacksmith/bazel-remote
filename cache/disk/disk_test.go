@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -95,6 +96,210 @@ func TestCacheBasics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestStoragePrefixScopesLocalDiskCache(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cacheDir := tempDir(t)
+	defer os.RemoveAll(cacheDir)
+
+	testCacheI, err := New(cacheDir, 1024*1024, WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testCache := testCacheI.(*diskCache)
+
+	repoAContext := cache.WithStoragePrefix(ctx, "bazel/production/us-east-1/42/987654/v0")
+	repoBContext := cache.WithStoragePrefix(ctx, "bazel/production/us-east-1/42/111111/v0")
+
+	err = testCache.Put(repoAContext, cache.CAS, contentsHash, contentsLength, strings.NewReader(contents))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rdr, sizeBytes, err := testCache.Get(repoAContext, cache.CAS, contentsHash, contentsLength, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rdr == nil {
+		t.Fatal("expected repo A to hit its own local CAS entry")
+	}
+	rdr.Close()
+	if sizeBytes != contentsLength {
+		t.Fatalf("repo A local CAS size = %d, want %d", sizeBytes, contentsLength)
+	}
+
+	rdr, _, err = testCache.Get(repoBContext, cache.CAS, contentsHash, contentsLength, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rdr != nil {
+		rdr.Close()
+		t.Fatal("expected repo B to miss repo A's local CAS entry")
+	}
+
+	found, _ := testCache.Contains(repoBContext, cache.CAS, contentsHash, contentsLength)
+	if found {
+		t.Fatal("expected repo B Contains to miss repo A's local CAS entry")
+	}
+
+	missing, err := testCache.FindMissingCasBlobs(repoAContext, []*pb.Digest{{Hash: contentsHash, SizeBytes: contentsLength}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("expected repo A FindMissingCasBlobs to find scoped CAS entry, got %d missing", len(missing))
+	}
+
+	missing, err = testCache.FindMissingCasBlobs(repoBContext, []*pb.Digest{{Hash: contentsHash, SizeBytes: contentsLength}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 1 {
+		t.Fatalf("expected repo B FindMissingCasBlobs to miss repo A scoped CAS entry, got %d missing", len(missing))
+	}
+}
+
+func TestStoragePrefixDoesNotScopeActionCacheLocalDiskCache(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cacheDir := tempDir(t)
+	defer os.RemoveAll(cacheDir)
+
+	testCacheI, err := New(cacheDir, 1024*1024, WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testCache := testCacheI.(*diskCache)
+
+	repoAContext := cache.WithStoragePrefix(ctx, "bazel/production/us-east-1/42/987654/v0")
+	repoBContext := cache.WithStoragePrefix(ctx, "bazel/production/us-east-1/42/111111/v0")
+
+	err = testCache.Put(repoAContext, cache.AC, contentsHash, contentsLength, strings.NewReader(contents))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rdr, _, err := testCache.Get(repoBContext, cache.AC, contentsHash, contentsLength, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rdr == nil {
+		t.Fatal("expected action cache to ignore request-scoped storage prefix")
+	}
+	rdr.Close()
+}
+
+func TestStoragePrefixScopesLocalDiskCacheAcrossRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cacheDir := tempDir(t)
+	defer os.RemoveAll(cacheDir)
+
+	repoAContext := cache.WithStoragePrefix(ctx, "bazel/production/us-east-1/42/987654/v0")
+	repoBContext := cache.WithStoragePrefix(ctx, "bazel/production/us-east-1/42/111111/v0")
+
+	testCacheI, err := New(cacheDir, 1024*1024, WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testCache := testCacheI.(*diskCache)
+
+	err = testCache.Put(repoAContext, cache.CAS, contentsHash, contentsLength, strings.NewReader(contents))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restartedCacheI, err := New(cacheDir, 1024*1024, WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedCache := restartedCacheI.(*diskCache)
+
+	rdr, _, err := restartedCache.Get(repoAContext, cache.CAS, contentsHash, contentsLength, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rdr == nil {
+		t.Fatal("expected repo A to reload its scoped local CAS entry")
+	}
+	rdr.Close()
+
+	rdr, _, err = restartedCache.Get(repoBContext, cache.CAS, contentsHash, contentsLength, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rdr != nil {
+		rdr.Close()
+		t.Fatal("expected repo B to miss repo A's scoped local CAS entry after restart")
+	}
+
+	rdr, _, err = restartedCache.Get(ctx, cache.CAS, contentsHash, contentsLength, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rdr != nil {
+		rdr.Close()
+		t.Fatal("expected unscoped context to miss repo A's scoped local CAS entry after restart")
+	}
+}
+
+func TestStoragePrefixEvictsScopedCASFile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cacheDir := tempDir(t)
+	defer os.RemoveAll(cacheDir)
+
+	prefix := "bazel/production/us-east-1/42/987654/v0"
+	repoContext := cache.WithStoragePrefix(ctx, prefix)
+	data1, hash1 := testutils.RandomDataAndHash(128)
+	data2, hash2 := testutils.RandomDataAndHash(128)
+
+	testCacheI, err := New(cacheDir, BlockSize, WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testCache := testCacheI.(*diskCache)
+
+	err = testCache.Put(repoContext, cache.CAS, hash1, int64(len(data1)), bytes.NewReader(data1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := filepath.Join(
+		cacheDir,
+		"storage_prefix",
+		cache.StoragePrefixID(prefix),
+		"cas.v2",
+		hash1[:2],
+		hash1+"-128-*",
+	)
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected one scoped CAS file matching %s, found %d", pattern, len(matches))
+	}
+	scopedCASFile := matches[0]
+
+	err = testCache.Put(repoContext, cache.CAS, hash2, int64(len(data2)), bytes.NewReader(data2))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(scopedCASFile); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected scoped CAS file to be removed after eviction: %s", scopedCASFile)
 }
 
 func TestCachePutWrongSize(t *testing.T) {

@@ -154,17 +154,34 @@ func (c *diskCache) updateCacheAgeMetric() {
 
 func (c *diskCache) getElementPath(key Key, value lruItem) string {
 	ks := key.(string)
-	hash := ks[len(ks)-sha256.Size*2:]
+	kind, hash, storagePrefixID := lookupKeyParts(ks)
+	return filepath.Join(c.dir, c.FileLocationForStoragePrefixID(storagePrefixID, kind, value.legacy, hash, value.size, value.random))
+}
+
+func lookupKeyParts(key string) (cache.EntryKind, string, string) {
 	var kind cache.EntryKind = cache.AC
-	if strings.HasPrefix(ks, "cas") {
+	var hash string
+	var storagePrefixID string
+	parts := strings.Split(key, "/")
+	if len(parts) >= 2 {
+		hash = parts[1]
+		if len(parts) >= 4 && parts[2] == "storage_prefix" {
+			storagePrefixID = parts[3]
+		}
+	}
+	if hash == "" && len(key) >= sha256.Size*2 {
+		hash = key[len(key)-sha256.Size*2:]
+	}
+
+	if strings.HasPrefix(key, "cas") {
 		kind = cache.CAS
-	} else if strings.HasPrefix(ks, "ac") {
+	} else if strings.HasPrefix(key, "ac") {
 		kind = cache.AC
-	} else if strings.HasPrefix(ks, "raw") {
+	} else if strings.HasPrefix(key, "raw") {
 		kind = cache.RAW
 	}
 
-	return filepath.Join(c.dir, c.FileLocation(kind, value.legacy, hash, value.size, value.random))
+	return kind, hash, storagePrefixID
 }
 
 func (c *diskCache) removeFile(f string) {
@@ -196,6 +213,22 @@ func (c *diskCache) FileLocationBase(kind cache.EntryKind, legacy bool, hash str
 	return fmt.Sprintf("cas.v2/%s/%s-%d", hash[:2], hash, size)
 }
 
+func (c *diskCache) FileLocationBaseForStoragePrefixID(storagePrefixID string, kind cache.EntryKind, legacy bool, hash string, size int64) string {
+	location := c.FileLocationBase(kind, legacy, hash, size)
+	if kind != cache.CAS || storagePrefixID == "" {
+		return location
+	}
+	return path.Join("storage_prefix", storagePrefixID, location)
+}
+
+func (c *diskCache) FileLocationBaseForContext(ctx context.Context, kind cache.EntryKind, legacy bool, hash string, size int64) string {
+	if kind != cache.CAS {
+		return c.FileLocationBase(kind, legacy, hash, size)
+	}
+	storagePrefixID, _ := cache.StoragePrefixIDFromContext(ctx)
+	return c.FileLocationBaseForStoragePrefixID(storagePrefixID, kind, legacy, hash, size)
+}
+
 func (c *diskCache) FileLocation(kind cache.EntryKind, legacy bool, hash string, size int64, random string) string {
 	if kind == cache.RAW {
 		return path.Join("raw.v2", hash[:2], hash+"-"+random)
@@ -210,6 +243,22 @@ func (c *diskCache) FileLocation(kind cache.EntryKind, legacy bool, hash string,
 	}
 
 	return fmt.Sprintf("cas.v2/%s/%s-%d-%s", hash[:2], hash, size, random)
+}
+
+func (c *diskCache) FileLocationForStoragePrefixID(storagePrefixID string, kind cache.EntryKind, legacy bool, hash string, size int64, random string) string {
+	location := c.FileLocation(kind, legacy, hash, size, random)
+	if kind != cache.CAS || storagePrefixID == "" {
+		return location
+	}
+	return path.Join("storage_prefix", storagePrefixID, location)
+}
+
+func (c *diskCache) FileLocationForContext(ctx context.Context, kind cache.EntryKind, legacy bool, hash string, size int64, random string) string {
+	if kind != cache.CAS {
+		return c.FileLocation(kind, legacy, hash, size, random)
+	}
+	storagePrefixID, _ := cache.StoragePrefixIDFromContext(ctx)
+	return c.FileLocationForStoragePrefixID(storagePrefixID, kind, legacy, hash, size, random)
 }
 
 // Put stores a stream of `size` bytes from `r` into the cache.
@@ -241,7 +290,7 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 		return nil
 	}
 
-	key := cache.LookupKey(kind, hash)
+	key := cache.LookupKeyForContext(ctx, kind, hash)
 
 	var tf *os.File // Tempfile.
 	var blobFile string
@@ -299,7 +348,10 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 	legacy := kind == cache.CAS && c.storageMode == casblob.Identity
 
 	// Final destination, if all goes well.
-	filePath := path.Join(c.dir, c.FileLocationBase(kind, legacy, hash, size))
+	filePath := path.Join(c.dir, c.FileLocationBaseForContext(ctx, kind, legacy, hash, size))
+	if err := os.MkdirAll(path.Dir(filePath), os.ModePerm); err != nil {
+		return internalErr(err)
+	}
 
 	// We will download to this temporary file.
 	tf, random, err := tfc.Create(filePath, legacy)
@@ -424,18 +476,18 @@ func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSiz
 // but that we can try the proxy backend.
 //
 // This function assumes that only CAS blobs are requested in zstd form.
-func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (io.ReadCloser, int64, bool, error) {
+func (c *diskCache) availableOrTryProxy(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (io.ReadCloser, int64, bool, error) {
 	locked := true
 	var err error
 	c.mu.Lock()
 
-	key := cache.LookupKey(kind, hash)
+	key := cache.LookupKeyForContext(ctx, kind, hash)
 	item, available := c.lru.Get(key)
 	if available {
 		c.mu.Unlock() // We expect a cache hit below.
 		locked = false
 
-		blobPath := path.Join(c.dir, c.FileLocation(kind, item.legacy, hash, item.size, item.random))
+		blobPath := path.Join(c.dir, c.FileLocationForContext(ctx, kind, item.legacy, hash, item.size, item.random))
 
 		if !isSizeMismatch(size, item.size) {
 			var f *os.File
@@ -447,7 +499,7 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 				c.mu.Lock()
 				item, available = c.lru.Get(key)
 				if available {
-					blobPath = path.Join(c.dir, c.FileLocation(kind, item.legacy, hash, item.size, item.random))
+					blobPath = path.Join(c.dir, c.FileLocationForContext(ctx, kind, item.legacy, hash, item.size, item.random))
 					f, err = os.Open(blobPath)
 				}
 				c.mu.Unlock()
@@ -575,7 +627,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	}
 
 	var err error
-	key := cache.LookupKey(kind, hash)
+	key := cache.LookupKeyForContext(ctx, kind, hash)
 
 	var tf *os.File // Tempfile we will write to.
 	var blobFile string
@@ -608,7 +660,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		}
 	}()
 
-	f, foundSize, tryProxy, err := c.availableOrTryProxy(kind, hash, size, offset, zstd)
+	f, foundSize, tryProxy, err := c.availableOrTryProxy(ctx, kind, hash, size, offset, zstd)
 	if err != nil {
 		return nil, -1, internalErr(err)
 	}
@@ -644,7 +696,10 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	legacy := kind == cache.CAS && c.storageMode == casblob.Identity
 
-	blobPathBase := path.Join(c.dir, c.FileLocationBase(kind, legacy, hash, foundSize))
+	blobPathBase := path.Join(c.dir, c.FileLocationBaseForContext(ctx, kind, legacy, hash, foundSize))
+	if err := os.MkdirAll(path.Dir(blobPathBase), os.ModePerm); err != nil {
+		return nil, -1, internalErr(err)
+	}
 	tf, random, err := tfc.Create(blobPathBase, legacy)
 	if err != nil {
 		return nil, -1, internalErr(err)
@@ -718,7 +773,7 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 	}
 
 	foundSize := int64(-1)
-	key := cache.LookupKey(kind, hash)
+	key := cache.LookupKeyForContext(ctx, kind, hash)
 
 	c.mu.Lock()
 	item, exists := c.lru.Get(key)

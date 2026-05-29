@@ -85,7 +85,7 @@ func (c *diskCache) findMissingCasBlobsInternal(ctx context.Context, blobs []*pb
 			remaining = remaining[batchSize:]
 		}
 
-		numMissing := c.findMissingLocalCAS(chunk)
+		numMissing := c.findMissingLocalCAS(ctx, chunk)
 		if numMissing == 0 {
 			continue
 		}
@@ -171,7 +171,7 @@ func filterNonNil(blobs []*pb.Digest) []*pb.Digest {
 
 // Set blobs that exist in the disk cache to nil, and return the number
 // of missing blobs.
-func (c *diskCache) findMissingLocalCAS(blobs []*pb.Digest) int {
+func (c *diskCache) findMissingLocalCAS(ctx context.Context, blobs []*pb.Digest) int {
 	var exists bool
 	var item lruItem
 	var key string
@@ -187,7 +187,7 @@ func (c *diskCache) findMissingLocalCAS(blobs []*pb.Digest) int {
 		}
 
 		foundSize := int64(-1)
-		key = cache.LookupKey(cache.CAS, blobs[i].Hash)
+		key = cache.LookupKeyForContext(ctx, cache.CAS, blobs[i].Hash)
 		item, exists = c.lru.Get(key)
 		if exists {
 			foundSize = item.size

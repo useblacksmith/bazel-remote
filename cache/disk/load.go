@@ -401,13 +401,24 @@ func (c *diskCache) scanDir() (scanResult, error) {
 			for d := range dc {
 				dirName := path.Join(c.dir, d)
 
-				var lookupKeyPrefix string
-				if strings.HasPrefix(d, "cas.v2/") {
-					lookupKeyPrefix = "cas/"
-				} else if strings.HasPrefix(d, "ac.v2/") {
-					lookupKeyPrefix = "ac/"
-				} else if strings.HasPrefix(d, "raw.v2/") {
-					lookupKeyPrefix = "raw/"
+				storagePrefixID := ""
+				cacheDir := d
+				if strings.HasPrefix(d, "storage_prefix/") {
+					parts := strings.SplitN(d, "/", 3)
+					if len(parts) != 3 {
+						return fmt.Errorf("Unrecognised storage prefix cache dir: %q", dirName)
+					}
+					storagePrefixID = parts[1]
+					cacheDir = parts[2]
+				}
+
+				var lookupKeyKind cache.EntryKind
+				if strings.HasPrefix(cacheDir, "cas.v2/") {
+					lookupKeyKind = cache.CAS
+				} else if strings.HasPrefix(cacheDir, "ac.v2/") {
+					lookupKeyKind = cache.AC
+				} else if strings.HasPrefix(cacheDir, "raw.v2/") {
+					lookupKeyKind = cache.RAW
 				} else {
 					return fmt.Errorf("Unrecognised directory in cache dir: %q", dirName)
 				}
@@ -452,7 +463,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 					item[n] = &item_values[n]
 					metadata[n] = &metadata_values[n]
 
-					metadata[n].lookupKey = lookupKeyPrefix + hash
+					metadata[n].lookupKey = cache.LookupKeyForStoragePrefixID(storagePrefixID, lookupKeyKind, hash)
 
 					item[n].sizeOnDisk = info.Size()
 					item[n].size = item[n].sizeOnDisk
@@ -486,15 +497,113 @@ func (c *diskCache) scanDir() (scanResult, error) {
 		})
 	}
 
+	dre := regexp.MustCompile(`^[a-f0-9]{2}$`)
+	storagePrefixDRE := regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+	queueCacheDirs := func(rootRel string) error {
+		root := c.dir
+		if rootRel != "" {
+			root = path.Join(c.dir, rootRel)
+		}
+		scopedCASRoot := strings.HasPrefix(rootRel, "storage_prefix/")
+		des, err := os.ReadDir(root)
+		if err != nil {
+			return err
+		}
+
+		for _, de := range des {
+			name := de.Name()
+
+			if !de.IsDir() {
+				if strings.ToLower(name) == lowercaseDSStoreFile {
+					continue
+				}
+
+				return fmt.Errorf("Unexpected file: %s", path.Join(rootRel, name))
+			}
+
+			if name == lostAndFound {
+				continue
+			}
+			if rootRel == "" && name == "storage_prefix" {
+				continue
+			}
+
+			if scopedCASRoot && name != "cas.v2" {
+				return fmt.Errorf("Unexpected dir: %s", path.Join(rootRel, name))
+			}
+			if name != "ac.v2" && name != "cas.v2" && name != "raw.v2" {
+				return fmt.Errorf("Unexpected dir: %s", path.Join(rootRel, name))
+			}
+
+			dir := path.Join(root, name)
+			des2, err := os.ReadDir(dir)
+			if err != nil {
+				return err
+			}
+
+			for _, de2 := range des2 {
+				name2 := de2.Name()
+
+				dirPath := path.Join(rootRel, name, name2)
+
+				if !de2.IsDir() {
+					if strings.ToLower(name2) == lowercaseDSStoreFile {
+						continue
+					}
+
+					return fmt.Errorf("Unexpected file: %s", dirPath)
+				}
+
+				if name2 == lostAndFound {
+					continue
+				}
+
+				if !dre.MatchString(name2) {
+					return fmt.Errorf("Unexpected dir: %s", dirPath)
+				}
+
+				dc <- dirPath
+			}
+		}
+		return nil
+	}
+
 	des, err := os.ReadDir(c.dir)
 	if err != nil {
 		return scanResult{}, fmt.Errorf("Failed to read cache dir %q: %w", c.dir, err)
 	}
 
-	dre := regexp.MustCompile(`^[a-f0-9]{2}$`)
-
+	hasUnscopedDirs := false
 	for _, de := range des {
 		name := de.Name()
+
+		if name == "storage_prefix" {
+			storagePrefixRoot := path.Join(c.dir, name)
+			prefixDirs, err := os.ReadDir(storagePrefixRoot)
+			if err != nil {
+				return scanResult{}, err
+			}
+			for _, prefixDir := range prefixDirs {
+				prefixID := prefixDir.Name()
+				if !prefixDir.IsDir() {
+					if strings.ToLower(prefixID) == lowercaseDSStoreFile {
+						continue
+					}
+					return scanResult{}, fmt.Errorf("Unexpected file: %s", path.Join(name, prefixID))
+				}
+				if prefixID == lostAndFound {
+					continue
+				}
+				if !storagePrefixDRE.MatchString(prefixID) {
+					return scanResult{}, fmt.Errorf("Unexpected storage prefix dir: %s", path.Join(name, prefixID))
+				}
+				if err := queueCacheDirs(path.Join(name, prefixID)); err != nil {
+					return scanResult{}, err
+				}
+			}
+			continue
+		}
 
 		if !de.IsDir() {
 			if strings.ToLower(name) == lowercaseDSStoreFile {
@@ -512,34 +621,12 @@ func (c *diskCache) scanDir() (scanResult, error) {
 			return scanResult{}, fmt.Errorf("Unexpected dir: %s", name)
 		}
 
-		dir := path.Join(c.dir, name)
-		des2, err := os.ReadDir(dir)
-		if err != nil {
+		hasUnscopedDirs = true
+	}
+
+	if hasUnscopedDirs {
+		if err := queueCacheDirs(""); err != nil {
 			return scanResult{}, err
-		}
-
-		for _, de2 := range des2 {
-			name2 := de2.Name()
-
-			dirPath := path.Join(name, name2)
-
-			if !de2.IsDir() {
-				if strings.ToLower(name) == lowercaseDSStoreFile {
-					continue
-				}
-
-				return scanResult{}, fmt.Errorf("Unexpected file: %s", dirPath)
-			}
-
-			if name2 == lostAndFound {
-				continue
-			}
-
-			if !dre.MatchString(name2) {
-				return scanResult{}, fmt.Errorf("Unexpected dir: %s", dirPath)
-			}
-
-			dc <- dirPath
 		}
 	}
 
@@ -589,7 +676,7 @@ func (c *diskCache) loadExistingFiles(maxSizeBytes int64) error {
 	for i := 0; i < len(result.item); i++ {
 		ok := c.lru.Add(result.metadata[i].lookupKey, *result.item[i])
 		if !ok {
-			err = os.Remove(filepath.Join(c.dir, result.metadata[i].lookupKey))
+			err = os.Remove(c.getElementPath(result.metadata[i].lookupKey, *result.item[i]))
 			if err != nil {
 				return err
 			}

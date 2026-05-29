@@ -23,6 +23,32 @@ from `github.com/useblacksmith/bazel-remote/v2`. Existing FA imports
 intentionally keep the upstream import path so this fork remains
 behavior-preserving until Blacksmith-specific changes are needed.
 
+## Build cache storage prefixing
+
+BLA-4006 keeps the default upstream behavior unless FA attaches an explicit
+request-scoped storage prefix to the cache operation context.
+
+The existing configured S3 prefix remains the default path for Buck2 and any
+other callers that do not opt in to request-scoped routing. For Bazel, FA should
+resolve the authorized VM/job namespace to the full physical prefix:
+
+```text
+<MINIO_PREFIX>/bazel/<environment>/<region>/<model_installation_id>/<repository_id>/<generation>
+```
+
+and attach it with `cache.WithStoragePrefix`. The S3 proxy then uses that
+request-scoped prefix when constructing CAS object keys. Action Cache remains
+isolated by bazel-remote's existing instance-name key remapping. The local disk
+cache CAS key also includes the request-scoped prefix, so a new repo/generation
+namespace does not hit stale CAS entries before reaching the S3 backend. This
+lets a single shared bazel-remote process route CAS puts/gets to the correct
+repo/generation namespace while preserving existing Buck2 behavior.
+
+For Bazel requests, FA should also mark the request with
+`cache.WithRequiredStoragePrefix`. If a request reaches the S3 proxy with that
+marker but without a request-scoped prefix, bazel-remote logs that it is falling
+back to the configured process-wide prefix. Buck2 should not set this marker.
+
 ## Security and upstream patch tracking
 
 Track upstream security fixes by monitoring the upstream repository's releases,
