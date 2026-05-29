@@ -46,6 +46,19 @@ not hit stale local entries before reaching the S3 backend. This lets a single
 shared bazel-remote process route AC/CAS puts/gets to the correct
 repo/generation namespace while preserving existing Buck2 behavior.
 
+Local disk cache entries store the full request prefix as a stable hash so the
+LRU can distinguish identical AC/CAS digests from different repo/generation
+namespaces without using S3-style slash-heavy prefixes in local paths:
+
+```text
+storage_prefix/<sha256(prefix)>/ac.v2/...
+storage_prefix/<sha256(prefix)>/cas.v2/...
+```
+
+This `storage_prefix` marker is only a local disk layout detail. MinIO/S3 object
+keys use the real request-scoped prefix directly, so broad remote deletion still
+targets `<MINIO_PREFIX>/bazel/.../<generation>/`.
+
 For Bazel requests, FA should also mark the request with
 `cache.WithRequiredStoragePrefix`. If a request reaches the S3 proxy with that
 marker but without a request-scoped prefix, bazel-remote logs that it is falling

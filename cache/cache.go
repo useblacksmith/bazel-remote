@@ -133,7 +133,7 @@ func LookupKeyForContext(ctx context.Context, kind EntryKind, hash string) strin
 func LookupKeyForStoragePrefixID(prefixID string, kind EntryKind, hash string) string {
 	key := LookupKey(kind, hash)
 	if (kind == AC || kind == CAS) && prefixID != "" {
-		return key + "/storage_prefix/" + prefixID
+		return key + "/" + prefixID
 	}
 	return key
 }
