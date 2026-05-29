@@ -89,7 +89,6 @@ type diskCache struct {
 
 const sha256HashStrSize = sha256.Size * 2 // Two hex characters per byte.
 const emptySha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-const scopedStorageRootDir = "storage_prefix"
 
 func internalErr(err error) *cache.Error {
 	return &cache.Error{
@@ -219,7 +218,7 @@ func (c *diskCache) FileLocationBaseForStoragePrefixID(storagePrefixID string, k
 	if kind == cache.RAW || storagePrefixID == "" {
 		return location
 	}
-	return path.Join(scopedStorageRootDir, storagePrefixID, location)
+	return path.Join(storagePrefixID, location)
 }
 
 func (c *diskCache) FileLocationBaseForContext(ctx context.Context, kind cache.EntryKind, legacy bool, hash string, size int64) string {
@@ -251,7 +250,7 @@ func (c *diskCache) FileLocationForStoragePrefixID(storagePrefixID string, kind 
 	if kind == cache.RAW || storagePrefixID == "" {
 		return location
 	}
-	return path.Join(scopedStorageRootDir, storagePrefixID, location)
+	return path.Join(storagePrefixID, location)
 }
 
 func (c *diskCache) FileLocationForContext(ctx context.Context, kind cache.EntryKind, legacy bool, hash string, size int64, random string) string {

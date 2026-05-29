@@ -396,6 +396,11 @@ func (c *diskCache) scanDir() (scanResult, error) {
 	// root dir of some unix style filesystems.
 	const lostAndFound = "lost+found"
 
+	dre := regexp.MustCompile(`^[a-f0-9]{2}$`)
+	// Request-scoped AC/CAS files live under <sha256(prefix)>/{ac.v2,cas.v2}/...
+	// so local disk paths stay compact while the S3 backend uses the full prefix.
+	storagePrefixDRE := regexp.MustCompile(`^[a-f0-9]{64}$`)
+
 	for i := 0; i < numWorkers; i++ {
 		dirListers.Go(func() error {
 			for d := range dc {
@@ -403,13 +408,10 @@ func (c *diskCache) scanDir() (scanResult, error) {
 
 				storagePrefixID := ""
 				cacheDir := d
-				if strings.HasPrefix(d, scopedStorageRootDir+"/") {
-					parts := strings.SplitN(d, "/", 3)
-					if len(parts) != 3 {
-						return fmt.Errorf("Unrecognised storage prefix cache dir: %q", dirName)
-					}
-					storagePrefixID = parts[1]
-					cacheDir = parts[2]
+				parts := strings.SplitN(d, "/", 3)
+				if len(parts) == 3 && storagePrefixDRE.MatchString(parts[0]) {
+					storagePrefixID = parts[0]
+					cacheDir = path.Join(parts[1], parts[2])
 				}
 
 				var lookupKeyKind cache.EntryKind
@@ -497,15 +499,12 @@ func (c *diskCache) scanDir() (scanResult, error) {
 		})
 	}
 
-	dre := regexp.MustCompile(`^[a-f0-9]{2}$`)
-	storagePrefixDRE := regexp.MustCompile(`^[a-f0-9]{64}$`)
-
 	queueCacheDirs := func(rootRel string) error {
 		root := c.dir
 		if rootRel != "" {
 			root = path.Join(c.dir, rootRel)
 		}
-		scopedRoot := strings.HasPrefix(rootRel, scopedStorageRootDir+"/")
+		scopedRoot := storagePrefixDRE.MatchString(rootRel)
 		des, err := os.ReadDir(root)
 		if err != nil {
 			return err
@@ -525,7 +524,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 			if name == lostAndFound {
 				continue
 			}
-			if rootRel == "" && name == scopedStorageRootDir {
+			if rootRel == "" && storagePrefixDRE.MatchString(name) {
 				continue
 			}
 
@@ -578,29 +577,9 @@ func (c *diskCache) scanDir() (scanResult, error) {
 	for _, de := range des {
 		name := de.Name()
 
-		if name == scopedStorageRootDir {
-			storagePrefixRoot := path.Join(c.dir, name)
-			prefixDirs, err := os.ReadDir(storagePrefixRoot)
-			if err != nil {
+		if de.IsDir() && storagePrefixDRE.MatchString(name) {
+			if err := queueCacheDirs(name); err != nil {
 				return scanResult{}, err
-			}
-			for _, prefixDir := range prefixDirs {
-				prefixID := prefixDir.Name()
-				if !prefixDir.IsDir() {
-					if strings.ToLower(prefixID) == lowercaseDSStoreFile {
-						continue
-					}
-					return scanResult{}, fmt.Errorf("Unexpected file: %s", path.Join(name, prefixID))
-				}
-				if prefixID == lostAndFound {
-					continue
-				}
-				if !storagePrefixDRE.MatchString(prefixID) {
-					return scanResult{}, fmt.Errorf("Unexpected storage prefix dir: %s", path.Join(name, prefixID))
-				}
-				if err := queueCacheDirs(path.Join(name, prefixID)); err != nil {
-					return scanResult{}, err
-				}
 			}
 			continue
 		}
