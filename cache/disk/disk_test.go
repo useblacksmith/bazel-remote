@@ -306,7 +306,6 @@ func TestStoragePrefixEvictsScopedCASFile(t *testing.T) {
 
 	pattern := filepath.Join(
 		cacheDir,
-		scopedStorageRootDir,
 		cache.StoragePrefixID(prefix),
 		"cas.v2",
 		hash1[:2],
