@@ -162,7 +162,7 @@ func TestStoragePrefixScopesLocalDiskCache(t *testing.T) {
 	}
 }
 
-func TestStoragePrefixDoesNotScopeActionCacheLocalDiskCache(t *testing.T) {
+func TestStoragePrefixScopesActionCacheLocalDiskCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -183,14 +183,47 @@ func TestStoragePrefixDoesNotScopeActionCacheLocalDiskCache(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rdr, _, err := testCache.Get(repoBContext, cache.AC, contentsHash, contentsLength, 0)
+	rdr, _, err := testCache.Get(repoAContext, cache.AC, contentsHash, contentsLength, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rdr == nil {
-		t.Fatal("expected action cache to ignore request-scoped storage prefix")
+		t.Fatal("expected repo A to hit its own scoped local AC entry")
 	}
 	rdr.Close()
+
+	rdr, _, err = testCache.Get(repoBContext, cache.AC, contentsHash, contentsLength, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rdr != nil {
+		rdr.Close()
+		t.Fatal("expected repo B to miss repo A's scoped local AC entry")
+	}
+
+	restartedCacheI, err := New(cacheDir, 1024*1024, WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedCache := restartedCacheI.(*diskCache)
+
+	rdr, _, err = restartedCache.Get(repoAContext, cache.AC, contentsHash, contentsLength, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rdr == nil {
+		t.Fatal("expected repo A to reload its scoped local AC entry")
+	}
+	rdr.Close()
+
+	rdr, _, err = restartedCache.Get(repoBContext, cache.AC, contentsHash, contentsLength, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rdr != nil {
+		rdr.Close()
+		t.Fatal("expected repo B to miss repo A's scoped local AC entry after restart")
+	}
 }
 
 func TestStoragePrefixScopesLocalDiskCacheAcrossRestart(t *testing.T) {

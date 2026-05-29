@@ -59,7 +59,7 @@ func TestObjectKeyForContextDefaultsToConfiguredPrefix(t *testing.T) {
 	}
 }
 
-func TestObjectKeyForContextUsesRequestScopedPrefixForCASOnly(t *testing.T) {
+func TestObjectKeyForContextUsesRequestScopedPrefixForACAndCAS(t *testing.T) {
 	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	repoAPrefix := "minio-prefix/bazel/production/us-east-1/42/987654/v0"
 	repoBPrefix := "minio-prefix/bazel/production/us-east-1/42/111111/v0"
@@ -94,13 +94,13 @@ func TestObjectKeyForContextUsesRequestScopedPrefixForCASOnly(t *testing.T) {
 			name:     "repo a action cache",
 			ctx:      repoAContext,
 			kind:     cache.AC,
-			expected: configuredPrefix + "/ac/ab/" + hash,
+			expected: repoAPrefix + "/ac/ab/" + hash,
 		},
 		{
 			name:     "repo b action cache",
 			ctx:      repoBContext,
 			kind:     cache.AC,
-			expected: configuredPrefix + "/ac/ab/" + hash,
+			expected: repoBPrefix + "/ac/ab/" + hash,
 		},
 	}
 
@@ -122,8 +122,8 @@ func TestObjectKeyForContextUsesRequestScopedPrefixForCASOnly(t *testing.T) {
 
 	repoAACKey := c.objectKeyForContext(repoAContext, hash, cache.AC)
 	repoBACKey := c.objectKeyForContext(repoBContext, hash, cache.AC)
-	if repoAACKey != repoBACKey {
-		t.Fatalf("action cache object keys should ignore request-scoped prefix: %s != %s", repoAACKey, repoBACKey)
+	if repoAACKey == repoBACKey {
+		t.Fatalf("same AC digest produced identical object keys for different request-scoped prefixes: %s", repoAACKey)
 	}
 }
 
@@ -152,13 +152,12 @@ func TestPutCapturesRequestScopedPrefixForAsyncUpload(t *testing.T) {
 	}
 }
 
-func TestPutIgnoresRequestScopedPrefixForActionCacheAsyncUpload(t *testing.T) {
+func TestPutCapturesRequestScopedPrefixForActionCacheAsyncUpload(t *testing.T) {
 	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	requestPrefix := "minio-prefix/bazel/production/us-east-1/42/987654/v0"
-	configuredPrefix := "minio-prefix/buck2/production/us-east-1"
 	uploadQueue := make(chan backendproxy.UploadReq, 1)
 	c := &s3Cache{
-		prefix:      configuredPrefix,
+		prefix:      "minio-prefix/buck2/production/us-east-1",
 		uploadQueue: uploadQueue,
 	}
 
@@ -168,14 +167,14 @@ func TestPutIgnoresRequestScopedPrefixForActionCacheAsyncUpload(t *testing.T) {
 
 	item := <-uploadQueue
 	defer item.Rc.Close()
-	if item.StoragePrefix != configuredPrefix {
-		t.Fatalf("queued upload StoragePrefix = %q, want %q", item.StoragePrefix, configuredPrefix)
+	if item.StoragePrefix != requestPrefix {
+		t.Fatalf("queued upload StoragePrefix = %q, want %q", item.StoragePrefix, requestPrefix)
 	}
-	if item.RequestScopedStoragePrefix {
-		t.Fatal("queued upload RequestScopedStoragePrefix = true, want false")
+	if !item.RequestScopedStoragePrefix {
+		t.Fatal("queued upload RequestScopedStoragePrefix = false, want true")
 	}
-	if item.RequireStoragePrefix {
-		t.Fatal("queued upload RequireStoragePrefix = true, want false")
+	if !item.RequireStoragePrefix {
+		t.Fatal("queued upload RequireStoragePrefix = false, want true")
 	}
 }
 

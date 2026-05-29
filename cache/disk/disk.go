@@ -215,14 +215,14 @@ func (c *diskCache) FileLocationBase(kind cache.EntryKind, legacy bool, hash str
 
 func (c *diskCache) FileLocationBaseForStoragePrefixID(storagePrefixID string, kind cache.EntryKind, legacy bool, hash string, size int64) string {
 	location := c.FileLocationBase(kind, legacy, hash, size)
-	if kind != cache.CAS || storagePrefixID == "" {
+	if kind == cache.RAW || storagePrefixID == "" {
 		return location
 	}
 	return path.Join("storage_prefix", storagePrefixID, location)
 }
 
 func (c *diskCache) FileLocationBaseForContext(ctx context.Context, kind cache.EntryKind, legacy bool, hash string, size int64) string {
-	if kind != cache.CAS {
+	if kind == cache.RAW {
 		return c.FileLocationBase(kind, legacy, hash, size)
 	}
 	storagePrefixID, _ := cache.StoragePrefixIDFromContext(ctx)
@@ -247,14 +247,14 @@ func (c *diskCache) FileLocation(kind cache.EntryKind, legacy bool, hash string,
 
 func (c *diskCache) FileLocationForStoragePrefixID(storagePrefixID string, kind cache.EntryKind, legacy bool, hash string, size int64, random string) string {
 	location := c.FileLocation(kind, legacy, hash, size, random)
-	if kind != cache.CAS || storagePrefixID == "" {
+	if kind == cache.RAW || storagePrefixID == "" {
 		return location
 	}
 	return path.Join("storage_prefix", storagePrefixID, location)
 }
 
 func (c *diskCache) FileLocationForContext(ctx context.Context, kind cache.EntryKind, legacy bool, hash string, size int64, random string) string {
-	if kind != cache.CAS {
+	if kind == cache.RAW {
 		return c.FileLocation(kind, legacy, hash, size, random)
 	}
 	storagePrefixID, _ := cache.StoragePrefixIDFromContext(ctx)
