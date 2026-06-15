@@ -18,6 +18,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+// Metrics is an optional sink for s3proxy reliability signals. It lets an
+// embedder (e.g. the Blacksmith FA agent) record events without this module
+// importing the embedder. Implementations must be safe to call from background
+// upload-worker goroutines and tolerate a nil receiver being skipped by callers.
+type Metrics interface {
+	// IncPrefixMissing is invoked when a request that required a request-scoped
+	// storage prefix did not carry one, so the configured fallback prefix was
+	// used instead (a potential cross-namespace read/write). operation is one of
+	// "UPLOAD", "DOWNLOAD", "CONTAINS".
+	IncPrefixMissing(operation string)
+}
+
 type s3Cache struct {
 	mcore            *minio.Core
 	prefix           string
@@ -25,6 +37,7 @@ type s3Cache struct {
 	uploadQueue      chan<- backendproxy.UploadReq
 	accessLogger     cache.Logger
 	errorLogger      cache.Logger
+	metrics          Metrics
 	v2mode           bool
 	updateTimestamps bool
 	objectKey        func(prefix string, hash string, kind cache.EntryKind) string
@@ -57,7 +70,8 @@ func New(
 	Region string,
 
 	storageMode string, accessLogger cache.Logger,
-	errorLogger cache.Logger, numUploaders, maxQueuedUploads int) cache.Proxy {
+	errorLogger cache.Logger, numUploaders, maxQueuedUploads int,
+	metrics Metrics) cache.Proxy {
 
 	fmt.Println("Using S3 backend.")
 
@@ -92,6 +106,7 @@ func New(
 		bucket:           Bucket,
 		accessLogger:     accessLogger,
 		errorLogger:      errorLogger,
+		metrics:          metrics,
 		v2mode:           storageMode == "zstd",
 		updateTimestamps: UpdateTimestamps,
 	}
@@ -151,6 +166,9 @@ func (c *s3Cache) objectKeyForContext(ctx context.Context, hash string, kind cac
 }
 
 func (c *s3Cache) logMissingRequiredStoragePrefix(operation string, kind cache.EntryKind, hash string) {
+	if c.metrics != nil {
+		c.metrics.IncPrefixMissing(operation)
+	}
 	if c.errorLogger == nil {
 		return
 	}

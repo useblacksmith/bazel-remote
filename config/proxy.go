@@ -150,7 +150,8 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.DisableSSL,
 			c.S3CloudStorage.UpdateTimestamps,
 			c.S3CloudStorage.Region,
-			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads)
+			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
+			nil)
 		return nil
 	}
 
