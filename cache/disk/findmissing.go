@@ -9,9 +9,14 @@ import (
 
 	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// maxConcurrentContainsChecks bounds the number of simultaneous proxy
+// Contains lookups across all FindMissingBlobs requests.
+const maxConcurrentContainsChecks = 512
 
 type proxyCheck struct {
 	wg          *sync.WaitGroup
@@ -109,26 +114,27 @@ func (c *diskCache) findMissingCasBlobsInternal(ctx context.Context, blobs []*pb
 					continue
 				}
 
-				// Adding to the containsQueue channel may have blocked on a previous iteration,
-				// so check to see if the context has cancelled.
-				select {
-				case <-ctx.Done():
+				// Acquire blocks while maxConcurrentContainsChecks checks are
+				// in flight, and returns early if the context is cancelled.
+				if err := c.containsSem.Acquire(ctx, 1); err != nil {
 					if cancelledDueToFailFast {
 						return errMissingBlob
 					}
 					return errRequestCancelled
-				default:
 				}
 
 				wg.Add(1)
-				c.containsQueue <- proxyCheck{
+				go func(req proxyCheck) {
+					defer c.containsSem.Release(1)
+					c.processContainsCheck(req)
+				}(proxyCheck{
 					wg:     &wg,
 					digest: &chunk[i],
 					ctx:    ctx,
 					// When failFast is true, onProxyMiss will have been set to a function that
 					// will cancel the context, causing the remaining proxyChecks to short-circuit.
 					onProxyMiss: cancelContextForFailFast,
-				}
+				})
 			}
 		}
 	}
@@ -206,43 +212,37 @@ func (c *diskCache) findMissingLocalCAS(blobs []*pb.Digest) int {
 	return missing
 }
 
-func (c *diskCache) containsWorker() {
-	var ok bool
-	for req := range c.containsQueue {
-		if req.ctx != nil {
-			select {
-			case <-req.ctx.Done():
-				// Fast-fail if the context has already been cancelled.
-				c.accessLogger.Printf("GRPC CAS HEAD %s CANCELLED", (*req.digest).Hash)
-				req.wg.Done()
-				continue
-			default:
-			}
-		}
+// processContainsCheck performs a single proxy Contains lookup and calls
+// req.wg.Done exactly once.
+func (c *diskCache) processContainsCheck(req proxyCheck) {
+	defer req.wg.Done()
 
-		ok, _ = c.proxy.Contains(req.ctx, cache.CAS, (*req.digest).Hash, (*req.digest).SizeBytes)
-		if ok {
-			c.accessLogger.Printf("GRPC CAS HEAD %s OK", (*req.digest).Hash)
-			// The blob exists on the proxy, remove it from the
-			// list of missing blobs.
-			*(req.digest) = nil
-		} else {
-			c.accessLogger.Printf("GRPC CAS HEAD %s NOT FOUND", (*req.digest).Hash)
-			if req.onProxyMiss != nil {
-				req.onProxyMiss()
-			}
+	if req.ctx != nil {
+		select {
+		case <-req.ctx.Done():
+			// Fast-fail if the context has already been cancelled.
+			c.accessLogger.Printf("GRPC CAS HEAD %s CANCELLED", (*req.digest).Hash)
+			return
+		default:
 		}
-		req.wg.Done()
+	}
+
+	ok, _ := c.proxy.Contains(req.ctx, cache.CAS, (*req.digest).Hash, (*req.digest).SizeBytes)
+	if ok {
+		c.accessLogger.Printf("GRPC CAS HEAD %s OK", (*req.digest).Hash)
+		// The blob exists on the proxy, remove it from the
+		// list of missing blobs.
+		*(req.digest) = nil
+	} else {
+		c.accessLogger.Printf("GRPC CAS HEAD %s NOT FOUND", (*req.digest).Hash)
+		if req.onProxyMiss != nil {
+			req.onProxyMiss()
+		}
 	}
 }
 
-func (c *diskCache) spawnContainsQueueWorkers() {
-	// TODO: make these configurable?
-	const queueSize = 2048
-	const numWorkers = 512
-
-	c.containsQueue = make(chan proxyCheck, queueSize)
-	for i := 0; i < numWorkers; i++ {
-		go c.containsWorker()
+func (c *diskCache) initContainsCheckLimiter() {
+	if c.containsSem == nil {
+		c.containsSem = semaphore.NewWeighted(maxConcurrentContainsChecks)
 	}
 }
