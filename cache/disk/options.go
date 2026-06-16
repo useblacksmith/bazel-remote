@@ -61,7 +61,7 @@ func WithProxyBackend(proxy cache.Proxy) Option {
 
 		if proxy != nil {
 			c.diskCache.proxy = proxy
-			c.diskCache.spawnContainsQueueWorkers()
+			c.diskCache.initContainsCheckLimiter()
 		}
 
 		return nil

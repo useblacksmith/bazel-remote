@@ -77,7 +77,9 @@ type diskCache struct {
 	maxBlobSize      int64
 	maxProxyBlobSize int64
 	accessLogger     *log.Logger
-	containsQueue    chan proxyCheck
+
+	// Limit the number of simultaneous proxy Contains checks.
+	containsSem *semaphore.Weighted
 
 	// Limit the number of simultaneous file removals and filesystem write
 	// operations (apart from atime updates, which we hope are fast).
