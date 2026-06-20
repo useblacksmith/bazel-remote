@@ -13,7 +13,6 @@ func TestMetricsLabelsRoundTrip(t *testing.T) {
 		BuildToolID:    "bazel",
 		VMID:           "vm-123",
 		JobID:          "job-456",
-		RunID:          "run-789",
 	}
 
 	got, ok := MetricsLabelsFromContext(WithMetricsLabels(context.Background(), labels))

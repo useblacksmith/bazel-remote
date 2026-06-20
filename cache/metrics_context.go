@@ -14,7 +14,6 @@ type MetricsLabels struct {
 	BuildToolID    string
 	VMID           string
 	JobID          string
-	RunID          string
 }
 
 // WithMetricsLabels attaches caller-owned metrics labels to a request context.
