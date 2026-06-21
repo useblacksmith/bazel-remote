@@ -8,7 +8,10 @@ on:
 jobs:
   linux:
     name: create linux binaries
-    runs-on: ubuntu-20.04
+    # Use the oldest available Ubuntu image to keep the glibc version low for the
+    # published, dynamically-linked (cgo, non-static) linux-x86_64 binary. Building
+    # on a newer image would raise the glibc floor and break older target systems.
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - name: checkout code
         uses: actions/checkout@v3
@@ -37,7 +40,7 @@ jobs:
 
   mac:
     name: create mac binaries
-    runs-on: macos-11
+    runs-on: blacksmith-6vcpu-macos-15
     steps:
       - name: checkout
         uses: actions/checkout@v3
