@@ -9,7 +9,7 @@ on:
 jobs:
   idletimer:
     name: idle-timer
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/setup-go@v3
