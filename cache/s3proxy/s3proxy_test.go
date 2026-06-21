@@ -238,7 +238,7 @@ func TestPutRecordsUploadQueueDrop(t *testing.T) {
 		t.Fatalf("observer outcomes len = %d, want 1", len(observer.outcomes))
 	}
 	outcome := observer.outcomes[0]
-	if outcome.HasKind || outcome.Method != "backend_upload" || outcome.Status != "dropped" || outcome.Reason != "upload_queue_full" {
+	if outcome.Method != "backend_upload" || outcome.Status != "dropped" || outcome.Reason != "upload_queue_full" {
 		t.Fatalf("unexpected outcome: %+v", outcome)
 	}
 	if outcome.Labels.RepositoryID != "717982840" || outcome.Labels.JobID != "job-456" {
@@ -262,7 +262,7 @@ func TestObserveUploadRecordsBackendUploadError(t *testing.T) {
 		t.Fatalf("observer outcomes len = %d, want 1", len(observer.outcomes))
 	}
 	outcome := observer.outcomes[0]
-	if outcome.HasKind || outcome.Method != "backend_upload" || outcome.Status != "error" || outcome.Reason != "s3_put_failed" {
+	if outcome.Method != "backend_upload" || outcome.Status != "error" || outcome.Reason != "s3_put_failed" {
 		t.Fatalf("unexpected outcome: %+v", outcome)
 	}
 	if outcome.Bytes != 12 {

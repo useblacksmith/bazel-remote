@@ -35,14 +35,12 @@ type OperationObserver interface {
 
 // OperationOutcome describes an observed cache operation outcome.
 type OperationOutcome struct {
-	Labels  MetricsLabels
-	Kind    EntryKind
-	HasKind bool
-	Method  string
-	Status  string
-	Reason  string
-	Ops     uint64
-	Bytes   uint64
+	Labels MetricsLabels
+	Method string
+	Status string
+	Reason string
+	Ops    uint64
+	Bytes  uint64
 }
 
 // ObserveOperation records an outcome when an observer is configured. Panics
