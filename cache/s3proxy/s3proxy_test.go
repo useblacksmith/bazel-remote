@@ -12,6 +12,14 @@ import (
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 )
 
+type recordingObserver struct {
+	outcomes []cache.OperationOutcome
+}
+
+func (r *recordingObserver) RecordOutcome(_ context.Context, outcome cache.OperationOutcome) {
+	r.outcomes = append(r.outcomes, outcome)
+}
+
 func TestObjectKey(t *testing.T) {
 	testCases := []struct {
 		prefix     string
@@ -200,6 +208,68 @@ func TestPutCapturesMissingRequiredRequestScopedPrefixForAsyncUpload(t *testing.
 	}
 	if !item.RequireStoragePrefix {
 		t.Fatal("queued upload RequireStoragePrefix = false, want true")
+	}
+}
+
+func TestPutRecordsUploadQueueDrop(t *testing.T) {
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	uploadQueue := make(chan backendproxy.UploadReq, 1)
+	uploadQueue <- backendproxy.UploadReq{Hash: "queued", Rc: io.NopCloser(strings.NewReader("queued"))}
+	observer := &recordingObserver{}
+	var errBuf bytes.Buffer
+	c := &s3Cache{
+		prefix:      "minio-prefix/staging/10/717982840/v0/bazel",
+		uploadQueue: uploadQueue,
+		errorLogger: stdlog.New(&errBuf, "", 0),
+		observer:    observer,
+	}
+
+	ctx := cache.WithMetricsLabels(context.Background(), cache.MetricsLabels{
+		InstallationID: "10",
+		RepositoryID:   "717982840",
+		Generation:     "v0",
+		BuildToolID:    "bazel",
+		VMID:           "vm-123",
+		JobID:          "job-456",
+	})
+	c.Put(ctx, cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
+
+	if len(observer.outcomes) != 1 {
+		t.Fatalf("observer outcomes len = %d, want 1", len(observer.outcomes))
+	}
+	outcome := observer.outcomes[0]
+	if outcome.Method != "backend_upload" || outcome.Status != "dropped" || outcome.Reason != "upload_queue_full" {
+		t.Fatalf("unexpected outcome: %+v", outcome)
+	}
+	if outcome.Labels.RepositoryID != "717982840" || outcome.Labels.JobID != "job-456" {
+		t.Fatalf("unexpected labels: %+v", outcome.Labels)
+	}
+}
+
+func TestObserveUploadRecordsBackendUploadError(t *testing.T) {
+	observer := &recordingObserver{}
+	c := &s3Cache{observer: observer}
+	c.observeUpload(context.Background(), backendproxy.UploadReq{
+		LogicalSize: 12,
+		Kind:        cache.CAS,
+		MetricsLabels: cache.MetricsLabels{
+			RepositoryID: "717982840",
+			JobID:        "job-456",
+		},
+	}, "error", "s3_put_failed")
+
+	if len(observer.outcomes) != 1 {
+		t.Fatalf("observer outcomes len = %d, want 1", len(observer.outcomes))
+	}
+	outcome := observer.outcomes[0]
+	if outcome.Method != "backend_upload" || outcome.Status != "error" || outcome.Reason != "s3_put_failed" {
+		t.Fatalf("unexpected outcome: %+v", outcome)
+	}
+	if outcome.Bytes != 12 {
+		t.Fatalf("outcome bytes = %d, want 12", outcome.Bytes)
+	}
+	if outcome.Labels.RepositoryID != "717982840" || outcome.Labels.JobID != "job-456" {
+		t.Fatalf("unexpected labels: %+v", outcome.Labels)
 	}
 }
 

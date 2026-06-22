@@ -12,16 +12,20 @@ import (
 )
 
 type metricsDecorator struct {
-	counter *prometheus.CounterVec
+	counter  *prometheus.CounterVec
+	observer cache.OperationObserver
 	*diskCache
 }
 
 const (
-	hitStatus  = "hit"
-	missStatus = "miss"
+	hitStatus   = "hit"
+	missStatus  = "miss"
+	errorStatus = "error"
 
 	containsMethod = "contains"
 	getMethod      = "get"
+	actionCacheGet = "action_cache_get"
+	casLookup      = "cas_lookup"
 	//putMethod      = "put"
 
 	acKind  = "ac" // This must be lowercase to match cache.EntryKind.String()
@@ -30,23 +34,25 @@ const (
 )
 
 func (m *metricsDecorator) RegisterMetrics() {
-	prometheus.MustRegister(m.counter)
+	if m.counter != nil {
+		prometheus.MustRegister(m.counter)
+	}
 	m.diskCache.RegisterMetrics()
 }
 
 func (m *metricsDecorator) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64) (io.ReadCloser, int64, error) {
 	rc, size, err := m.diskCache.Get(ctx, kind, hash, size, offset)
 	if err != nil {
+		m.recordLookup(ctx, kind, getMethod, errorStatus, "get_failed", 1, 0)
 		return rc, size, err
 	}
 
-	lbls := prometheus.Labels{"method": getMethod, "kind": kind.String()}
+	status := missStatus
 	if rc != nil {
-		lbls["status"] = hitStatus
-	} else {
-		lbls["status"] = missStatus
+		status = hitStatus
 	}
-	m.counter.With(lbls).Inc()
+	m.incCounter(getMethod, kind.String(), status, 1)
+	m.recordLookup(ctx, kind, getMethod, status, "", 1, nonNegativeUint64(size))
 
 	return rc, size, nil
 }
@@ -54,16 +60,16 @@ func (m *metricsDecorator) Get(ctx context.Context, kind cache.EntryKind, hash s
 func (m *metricsDecorator) GetValidatedActionResult(ctx context.Context, hash string) (*pb.ActionResult, []byte, error) {
 	ar, data, err := m.diskCache.GetValidatedActionResult(ctx, hash)
 	if err != nil {
+		m.record(ctx, actionCacheGet, errorStatus, "get_action_result_failed", 1, 0)
 		return ar, data, err
 	}
 
-	lbls := prometheus.Labels{"method": getMethod, "kind": acKind}
+	status := missStatus
 	if ar != nil {
-		lbls["status"] = hitStatus
-	} else {
-		lbls["status"] = missStatus
+		status = hitStatus
 	}
-	m.counter.With(lbls).Inc()
+	m.incCounter(getMethod, acKind, status, 1)
+	m.record(ctx, actionCacheGet, status, "", 1, uint64(len(data)))
 
 	return ar, data, err
 }
@@ -71,19 +77,16 @@ func (m *metricsDecorator) GetValidatedActionResult(ctx context.Context, hash st
 func (m *metricsDecorator) GetZstd(ctx context.Context, hash string, size int64, offset int64) (io.ReadCloser, int64, error) {
 	rc, size, err := m.diskCache.GetZstd(ctx, hash, size, offset)
 	if err != nil {
+		m.record(ctx, casLookup, errorStatus, "get_zstd_failed", 1, 0)
 		return rc, size, err
 	}
 
-	lbls := prometheus.Labels{
-		"method": getMethod,
-		"kind":   "cas",
-	}
+	status := missStatus
 	if rc != nil {
-		lbls["status"] = hitStatus
-	} else {
-		lbls["status"] = missStatus
+		status = hitStatus
 	}
-	m.counter.With(lbls).Inc()
+	m.incCounter(getMethod, casKind, status, 1)
+	m.record(ctx, casLookup, status, "", 1, nonNegativeUint64(size))
 
 	return rc, size, nil
 }
@@ -91,13 +94,12 @@ func (m *metricsDecorator) GetZstd(ctx context.Context, hash string, size int64,
 func (m *metricsDecorator) Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64) {
 	ok, size := m.diskCache.Contains(ctx, kind, hash, size)
 
-	lbls := prometheus.Labels{"method": containsMethod, "kind": kind.String()}
+	status := missStatus
 	if ok {
-		lbls["status"] = hitStatus
-	} else {
-		lbls["status"] = missStatus
+		status = hitStatus
 	}
-	m.counter.With(lbls).Inc()
+	m.incCounter(containsMethod, kind.String(), status, 1)
+	m.recordLookup(ctx, kind, containsMethod, status, "", 1, nonNegativeUint64(size))
 
 	return ok, size
 }
@@ -106,6 +108,7 @@ func (m *metricsDecorator) FindMissingCasBlobs(ctx context.Context, blobs []*pb.
 	numLooking := len(blobs)
 	digests, err := m.diskCache.FindMissingCasBlobs(ctx, blobs)
 	if err != nil {
+		m.record(ctx, casLookup, errorStatus, "find_missing_cas_blobs_failed", uint64(numLooking), 0)
 		return digests, err
 	}
 
@@ -113,22 +116,49 @@ func (m *metricsDecorator) FindMissingCasBlobs(ctx context.Context, blobs []*pb.
 
 	numFound := numLooking - numMissing
 
-	hitLabels := prometheus.Labels{
-		"method": containsMethod,
-		"kind":   "cas",
-		"status": hitStatus,
+	m.incCounter(containsMethod, casKind, hitStatus, float64(numFound))
+	m.incCounter(containsMethod, casKind, missStatus, float64(numMissing))
+	if numFound > 0 {
+		m.record(ctx, casLookup, hitStatus, "", uint64(numFound), 0)
 	}
-	hits := m.counter.With(hitLabels)
-
-	missLabels := prometheus.Labels{
-		"method": containsMethod,
-		"kind":   "cas",
-		"status": missStatus,
+	if numMissing > 0 {
+		m.record(ctx, casLookup, missStatus, "", uint64(numMissing), 0)
 	}
-	misses := m.counter.With(missLabels)
-
-	hits.Add(float64(numFound))
-	misses.Add(float64(numMissing))
 
 	return digests, nil
+}
+
+func (m *metricsDecorator) incCounter(method, kind, status string, value float64) {
+	if m.counter == nil || value == 0 {
+		return
+	}
+	m.counter.With(prometheus.Labels{"method": method, "kind": kind, "status": status}).Add(value)
+}
+
+func (m *metricsDecorator) recordLookup(ctx context.Context, kind cache.EntryKind, method, status, reason string, ops uint64, bytes uint64) {
+	switch kind {
+	case cache.AC:
+		m.record(ctx, actionCacheGet, status, reason, ops, bytes)
+	case cache.CAS:
+		m.record(ctx, casLookup, status, reason, ops, bytes)
+	default:
+		m.record(ctx, method, status, reason, ops, bytes)
+	}
+}
+
+func (m *metricsDecorator) record(ctx context.Context, operation, status, reason string, ops uint64, bytes uint64) {
+	cache.ObserveOperation(ctx, m.observer, cache.OperationOutcome{
+		Method: operation,
+		Status: status,
+		Reason: reason,
+		Ops:    ops,
+		Bytes:  bytes,
+	})
+}
+
+func nonNegativeUint64(value int64) uint64 {
+	if value < 0 {
+		return 0
+	}
+	return uint64(value)
 }
