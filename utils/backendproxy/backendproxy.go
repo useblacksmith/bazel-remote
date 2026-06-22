@@ -12,6 +12,12 @@ type UploadReq struct {
 	SizeOnDisk  int64
 	Kind        cache.EntryKind
 	Rc          io.ReadCloser
+	// StoragePrefix captures the request-scoped physical object-key prefix at
+	// enqueue time. Uploads are asynchronous, so backends cannot rely on the
+	// original request context still being available when workers process this.
+	StoragePrefix              string
+	RequestScopedStoragePrefix bool
+	RequireStoragePrefix       bool
 }
 
 type Uploader interface {
