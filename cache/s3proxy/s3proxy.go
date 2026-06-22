@@ -41,6 +41,15 @@ type s3Cache struct {
 	v2mode           bool
 	updateTimestamps bool
 	objectKey        func(prefix string, hash string, kind cache.EntryKind) string
+	observer         cache.OperationObserver
+}
+
+type Option func(*s3Cache)
+
+func WithOperationObserver(observer cache.OperationObserver) Option {
+	return func(c *s3Cache) {
+		c.observer = observer
+	}
 }
 
 var (
@@ -72,7 +81,7 @@ func New(
 
 	storageMode string, accessLogger cache.Logger,
 	errorLogger cache.Logger, numUploaders, maxQueuedUploads int,
-	metrics Metrics) cache.Proxy {
+	metrics Metrics, options ...Option) cache.Proxy {
 
 	fmt.Println("Using S3 backend.")
 
@@ -93,7 +102,7 @@ func New(
 	tr.MaxIdleConnsPerHost = MaxIdleConns
 
 	// Initialize minio client with credentials
-	opts := &minio.Options{
+	minioOpts := &minio.Options{
 		Creds:        Credentials,
 		BucketLookup: BucketLookupType,
 
@@ -101,7 +110,7 @@ func New(
 		Secure:    secure,
 		Transport: tr,
 	}
-	minioCore, err = minio.NewCore(Endpoint, opts)
+	minioCore, err = minio.NewCore(Endpoint, minioOpts)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -120,6 +129,9 @@ func New(
 		metrics:          metrics,
 		v2mode:           storageMode == "zstd",
 		updateTimestamps: UpdateTimestamps,
+	}
+	for _, opt := range options {
+		opt(c)
 	}
 
 	if c.v2mode {
@@ -234,6 +246,9 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	)
 
 	logResponse(c.accessLogger, "UPLOAD", c.bucket, objectKey, err)
+	if err != nil {
+		c.observeUpload(context.Background(), item, "error", "s3_put_failed")
+	}
 
 	_ = item.Rc.Close()
 }
@@ -244,6 +259,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		return
 	}
 	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
+	labels, _ := cache.MetricsLabelsFromContext(ctx)
 
 	select {
 	case c.uploadQueue <- backendproxy.UploadReq{
@@ -255,9 +271,17 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		StoragePrefix:              prefix,
 		RequestScopedStoragePrefix: requestScopedPrefix,
 		RequireStoragePrefix:       requirePrefix,
+		MetricsLabels:              labels,
 	}:
 	default:
 		c.errorLogger.Printf("too many uploads queued\n")
+		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
+			Method: "backend_upload",
+			Status: "dropped",
+			Reason: "upload_queue_full",
+			Ops:    1,
+			Bytes:  nonNegativeUint64(logicalSize),
+		})
 		_ = rc.Close()
 	}
 }
@@ -343,4 +367,21 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	logResponse(c.accessLogger, "CONTAINS", c.bucket, objectKey, err)
 
 	return exists, size
+}
+
+func (c *s3Cache) observeUpload(ctx context.Context, item backendproxy.UploadReq, status string, reason string) {
+	cache.ObserveOperation(cache.WithMetricsLabels(ctx, item.MetricsLabels), c.observer, cache.OperationOutcome{
+		Method: "backend_upload",
+		Status: status,
+		Reason: reason,
+		Ops:    1,
+		Bytes:  nonNegativeUint64(item.LogicalSize),
+	})
+}
+
+func nonNegativeUint64(value int64) uint64 {
+	if value < 0 {
+		return 0
+	}
+	return uint64(value)
 }

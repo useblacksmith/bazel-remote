@@ -18,6 +18,7 @@ type UploadReq struct {
 	StoragePrefix              string
 	RequestScopedStoragePrefix bool
 	RequireStoragePrefix       bool
+	MetricsLabels              cache.MetricsLabels
 }
 
 type Uploader interface {

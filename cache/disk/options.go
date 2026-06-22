@@ -88,17 +88,18 @@ func WithAccessLogger(logger *log.Logger) Option {
 
 func WithEndpointMetrics() Option {
 	return func(c *CacheConfig) error {
-		if c.metrics != nil {
+		if c.metrics != nil && c.metrics.counter != nil {
 			return fmt.Errorf("WithEndpointMetrics specified multiple times")
 		}
 
-		c.metrics = &metricsDecorator{
-			counter: prometheus.NewCounterVec(prometheus.CounterOpts{
-				Name: "bazel_remote_incoming_requests_total",
-				Help: "The number of incoming cache requests",
-			},
-				[]string{"method", "kind", "status"}),
+		if c.metrics == nil {
+			c.metrics = &metricsDecorator{}
 		}
+		c.metrics.counter = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "bazel_remote_incoming_requests_total",
+			Help: "The number of incoming cache requests",
+		},
+			[]string{"method", "kind", "status"})
 
 		c.metrics.counter.WithLabelValues("get", "cas", "hit").Add(0)
 		c.metrics.counter.WithLabelValues("get", "cas", "miss").Add(0)
@@ -114,6 +115,19 @@ func WithEndpointMetrics() Option {
 func WithMaxSizeHardLimit(maxSizeHardLimit int64) Option {
 	return func(cc *CacheConfig) error {
 		cc.maxSizeHardLimit = maxSizeHardLimit
+		return nil
+	}
+}
+
+func WithOperationObserver(observer cache.OperationObserver) Option {
+	return func(c *CacheConfig) error {
+		if observer == nil {
+			return nil
+		}
+		if c.metrics == nil {
+			c.metrics = &metricsDecorator{}
+		}
+		c.metrics.observer = observer
 		return nil
 	}
 }
