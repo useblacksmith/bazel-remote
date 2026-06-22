@@ -33,7 +33,7 @@ other callers that do not opt in to request-scoped routing. For Bazel, FA should
 resolve the authorized VM/job namespace to the full physical prefix:
 
 ```text
-<MINIO_PREFIX>/bazel/<environment>/<region>/<model_installation_id>/<repository_id>/<generation>
+<MINIO_PREFIX>/<environment>/<model_installation_id>/<repository_id>/<generation>/<tool>
 ```
 
 and attach it with `cache.WithStoragePrefix`. The S3 proxy then uses that
@@ -50,7 +50,7 @@ Local disk cache entries store the full request prefix as a stable hash so the
 LRU can distinguish identical AC/CAS digests from different repo/generation
 namespaces without using S3-style slash-heavy prefixes in local paths. MinIO/S3
 object keys use the real request-scoped prefix directly, so broad remote
-deletion still targets `<MINIO_PREFIX>/bazel/.../<generation>/`.
+deletion still targets `<MINIO_PREFIX>/<environment>/<model_installation_id>/<repository_id>/<generation>/`.
 
 For Bazel requests, FA should also mark the request with
 `cache.WithRequiredStoragePrefix`. If a request reaches the S3 proxy with that
@@ -70,3 +70,30 @@ tags, and security advisories for `bazel-remote`. To apply an upstream patch:
 5. Run the FA agent build and Buck2 cache tests before merging.
 
 BLA-4006 should make CAS namespacing changes in this repository.
+
+## Build cache operation observation
+
+BLA-4010 adds optional cache operation observation for FA-owned customer
+metrics. Callers may attach opaque identity labels with
+`cache.WithMetricsLabels`. bazel-remote stores and forwards those labels but
+does not interpret tenant, repository, VM, or job identity.
+
+The disk cache accepts an optional `cache.OperationObserver` and invokes it next
+to the existing endpoint metrics decorator for semantic cache outcomes:
+
+- `action_cache_get`: `hit`, `miss`, or `error`
+- `cas_lookup`: `hit`, `miss`, or `error`
+
+The S3 proxy accepts the same observer and records backend async upload health
+only:
+
+- `backend_upload`: `error` or `dropped`
+
+Client transfer bytes are intentionally not inferred inside bazel-remote; FA
+observes gRPC request/response payloads and emits `client_upload` and
+`client_download` rows with byte counts.
+
+Nil observers preserve existing behavior. Observer panics are swallowed through
+the cache package helper so metrics collection cannot change cache request
+outcomes. The fork still has no Laravel/Web dependency; FA owns aggregation and
+ClickHouse delivery.
