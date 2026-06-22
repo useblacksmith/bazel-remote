@@ -107,3 +107,33 @@ func TransformActionCacheKey(key, instance string, logger Logger) string {
 func LookupKey(kind EntryKind, hash string) string {
 	return kind.String() + "/" + hash
 }
+
+func StoragePrefixID(prefix string) string {
+	sum := sha256.Sum256([]byte(prefix))
+	return hex.EncodeToString(sum[:])
+}
+
+func StoragePrefixIDFromContext(ctx context.Context) (string, bool) {
+	prefix, ok := StoragePrefixFromContext(ctx)
+	if !ok {
+		return "", false
+	}
+	return StoragePrefixID(prefix), true
+}
+
+func LookupKeyForContext(ctx context.Context, kind EntryKind, hash string) string {
+	if kind == AC || kind == CAS {
+		if prefixID, ok := StoragePrefixIDFromContext(ctx); ok {
+			return LookupKeyForStoragePrefixID(prefixID, kind, hash)
+		}
+	}
+	return LookupKey(kind, hash)
+}
+
+func LookupKeyForStoragePrefixID(prefixID string, kind EntryKind, hash string) string {
+	key := LookupKey(kind, hash)
+	if (kind == AC || kind == CAS) && prefixID != "" {
+		return key + "/" + prefixID
+	}
+	return key
+}
