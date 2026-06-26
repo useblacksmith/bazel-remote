@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"path"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -219,6 +220,19 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 		c.logMissingRequiredStoragePrefix("UPLOAD", item.Kind, item.Hash)
 	}
 	objectKey := c.objectKeyForPrefix(prefix, item.Hash, item.Kind)
+
+	opts := minio.PutObjectOptions{
+		UserMetadata: map[string]string{
+			"Content-Type": "application/octet-stream",
+		},
+	}
+	// Create-if-absent: a backend upload only counts toward the storage footprint
+	// when it stores a net-new object. If the object already exists, MinIO rejects
+	// the conditional PUT with a precondition failure and we classify it as
+	// already_exists instead of created. SetMatchETagExcept("*") emits an unquoted
+	// "If-None-Match: *" (the quoting bug is fixed in minio-go >= v7.0.72).
+	opts.SetMatchETagExcept("*")
+
 	_, err := c.mcore.PutObject(
 		context.Background(),
 		c.bucket,        // bucketName
@@ -227,19 +241,33 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 		item.SizeOnDisk, // objectSize
 		"",              // md5base64
 		"",              // sha256
-		minio.PutObjectOptions{
-			UserMetadata: map[string]string{
-				"Content-Type": "application/octet-stream",
-			},
-		}, // metadata
+		opts,            // metadata
 	)
 
 	logResponse(c.accessLogger, "UPLOAD", c.bucket, objectKey, err)
-	if err != nil {
-		c.observeUpload(context.Background(), item, "error", "s3_put_failed")
-	}
+
+	status, reason := classifyUploadOutcome(err)
+	c.observeUpload(context.Background(), item, status, reason)
 
 	item.Rc.Close()
+}
+
+// classifyUploadOutcome maps a create-if-absent backend PutObject result to a
+// terminal storage-accounting status. Only a net-new object (no error) is
+// "created" and counts toward the footprint. A precondition failure means the
+// object already existed: RFC-compliant servers return 412 PreconditionFailed,
+// while some older MinIO releases return 304 NotModified, so both map to
+// already_exists. Anything else is a genuine failure.
+func classifyUploadOutcome(err error) (status string, reason string) {
+	if err == nil {
+		return "created", ""
+	}
+	switch minio.ToErrorResponse(err).StatusCode {
+	case http.StatusPreconditionFailed, http.StatusNotModified:
+		return "already_exists", "precondition_failed"
+	default:
+		return "failed", "s3_put_failed"
+	}
 }
 
 func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
@@ -269,7 +297,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 			Status: "dropped",
 			Reason: "upload_queue_full",
 			Ops:    1,
-			Bytes:  nonNegativeUint64(logicalSize),
+			Bytes:  nonNegativeUint64(sizeOnDisk),
 		})
 		rc.Close()
 	}
@@ -359,12 +387,14 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 }
 
 func (c *s3Cache) observeUpload(ctx context.Context, item backendproxy.UploadReq, status string, reason string) {
+	// SizeOnDisk is the compressed/stored byte count, matching what MinIO actually
+	// persists; the footprint accumulator and the MinIO drift scan share this unit.
 	cache.ObserveOperation(cache.WithMetricsLabels(ctx, item.MetricsLabels), c.observer, cache.OperationOutcome{
 		Method: "backend_upload",
 		Status: status,
 		Reason: reason,
 		Ops:    1,
-		Bytes:  nonNegativeUint64(item.LogicalSize),
+		Bytes:  nonNegativeUint64(item.SizeOnDisk),
 	})
 }
 
