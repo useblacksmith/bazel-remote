@@ -339,12 +339,7 @@ def go_dependencies():
         sum = "h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=",
         version = "v0.6.0",
     )
-    go_repository(
-        name = "com_github_google_gofuzz",
-        importpath = "github.com/google/gofuzz",
-        sum = "h1:A8PeW59pxE9IoFRqBp37U+mSNaQoZ46F1f0f863XSXw=",
-        version = "v1.0.0",
-    )
+
     go_repository(
         name = "com_github_google_s2a_go",
         importpath = "github.com/google/s2a-go",
@@ -573,14 +568,8 @@ def go_dependencies():
     go_repository(
         name = "com_github_minio_minio_go_v7",
         importpath = "github.com/minio/minio-go/v7",
-        sum = "h1:l8AnsQFyY1xiwa/DaQskY4NXSLA2yrGsW5iD9nRPVS0=",
-        version = "v7.0.69",
-    )
-    go_repository(
-        name = "com_github_minio_sha256_simd",
-        importpath = "github.com/minio/sha256-simd",
-        sum = "h1:6kaan5IFmwTNynnKKpDHe6FWHohJOHhCPchzK49dzMM=",
-        version = "v1.0.1",
+        sum = "h1:ZSbxs2BfJensLyHdVOgHv+pfmvxYraaUy07ER04dWnA=",
+        version = "v7.0.72",
     )
 
     go_repository(
