@@ -265,13 +265,13 @@ func TestObserveUploadReportsSizeOnDisk(t *testing.T) {
 			RepositoryID: "717982840",
 			JobID:        "job-456",
 		},
-	}, "failed", "s3_put_failed")
+	}, "error", "s3_put_failed")
 
 	if len(observer.outcomes) != 1 {
 		t.Fatalf("observer outcomes len = %d, want 1", len(observer.outcomes))
 	}
 	outcome := observer.outcomes[0]
-	if outcome.Method != "backend_upload" || outcome.Status != "failed" || outcome.Reason != "s3_put_failed" {
+	if outcome.Method != "backend_upload" || outcome.Status != "error" || outcome.Reason != "s3_put_failed" {
 		t.Fatalf("unexpected outcome: %+v", outcome)
 	}
 	if outcome.Bytes != 12 {
@@ -292,8 +292,8 @@ func TestClassifyUploadOutcome(t *testing.T) {
 		{"net-new object", nil, "created", ""},
 		{"precondition failed 412", minio.ErrorResponse{StatusCode: http.StatusPreconditionFailed}, "already_exists", "precondition_failed"},
 		{"not modified 304 (older minio)", minio.ErrorResponse{StatusCode: http.StatusNotModified}, "already_exists", "precondition_failed"},
-		{"server error", minio.ErrorResponse{StatusCode: http.StatusInternalServerError}, "failed", "s3_put_failed"},
-		{"non-minio error", errNotFound, "failed", "s3_put_failed"},
+		{"server error", minio.ErrorResponse{StatusCode: http.StatusInternalServerError}, "error", "s3_put_failed"},
+		{"non-minio error", errNotFound, "error", "s3_put_failed"},
 	}
 
 	for _, tc := range testCases {

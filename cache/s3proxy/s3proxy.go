@@ -258,6 +258,12 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 // object already existed: RFC-compliant servers return 412 PreconditionFailed,
 // while some older MinIO releases return 304 NotModified, so both map to
 // already_exists. Anything else is a genuine failure.
+//
+// The failure status is "error" (not "failed") to match the shared build-cache
+// status taxonomy: FA emits "error" (buildCacheStatusError) and the web reader
+// counts status IN ('error', 'rejected', 'dropped') as failures
+// (BuildCacheMetricsService::FAILURE_STATUSES). A divergent "failed" would be
+// silently dropped by those consumers.
 func classifyUploadOutcome(err error) (status string, reason string) {
 	if err == nil {
 		return "created", ""
@@ -266,7 +272,7 @@ func classifyUploadOutcome(err error) (status string, reason string) {
 	case http.StatusPreconditionFailed, http.StatusNotModified:
 		return "already_exists", "precondition_failed"
 	default:
-		return "failed", "s3_put_failed"
+		return "error", "s3_put_failed"
 	}
 }
 
