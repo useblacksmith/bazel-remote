@@ -229,8 +229,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	// Create-if-absent: a backend upload only counts toward the storage footprint
 	// when it stores a net-new object. If the object already exists, MinIO rejects
 	// the conditional PUT with a precondition failure and we classify it as
-	// already_exists instead of created. SetMatchETagExcept("*") emits an unquoted
-	// "If-None-Match: *" (the quoting bug is fixed in minio-go >= v7.0.72).
+	// already_exists instead of created.
 	opts.SetMatchETagExcept("*")
 
 	_, err := c.mcore.PutObject(
