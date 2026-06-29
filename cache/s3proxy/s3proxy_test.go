@@ -5,11 +5,13 @@ import (
 	"context"
 	"io"
 	stdlog "log"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
+	"github.com/minio/minio-go/v7"
 )
 
 type recordingObserver struct {
@@ -232,6 +234,8 @@ func TestPutRecordsUploadQueueDrop(t *testing.T) {
 		VMID:           "vm-123",
 		JobID:          "job-456",
 	})
+	// Put is called with logicalSize=4, sizeOnDisk=4; the dropped outcome now
+	// reports SizeOnDisk bytes.
 	c.Put(ctx, cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
 
 	if len(observer.outcomes) != 1 {
@@ -241,16 +245,21 @@ func TestPutRecordsUploadQueueDrop(t *testing.T) {
 	if outcome.Method != "backend_upload" || outcome.Status != "dropped" || outcome.Reason != "upload_queue_full" {
 		t.Fatalf("unexpected outcome: %+v", outcome)
 	}
+	if outcome.Bytes != 4 {
+		t.Fatalf("dropped outcome bytes = %d, want 4 (SizeOnDisk)", outcome.Bytes)
+	}
 	if outcome.Labels.RepositoryID != "717982840" || outcome.Labels.JobID != "job-456" {
 		t.Fatalf("unexpected labels: %+v", outcome.Labels)
 	}
 }
 
-func TestObserveUploadRecordsBackendUploadError(t *testing.T) {
+func TestObserveUploadReportsSizeOnDisk(t *testing.T) {
 	observer := &recordingObserver{}
 	c := &s3Cache{observer: observer}
 	c.observeUpload(context.Background(), backendproxy.UploadReq{
-		LogicalSize: 12,
+		// LogicalSize must be ignored; only SizeOnDisk (stored bytes) is reported.
+		LogicalSize: 99,
+		SizeOnDisk:  12,
 		Kind:        cache.CAS,
 		MetricsLabels: cache.MetricsLabels{
 			RepositoryID: "717982840",
@@ -266,10 +275,35 @@ func TestObserveUploadRecordsBackendUploadError(t *testing.T) {
 		t.Fatalf("unexpected outcome: %+v", outcome)
 	}
 	if outcome.Bytes != 12 {
-		t.Fatalf("outcome bytes = %d, want 12", outcome.Bytes)
+		t.Fatalf("outcome bytes = %d, want 12 (SizeOnDisk, not LogicalSize)", outcome.Bytes)
 	}
 	if outcome.Labels.RepositoryID != "717982840" || outcome.Labels.JobID != "job-456" {
 		t.Fatalf("unexpected labels: %+v", outcome.Labels)
+	}
+}
+
+func TestClassifyUploadOutcome(t *testing.T) {
+	testCases := []struct {
+		name           string
+		err            error
+		expectedStatus string
+		expectedReason string
+	}{
+		{"net-new object", nil, "created", ""},
+		{"precondition failed 412", minio.ErrorResponse{StatusCode: http.StatusPreconditionFailed}, "already_exists", "precondition_failed"},
+		{"not modified 304 (older minio)", minio.ErrorResponse{StatusCode: http.StatusNotModified}, "already_exists", "precondition_failed"},
+		{"server error", minio.ErrorResponse{StatusCode: http.StatusInternalServerError}, "error", "s3_put_failed"},
+		{"non-minio error", errNotFound, "error", "s3_put_failed"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, reason := classifyUploadOutcome(tc.err)
+			if status != tc.expectedStatus || reason != tc.expectedReason {
+				t.Fatalf("classifyUploadOutcome(%v) = (%q, %q), want (%q, %q)",
+					tc.err, status, reason, tc.expectedStatus, tc.expectedReason)
+			}
+		})
 	}
 }
 
