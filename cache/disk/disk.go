@@ -71,6 +71,7 @@ type lruItem struct {
 type diskCache struct {
 	dir              string
 	proxy            cache.Proxy
+	lruObserver      cache.LRUObserver
 	storageMode      casblob.CompressionType
 	zstd             zstdimpl.ZstdImpl
 	maxBlobSize      int64
@@ -292,6 +293,24 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 		return nil
 	}
 
+	// LRU capture (D15): for managed AC writes, buffer and parse the
+	// ActionResult so we can emit a closure after a successful commit. AC
+	// blobs are small and this only runs when an observer is configured.
+	var acForObserver *pb.ActionResult
+	if kind == cache.AC && c.lruObserver != nil {
+		acBytes, rErr := io.ReadAll(r)
+		if rErr != nil {
+			return internalErr(rErr)
+		}
+		r = bytes.NewReader(acBytes)
+		ar := &pb.ActionResult{}
+		if proto.Unmarshal(acBytes, ar) == nil {
+			acForObserver = ar
+		} else {
+			lruObservationsDropped.WithLabelValues(dropReasonUnmarshalActionRes).Inc()
+		}
+	}
+
 	key := cache.LookupKeyForContext(ctx, kind, hash)
 
 	var tf *os.File // Tempfile.
@@ -390,6 +409,11 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 	unreserve, removeTempfile, err = c.commit(key, legacy, blobFile, size, size, sizeOnDisk, random)
 	if err != nil {
 		return internalErr(err)
+	}
+
+	if acForObserver != nil {
+		// AC blobs are stored uncompressed, so size == sizeOnDisk.
+		c.emitACClosureFromWrite(ctx, hash, size, acForObserver)
 	}
 
 	return nil
@@ -822,6 +846,16 @@ func isSizeMismatch(requestedSize int64, foundSize int64) bool {
 // not, nil values are returned. If something unexpected went wrong, return
 // an error.
 func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (*pb.ActionResult, []byte, error) {
+	// LRU capture (D15): when an observer is configured, attach a leaf-size
+	// sink so the closure can be assembled from sizes that validation already
+	// resolves. Gated so the default path is byte-for-byte unchanged.
+	capture := c.lruObserver != nil
+	var collector *leafSizeCollector
+	if capture {
+		collector = newLeafSizeCollector()
+		ctx = cache.WithLeafSizeSink(ctx, collector)
+	}
+
 	rc, sizeBytes, err := c.Get(ctx, cache.AC, hash, -1, 0)
 	if rc != nil {
 		defer rc.Close()
@@ -889,6 +923,13 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 			return nil, nil, err
 		}
 
+		if capture {
+			// The Tree blob itself must be kept by the sweep, so record it as a
+			// leaf. It is local now (we just read it), so this is a local-index
+			// existence check with no extra proxy round trip.
+			pendingValidations = append(pendingValidations, d.TreeDigest)
+		}
+
 		for _, f := range tree.Root.GetFiles() {
 			if f.Digest != nil {
 				pendingValidations = append(pendingValidations, f.Digest)
@@ -912,12 +953,30 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 		pendingValidations = append(pendingValidations, result.StderrDigest)
 	}
 
+	// Snapshot the leaf hashes before validation nil-s the found entries, so
+	// the closure can be assembled after a successful (all-present) validation.
+	var leafHashes []string
+	if capture {
+		leafHashes = make([]string, 0, len(pendingValidations))
+		for _, d := range pendingValidations {
+			if d != nil {
+				leafHashes = append(leafHashes, d.Hash)
+			}
+		}
+	}
+
 	err = c.findMissingCasBlobsInternal(ctx, pendingValidations, true)
 	if errors.Is(err, errMissingBlob) {
 		return nil, nil, nil // aka "not found"
 	}
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if capture {
+		// A successful hit proves every leaf exists; sizes were recorded as
+		// validation touched each one. AC blobs are uncompressed (size == sizeOnDisk).
+		c.emitACClosureFromHit(ctx, hash, sizeBytes, leafHashes, collector)
 	}
 
 	return result, acdata, nil
