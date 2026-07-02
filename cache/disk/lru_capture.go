@@ -16,6 +16,13 @@ import (
 const (
 	leafSizeSourceLocal = "local"
 	leafSizeSourceProxy = "proxy"
+	// leafSizeSourceMissing is recorded when a closure leaf's sizeOnDisk could
+	// not be resolved from either the local index or a proxy stat during
+	// validation. It is the field validator for the zero-extra-round-trip size
+	// assumption (D11): a non-trivial rate means sizes are not always free and
+	// the design must be revisited. It always coincides with a complete-or-drop
+	// (incomplete_closure) drop of the enclosing AC entry.
+	leafSizeSourceMissing = "missing"
 
 	dropReasonIncompleteClosure  = "incomplete_closure"
 	dropReasonWriteHasDirs       = "write_has_directories"
@@ -110,6 +117,9 @@ func (c *diskCache) emitACClosureFromHit(ctx context.Context, acHash string, acS
 
 		sz, ok := collector.size(h)
 		if !ok {
+			// Record the missing leaf so the zero-round-trip size assumption is
+			// observable in the field, then drop the whole closure (D11/§4.4).
+			lruLeafSizeSource.WithLabelValues(leafSizeSourceMissing).Inc()
 			lruObservationsDropped.WithLabelValues(dropReasonIncompleteClosure).Inc()
 			return
 		}

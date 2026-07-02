@@ -887,6 +887,14 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 
 	pendingValidations := []*pb.Digest{}
 
+	// treeLeafHashes collects output_directories Tree blob hashes for the LRU
+	// closure. The Tree blobs are recorded as closure leaves (the sweep must
+	// keep them) but are deliberately kept OUT of pendingValidations: their
+	// existence is already proven by the reads below, so re-validating them
+	// could only turn a proven hit into a miss (e.g. a transient proxy
+	// StatObject error on a proxy-served Tree).
+	var treeLeafHashes []string
+
 	for _, f := range result.OutputFiles {
 		// f was validated in validate.ActionResult but blobs were not checked for existence
 		if len(f.Contents) == 0 {
@@ -924,10 +932,16 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 		}
 
 		if capture {
-			// The Tree blob itself must be kept by the sweep, so record it as a
-			// leaf. It is local now (we just read it), so this is a local-index
-			// existence check with no extra proxy round trip.
-			pendingValidations = append(pendingValidations, d.TreeDigest)
+			// Record the Tree blob as a closure leaf without re-validating its
+			// existence: we just read it (above), so re-checking could only
+			// produce a worse answer. Resolve sizeOnDisk from the local index
+			// only (zero extra round trips); a proxy-only Tree yields no local
+			// size and is handled by complete-or-drop (recorded as a missing
+			// leaf size in emitACClosureFromHit).
+			if sz, ok := c.lookupSizeOnDisk(ctx, cache.CAS, d.TreeDigest.Hash); ok {
+				collector.RecordLeafSize(d.TreeDigest.Hash, sz, false)
+			}
+			treeLeafHashes = append(treeLeafHashes, d.TreeDigest.Hash)
 		}
 
 		for _, f := range tree.Root.GetFiles() {
@@ -957,12 +971,15 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 	// the closure can be assembled after a successful (all-present) validation.
 	var leafHashes []string
 	if capture {
-		leafHashes = make([]string, 0, len(pendingValidations))
+		leafHashes = make([]string, 0, len(pendingValidations)+len(treeLeafHashes))
 		for _, d := range pendingValidations {
 			if d != nil {
 				leafHashes = append(leafHashes, d.Hash)
 			}
 		}
+		// Tree blobs were size-recorded above but excluded from
+		// pendingValidations; add them to the closure leaf set here.
+		leafHashes = append(leafHashes, treeLeafHashes...)
 	}
 
 	err = c.findMissingCasBlobsInternal(ctx, pendingValidations, true)

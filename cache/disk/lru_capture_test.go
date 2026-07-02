@@ -71,7 +71,7 @@ func (p *sinkRecordingProxy) calls() int {
 	return p.containsCalls
 }
 
-func putCAS(t *testing.T, c *diskCache, data []byte) *pb.Digest {
+func putCAS(t testing.TB, c *diskCache, data []byte) *pb.Digest {
 	t.Helper()
 	sum := sha256.Sum256(data)
 	hash := hex.EncodeToString(sum[:])
@@ -81,7 +81,7 @@ func putCAS(t *testing.T, c *diskCache, data []byte) *pb.Digest {
 	return &pb.Digest{Hash: hash, SizeBytes: int64(len(data))}
 }
 
-func putAC(t *testing.T, c *diskCache, ar *pb.ActionResult) string {
+func putAC(t testing.TB, c *diskCache, ar *pb.ActionResult) string {
 	t.Helper()
 	data, err := proto.Marshal(ar)
 	if err != nil {
