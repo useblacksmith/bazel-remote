@@ -80,14 +80,15 @@ func (c *leafSizeCollector) size(hash string) (int64, bool) {
 
 // lookupSizeOnDisk returns the on-disk size of a locally-stored entry, used by
 // the AC write path to resolve just-written leaves from the index. It never
-// reaches the proxy.
+// reaches the proxy, and it uses a recency-neutral Peek so observation-only
+// lookups do not promote entries and change eviction order.
 func (c *diskCache) lookupSizeOnDisk(ctx context.Context, kind cache.EntryKind, hash string) (int64, bool) {
 	if kind == cache.CAS && hash == emptySha256 {
 		return 0, true
 	}
 	key := cache.LookupKeyForContext(ctx, kind, hash)
 	c.mu.Lock()
-	item, ok := c.lru.Get(key)
+	item, ok := c.lru.Peek(key)
 	c.mu.Unlock()
 	if !ok {
 		return 0, false
