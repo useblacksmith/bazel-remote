@@ -99,6 +99,40 @@ func TestEviction(t *testing.T) {
 	}
 }
 
+func TestPeekDoesNotPromote(t *testing.T) {
+	var evictions []int
+	onEvict := func(key Key, value lruItem) {
+		evictions = append(evictions, key.(int))
+	}
+
+	// Room for exactly two single-block items.
+	lru := NewSizedLRU(2*BlockSize, onEvict, 0)
+
+	item := lruItem{size: 1, sizeOnDisk: 1}
+	for i := 0; i < 2; i++ {
+		if ok := lru.Add(i, item); !ok {
+			t.Fatalf("Add: failed adding %d", i)
+		}
+	}
+
+	// Peek the LRU-side entry; this must not change its recency.
+	peeked, ok := lru.Peek(0)
+	if !ok {
+		t.Fatalf("Peek: failed getting item")
+	}
+	if peeked.sizeOnDisk != item.sizeOnDisk {
+		t.Fatalf("Peek: got a different item back")
+	}
+
+	// Adding a third item must still evict key 0, not key 1.
+	if ok := lru.Add(2, item); !ok {
+		t.Fatalf("Add: failed adding 2")
+	}
+	if !reflect.DeepEqual(evictions, []int{0}) {
+		t.Fatalf("Expecting evictions [0], found %v", evictions)
+	}
+}
+
 func TestRejectBigItem(t *testing.T) {
 	// Bounded caches should reject big items
 	lru := NewSizedLRU(10, nil, 0)

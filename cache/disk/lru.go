@@ -163,6 +163,17 @@ func (c *SizedLRU) Get(key Key) (value lruItem, ok bool) {
 	return
 }
 
+// Peek looks up a key in the cache without updating its recency, so it has
+// no effect on eviction order. Used by observation-only paths that must not
+// perturb the LRU.
+func (c *SizedLRU) Peek(key Key) (value lruItem, ok bool) {
+	if ele, hit := c.cache[key]; hit {
+		return ele.Value.(*entry).value, true
+	}
+
+	return
+}
+
 // Remove removes a (key, value) from the cache
 func (c *SizedLRU) Remove(key Key) {
 	if ele, hit := c.cache[key]; hit {

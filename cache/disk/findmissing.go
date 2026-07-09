@@ -183,6 +183,10 @@ func (c *diskCache) findMissingLocalCAS(ctx context.Context, blobs []*pb.Digest)
 	var key string
 	missing := 0
 
+	// Only AC-closure validation attaches a sink (LRU capture); the public
+	// FindMissingBlobs path has none, so this is a no-op there.
+	sink, _ := cache.LeafSizeSinkFromContext(ctx)
+
 	c.mu.Lock()
 
 	for i := range blobs {
@@ -200,6 +204,10 @@ func (c *diskCache) findMissingLocalCAS(ctx context.Context, blobs []*pb.Digest)
 		}
 
 		if exists && !isSizeMismatch(blobs[i].SizeBytes, foundSize) {
+			if sink != nil {
+				// Local hit: sizeOnDisk is already in hand, no extra round trip.
+				sink.RecordLeafSize(blobs[i].Hash, item.sizeOnDisk, false)
+			}
 			c.accessLogger.Printf("GRPC CAS HEAD %s OK", blobs[i].Hash)
 			blobs[i] = nil
 		} else {
