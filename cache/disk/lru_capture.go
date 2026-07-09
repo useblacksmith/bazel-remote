@@ -28,6 +28,31 @@ const (
 	dropReasonWriteHasDirs       = "write_has_directories"
 	dropReasonWriteInlinedLeaf   = "write_inlined_leaf"
 	dropReasonUnmarshalActionRes = "ac_unmarshal_failed"
+	dropReasonACTooLarge         = "ac_too_large"
+	dropReasonCaptureBudget      = "capture_budget"
+)
+
+const (
+	// lruMaxACCaptureBytes bounds the in-memory buffering of ONE AC write for
+	// closure capture. Without an observer the write streams to a tempfile
+	// with constant memory; capture must parse the whole ActionResult, so it
+	// buffers the blob - and the declared size is client-controlled. 4 MiB
+	// is the gRPC max-message default: every AC arriving via UpdateActionResult
+	// fits under it by construction (the AR rides inside the message with
+	// envelope overhead as margin), so the bound only bites the HTTP path,
+	// where no transport limit exists. Oversized ACs are cached normally via
+	// the streaming path and simply not observed (capture is advisory and
+	// must never gate the write path) - dropped as ac_too_large.
+	lruMaxACCaptureBytes = 4 << 20
+
+	// lruCaptureBudgetBytes bounds the AGGREGATE capture memory across all
+	// in-flight AC writes: the per-request cap alone leaves a worst case of
+	// (max concurrent AC writes x 4 MiB), which scales with VM count and
+	// stream counts. The budget makes the ceiling an explicit constant.
+	// Requests that cannot acquire budget skip observation (capture_budget
+	// drop) - under memory pressure, not observing is exactly the right
+	// degradation for an advisory feature.
+	lruCaptureBudgetBytes = 64 << 20
 )
 
 var (
@@ -46,6 +71,25 @@ var (
 		Help: "AC closures dropped before emission, by reason.",
 	}, []string{"reason"})
 )
+
+// tryAcquireCaptureBudget reserves size bytes of the process-wide AC capture
+// budget, non-blocking: capture is advisory, so under budget pressure we skip
+// the observation rather than delay the write. Callers must pair a successful
+// acquire with releaseCaptureBudget once the buffered blob is dead.
+func (c *diskCache) tryAcquireCaptureBudget(size int64) bool {
+	if c.lruCaptureSem == nil {
+		// Zero-value diskCache (tests construct these directly): no budget
+		// configured means no bound, matching the pre-budget behavior.
+		return true
+	}
+	return c.lruCaptureSem.TryAcquire(size)
+}
+
+func (c *diskCache) releaseCaptureBudget(size int64) {
+	if c.lruCaptureSem != nil {
+		c.lruCaptureSem.Release(size)
+	}
+}
 
 // leafSizeCollector implements cache.LeafSizeSink for a single AC-closure
 // validation. It records sizeOnDisk per CAS leaf hash discovered during

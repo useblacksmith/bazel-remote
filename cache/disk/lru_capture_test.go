@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
+	"net/http"
 	"os"
 	"sync"
 	"testing"
@@ -402,5 +404,117 @@ func TestNilObserverDoesNotCapture(t *testing.T) {
 	}
 	if ar == nil {
 		t.Fatal("expected a validated action result")
+	}
+}
+
+func TestOversizedACWriteIsCachedButNotObserved(t *testing.T) {
+	cacheDir := testutils.TempDir(t)
+	defer os.RemoveAll(cacheDir)
+
+	obs := &recordingLRUObserver{}
+	ci, err := New(cacheDir, 64*1024*1024,
+		WithAccessLogger(testutils.NewSilentLogger()),
+		WithLRUObserver(obs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := ci.(*diskCache)
+
+	before := testutil.ToFloat64(lruObservationsDropped.WithLabelValues(dropReasonACTooLarge))
+	beforeUnmarshal := testutil.ToFloat64(lruObservationsDropped.WithLabelValues(dropReasonUnmarshalActionRes))
+
+	// One byte past the per-request capture cap. Content need not be a valid
+	// ActionResult: the size gate must skip capture before any parse attempt.
+	data := make([]byte, lruMaxACCaptureBytes+1)
+	sum := sha256.Sum256(data)
+	hash := hex.EncodeToString(sum[:])
+	if err := c.Put(context.Background(), cache.AC, hash, int64(len(data)), bytes.NewReader(data)); err != nil {
+		t.Fatalf("oversized AC write must succeed on the streaming path: %v", err)
+	}
+
+	if got := len(obs.snapshot()); got != 0 {
+		t.Fatalf("oversized AC must not be observed, got %d closures", got)
+	}
+	if got := testutil.ToFloat64(lruObservationsDropped.WithLabelValues(dropReasonACTooLarge)); got != before+1 {
+		t.Fatalf("ac_too_large drops = %v, want %v", got, before+1)
+	}
+	if got := testutil.ToFloat64(lruObservationsDropped.WithLabelValues(dropReasonUnmarshalActionRes)); got != beforeUnmarshal {
+		t.Fatalf("size gate must skip before parsing: unmarshal drops moved %v -> %v", beforeUnmarshal, got)
+	}
+
+	found, _ := c.Contains(context.Background(), cache.AC, hash, int64(len(data)))
+	if !found {
+		t.Fatal("oversized AC blob was not cached")
+	}
+}
+
+func TestCaptureBudgetExhaustionSkipsObservationOnly(t *testing.T) {
+	ctx := context.Background()
+	cacheDir := testutils.TempDir(t)
+	defer os.RemoveAll(cacheDir)
+
+	obs := &recordingLRUObserver{}
+	ci, err := New(cacheDir, 1024*32,
+		WithAccessLogger(testutils.NewSilentLogger()),
+		WithLRUObserver(obs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := ci.(*diskCache)
+
+	// Drain the whole aggregate budget, as if 16 concurrent 4 MiB captures
+	// were in flight.
+	if err := c.lruCaptureSem.Acquire(ctx, lruCaptureBudgetBytes); err != nil {
+		t.Fatal(err)
+	}
+
+	before := testutil.ToFloat64(lruObservationsDropped.WithLabelValues(dropReasonCaptureBudget))
+
+	starvedHash := putAC(t, c, &pb.ActionResult{ExitCode: 1})
+	if got := len(obs.snapshot()); got != 0 {
+		t.Fatalf("budget-starved AC must not be observed, got %d closures", got)
+	}
+	if got := testutil.ToFloat64(lruObservationsDropped.WithLabelValues(dropReasonCaptureBudget)); got != before+1 {
+		t.Fatalf("capture_budget drops = %v, want %v", got, before+1)
+	}
+	if found, _ := c.Contains(ctx, cache.AC, starvedHash, -1); !found {
+		t.Fatal("budget-starved AC write must still be cached")
+	}
+
+	// Budget freed: capture resumes.
+	c.lruCaptureSem.Release(lruCaptureBudgetBytes)
+	putAC(t, c, &pb.ActionResult{ExitCode: 2})
+	if got := len(obs.snapshot()); got != 1 {
+		t.Fatalf("expected capture to resume after budget release, got %d closures", got)
+	}
+}
+
+func TestACBodyLargerThanDeclaredSizeIsRejected(t *testing.T) {
+	cacheDir := testutils.TempDir(t)
+	defer os.RemoveAll(cacheDir)
+
+	obs := &recordingLRUObserver{}
+	ci, err := New(cacheDir, 1024*32,
+		WithAccessLogger(testutils.NewSilentLogger()),
+		WithLRUObserver(obs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := ci.(*diskCache)
+
+	body := []byte("this body is much longer than the declared size")
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+
+	err = c.Put(context.Background(), cache.AC, hash, 4, bytes.NewReader(body))
+	if err == nil {
+		t.Fatal("expected rejection when body exceeds declared size")
+	}
+	var cerr *cache.Error
+	if !errors.As(err, &cerr) || cerr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 cache.Error, got %v", err)
+	}
+	if got := len(obs.snapshot()); got != 0 {
+		t.Fatalf("rejected write must not be observed, got %d closures", got)
 	}
 }

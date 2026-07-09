@@ -73,6 +73,7 @@ func New(dir string, maxSizeBytes int64, opts ...Option) (Cache, error) {
 		maxProxyBlobSize: math.MaxInt64,
 
 		fileRemovalSem: semaphore.NewWeighted(semaphoreWeight),
+		lruCaptureSem:  semaphore.NewWeighted(lruCaptureBudgetBytes),
 
 		gaugeCacheAge: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "bazel_remote_disk_cache_longest_item_idle_time_seconds",

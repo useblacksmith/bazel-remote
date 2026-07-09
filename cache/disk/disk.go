@@ -84,6 +84,10 @@ type diskCache struct {
 	// Limit the number of simultaneous file removals.
 	fileRemovalSem *semaphore.Weighted
 
+	// Aggregate byte budget for in-memory AC capture buffers (LRU
+	// observation, D15). Lazily initialized; see lruCaptureBudgetBytes.
+	lruCaptureSem *semaphore.Weighted
+
 	mu  sync.Mutex
 	lru SizedLRU
 
@@ -295,19 +299,41 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	// LRU capture (D15): for managed AC writes, buffer and parse the
 	// ActionResult so we can emit a closure after a successful commit. AC
-	// blobs are small and this only runs when an observer is configured.
+	// blobs are usually small and this only runs when an observer is
+	// configured - but the declared size is client-controlled, so the
+	// buffering is bounded per request (lruMaxACCaptureBytes) and in
+	// aggregate (lruCaptureBudgetBytes). Either bound tripping skips the
+	// OBSERVATION only: the write itself proceeds on the normal streaming
+	// path with constant memory. Capture is advisory and never gates writes.
 	var acForObserver *pb.ActionResult
 	if kind == cache.AC && c.lruObserver != nil {
-		acBytes, rErr := io.ReadAll(r)
-		if rErr != nil {
-			return internalErr(rErr)
-		}
-		r = bytes.NewReader(acBytes)
-		ar := &pb.ActionResult{}
-		if proto.Unmarshal(acBytes, ar) == nil {
-			acForObserver = ar
-		} else {
-			lruObservationsDropped.WithLabelValues(dropReasonUnmarshalActionRes).Inc()
+		switch {
+		case size > lruMaxACCaptureBytes:
+			lruObservationsDropped.WithLabelValues(dropReasonACTooLarge).Inc()
+		case !c.tryAcquireCaptureBudget(size):
+			lruObservationsDropped.WithLabelValues(dropReasonCaptureBudget).Inc()
+		default:
+			// Held until Put returns: the buffer stays live through the
+			// tempfile write below via the replacement reader.
+			defer c.releaseCaptureBudget(size)
+			// Belt against a lying client: the declared size passed the cap,
+			// but the body may be longer. Reading size+1 detects the excess
+			// without unbounded buffering; the request is malformed, so
+			// failing it is correct (this is NOT the advisory skip path).
+			acBytes, rErr := io.ReadAll(io.LimitReader(r, size+1))
+			if rErr != nil {
+				return internalErr(rErr)
+			}
+			if int64(len(acBytes)) > size {
+				return badReqErr("Blob larger than declared size %d", size)
+			}
+			r = bytes.NewReader(acBytes)
+			ar := &pb.ActionResult{}
+			if proto.Unmarshal(acBytes, ar) == nil {
+				acForObserver = ar
+			} else {
+				lruObservationsDropped.WithLabelValues(dropReasonUnmarshalActionRes).Inc()
+			}
 		}
 	}
 
