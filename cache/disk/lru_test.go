@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"fmt"
 	"math"
 	"net/http"
 	"reflect"
@@ -103,6 +104,44 @@ func TestEviction(t *testing.T) {
 		if !reflect.DeepEqual(expectedEvictions, evictions) {
 			t.Fatalf("Expecting evictions %v, found %v", expectedEvictions, evictions)
 		}
+	}
+}
+
+func TestPeekDoesNotPromote(t *testing.T) {
+	var evictions []string
+	onEvict := func(key string, value lruItem) {
+		evictions = append(evictions, key)
+	}
+
+	// Room for exactly two single-block items.
+	lru := NewSizedLRU(2*BlockSize, onEvict, 0)
+
+	item := lruItem{size: 1, sizeOnDisk: 1}
+	for i := 0; i < 2; i++ {
+		key := fmt.Sprintf("%d", i)
+		if ok := lru.Add(key, item); !ok {
+			t.Fatalf("Add: failed adding %d", i)
+		}
+	}
+
+	// Peek the LRU-side entry; this must not change its recency.
+	peeked, ok := lru.Peek("0")
+	if !ok {
+		t.Fatalf("Peek: failed getting item")
+	}
+	if peeked.sizeOnDisk != item.sizeOnDisk {
+		t.Fatalf("Peek: got a different item back")
+	}
+
+	// Adding a third item must still evict key 0, not key 1.
+	if ok := lru.Add("2", item); !ok {
+		t.Fatalf("Add: failed adding 2")
+	}
+	if len(lru.queuedEvictionsChan) > 0 {
+		lru.performQueuedEvictions()
+	}
+	if !reflect.DeepEqual(evictions, []string{"0"}) {
+		t.Fatalf("Expecting evictions [0], found %v", evictions)
 	}
 }
 

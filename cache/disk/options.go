@@ -131,3 +131,13 @@ func WithOperationObserver(observer cache.OperationObserver) Option {
 		return nil
 	}
 }
+
+// WithLRUObserver sets the (optional) sink for AC-access closures used to build
+// LRU retention artifacts. Capture happens inside the diskCache (D15); a nil
+// observer disables capture entirely with no behavior change.
+func WithLRUObserver(observer cache.LRUObserver) Option {
+	return func(c *CacheConfig) error {
+		c.diskCache.lruObserver = observer
+		return nil
+	}
+}

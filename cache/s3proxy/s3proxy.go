@@ -397,6 +397,17 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 		size = s.Size
 	}
 
+	if exists {
+		// Surface the stored object size for LRU closure capture without
+		// changing the value returned to the validator. StatObject already
+		// computed s.Size, so this is free, and for CAS/v2 it is the only
+		// place the on-disk size is available (the returned size stays -1).
+		// A nil sink (the common case) makes this a no-op.
+		if sink, ok := cache.LeafSizeSinkFromContext(ctx); ok && s.Size >= 0 {
+			sink.RecordLeafSize(hash, s.Size, true)
+		}
+	}
+
 	logResponse(c.accessLogger, "CONTAINS", c.bucket, objectKey, err)
 
 	return exists, size
