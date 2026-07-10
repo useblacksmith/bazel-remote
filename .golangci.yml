@@ -1,0 +1,30 @@
+version: "2"
+
+# The go 1.25 directive forced an upgrade from golangci-lint v1 (latest v1
+# binaries are built with go1.24) to v2. This config reproduces the v1
+# default gate this repo was linted with, so the upgrade does not require a
+# style sweep of upstream bazel-remote code:
+# - v2 merged stylecheck (ST*) and quickfix (QF*) into staticcheck; v1 did
+#   not enable them by default, so keep staticcheck to S*/SA* checks.
+# - v2 moved v1's default exclusion rules behind opt-in presets.
+linters:
+  settings:
+    staticcheck:
+      checks:
+        - "S*"
+        - "SA*"
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # The grpc 1.79 bump (security bundle 0710-B1) added deprecation
+      # markers for grpc.Dial/DialContext/WithBlock, which remain supported
+      # throughout grpc 1.x. Migrating to grpc.NewClient changes dial
+      # semantics (lazy connect, WithBlock unsupported) and is out of scope
+      # for a dependency bump; do that migration in a dedicated change.
+      - linters:
+          - staticcheck
+        text: 'SA1019: grpc\.(Dial|DialContext|WithBlock) is deprecated'
