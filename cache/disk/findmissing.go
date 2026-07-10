@@ -182,6 +182,7 @@ func (c *diskCache) findMissingLocalCAS(ctx context.Context, blobs []*pb.Digest)
 	var item lruItem
 	var key string
 	missing := 0
+	hits := uint64(0)
 
 	// Only AC-closure validation attaches a sink (LRU capture); the public
 	// FindMissingBlobs path has none, so this is a no-op there.
@@ -193,6 +194,7 @@ func (c *diskCache) findMissingLocalCAS(ctx context.Context, blobs []*pb.Digest)
 		if blobs[i].SizeBytes == 0 && blobs[i].Hash == emptySha256 {
 			c.accessLogger.Printf("GRPC CAS HEAD %s OK", blobs[i].Hash)
 			blobs[i] = nil
+			hits++
 			continue
 		}
 
@@ -210,12 +212,19 @@ func (c *diskCache) findMissingLocalCAS(ctx context.Context, blobs []*pb.Digest)
 			}
 			c.accessLogger.Printf("GRPC CAS HEAD %s OK", blobs[i].Hash)
 			blobs[i] = nil
+			hits++
 		} else {
 			missing++
 		}
 	}
 
 	c.mu.Unlock()
+	if hits > 0 {
+		c.observeLookup(ctx, cache.CAS, cache.LookupAccessContains, cache.LookupSourceLocal, cache.LookupResultHit, hits)
+	}
+	if missing > 0 {
+		c.observeLookup(ctx, cache.CAS, cache.LookupAccessContains, cache.LookupSourceLocal, cache.LookupResultMiss, uint64(missing))
+	}
 
 	return missing
 }
@@ -237,11 +246,15 @@ func (c *diskCache) processContainsCheck(req proxyCheck) {
 
 	ok, _ := c.proxy.Contains(req.ctx, cache.CAS, (*req.digest).Hash, (*req.digest).SizeBytes)
 	if ok {
+		c.observeLookup(req.ctx, cache.CAS, cache.LookupAccessContains, cache.LookupSourceBackend, cache.LookupResultHit, 1)
 		c.accessLogger.Printf("GRPC CAS HEAD %s OK", (*req.digest).Hash)
 		// The blob exists on the proxy, remove it from the
 		// list of missing blobs.
 		*(req.digest) = nil
 	} else {
+		// Proxy.Contains does not expose backend errors separately, so false is
+		// necessarily observed as a miss at this interface boundary.
+		c.observeLookup(req.ctx, cache.CAS, cache.LookupAccessContains, cache.LookupSourceBackend, cache.LookupResultMiss, 1)
 		c.accessLogger.Printf("GRPC CAS HEAD %s NOT FOUND", (*req.digest).Hash)
 		if req.onProxyMiss != nil {
 			req.onProxyMiss()

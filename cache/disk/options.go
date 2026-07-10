@@ -123,6 +123,15 @@ func WithOperationObserver(observer cache.OperationObserver) Option {
 	}
 }
 
+// WithLookupAttemptObserver sets the optional low-cardinality observer for
+// local/backend lookup attempts and final AC closure validation.
+func WithLookupAttemptObserver(observer cache.LookupAttemptObserver) Option {
+	return func(c *CacheConfig) error {
+		c.diskCache.lookupObserver = observer
+		return nil
+	}
+}
+
 // WithLRUObserver sets the (optional) sink for AC-access closures used to build
 // LRU retention artifacts. Capture happens inside the diskCache (D15); a nil
 // observer disables capture entirely with no behavior change.

@@ -72,6 +72,7 @@ type diskCache struct {
 	dir              string
 	proxy            cache.Proxy
 	lruObserver      cache.LRUObserver
+	lookupObserver   cache.LookupAttemptObserver
 	storageMode      casblob.CompressionType
 	zstd             zstdimpl.ZstdImpl
 	maxBlobSize      int64
@@ -656,10 +657,12 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	// The hash format is checked properly in the http/grpc code.
 	// Just perform a simple/fast check here, to catch bad tests.
 	if len(hash) != sha256HashStrSize {
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceLocal, cache.LookupResultError, 1)
 		return nil, -1, badReqErr("Invalid hash size: %d, expected: %d", len(hash), sha256.Size)
 	}
 
 	if kind == cache.CAS && size <= 0 && hash == emptySha256 {
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceLocal, cache.LookupResultHit, 1)
 		if zstd {
 			return io.NopCloser(bytes.NewReader(emptyZstdBlob)), 0, nil
 		}
@@ -668,13 +671,16 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	}
 
 	if kind != cache.CAS && zstd {
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceLocal, cache.LookupResultError, 1)
 		return nil, -1, errOnlyCompressedCAS
 	}
 
 	if offset < 0 {
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceLocal, cache.LookupResultError, 1)
 		return nil, -1, badReqErr("Invalid offset: %d", offset)
 	}
 	if size > 0 && offset >= size {
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceLocal, cache.LookupResultError, 1)
 		return nil, -1, badReqErr("Invalid offset: %d for size %d", offset, size)
 	}
 
@@ -714,14 +720,17 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	f, foundSize, tryProxy, err := c.availableOrTryProxy(ctx, kind, hash, size, offset, zstd)
 	if err != nil {
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceLocal, cache.LookupResultError, 1)
 		return nil, -1, internalErr(err)
 	}
 	if tryProxy && size > 0 {
 		unreserve = true
 	}
 	if f != nil {
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceLocal, cache.LookupResultHit, 1)
 		return f, foundSize, nil
 	}
+	c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceLocal, cache.LookupResultMiss, 1)
 
 	if !tryProxy {
 		return nil, -1, nil
@@ -732,19 +741,24 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		defer r.Close()
 	}
 	if err != nil {
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceBackend, cache.LookupResultError, 1)
 		return nil, -1, internalErr(err)
 	}
 	if r == nil {
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceBackend, cache.LookupResultMiss, 1)
 		return nil, -1, nil
 	}
 	if foundSize > c.maxProxyBlobSize {
 		r.Close()
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceBackend, cache.LookupResultError, 1)
 		return nil, -1, nil
 	}
 
 	if isSizeMismatch(size, foundSize) || foundSize < 0 {
+		c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceBackend, cache.LookupResultError, 1)
 		return nil, -1, nil
 	}
+	c.observeLookup(ctx, kind, cache.LookupAccessGet, cache.LookupSourceBackend, cache.LookupResultHit, 1)
 
 	legacy := kind == cache.CAS && c.storageMode == casblob.Identity
 
@@ -817,10 +831,12 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 	// The hash format is checked properly in the http/grpc code.
 	// Just perform a simple/fast check here, to catch bad tests.
 	if len(hash) != sha256HashStrSize {
+		c.observeLookup(ctx, kind, cache.LookupAccessContains, cache.LookupSourceLocal, cache.LookupResultError, 1)
 		return false, -1
 	}
 
 	if kind == cache.CAS && size <= 0 && hash == emptySha256 {
+		c.observeLookup(ctx, kind, cache.LookupAccessContains, cache.LookupSourceLocal, cache.LookupResultHit, 1)
 		return true, 0
 	}
 
@@ -835,14 +851,22 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 	c.mu.Unlock()
 
 	if exists && !isSizeMismatch(size, foundSize) {
+		c.observeLookup(ctx, kind, cache.LookupAccessContains, cache.LookupSourceLocal, cache.LookupResultHit, 1)
 		return true, foundSize
 	}
+	c.observeLookup(ctx, kind, cache.LookupAccessContains, cache.LookupSourceLocal, cache.LookupResultMiss, 1)
 
 	if c.proxy != nil && size <= c.maxProxyBlobSize {
 		exists, foundSize = c.proxy.Contains(ctx, kind, hash, size)
 		if exists && foundSize <= c.maxProxyBlobSize && !isSizeMismatch(size, foundSize) {
+			c.observeLookup(ctx, kind, cache.LookupAccessContains, cache.LookupSourceBackend, cache.LookupResultHit, 1)
 			return true, foundSize
 		}
+		result := cache.LookupResultMiss
+		if exists {
+			result = cache.LookupResultError
+		}
+		c.observeLookup(ctx, kind, cache.LookupAccessContains, cache.LookupSourceBackend, result, 1)
 	}
 
 	return false, -1
@@ -872,6 +896,13 @@ func isSizeMismatch(requestedSize int64, foundSize int64) bool {
 // not, nil values are returned. If something unexpected went wrong, return
 // an error.
 func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (*pb.ActionResult, []byte, error) {
+	validationResult := cache.LookupResult("")
+	defer func() {
+		if validationResult != "" {
+			c.observeLookup(ctx, cache.AC, cache.LookupAccessValidatedAction, cache.LookupSourceValidation, validationResult, 1)
+		}
+	}()
+
 	// LRU capture (D15): when an observer is configured, attach a leaf-size
 	// sink so the closure can be assembled from sizes that validation already
 	// resolves. Gated so the default path is byte-for-byte unchanged.
@@ -893,6 +924,10 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 	if rc == nil || sizeBytes <= 0 {
 		return nil, nil, nil // aka "not found"
 	}
+	// Once the AC blob exists, every exit from this function is a terminal
+	// closure-validation outcome. Error is the safe default for malformed or
+	// unreadable action results; missing dependencies and full hits override it.
+	validationResult = cache.LookupResultError
 
 	acdata, err := io.ReadAll(rc)
 	if err != nil {
@@ -932,6 +967,9 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 		// d was validated in validate.ActionResult but blobs were not checked for existence
 		r, size, err := c.Get(ctx, cache.CAS, d.TreeDigest.Hash, d.TreeDigest.SizeBytes, 0)
 		if r == nil {
+			if err == nil {
+				validationResult = cache.LookupResultDependencyMissing
+			}
 			return nil, nil, err // aka "not found", or an err if non-nil
 		}
 		if err != nil {
@@ -1010,6 +1048,7 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 
 	err = c.findMissingCasBlobsInternal(ctx, pendingValidations, true)
 	if errors.Is(err, errMissingBlob) {
+		validationResult = cache.LookupResultDependencyMissing
 		return nil, nil, nil // aka "not found"
 	}
 	if err != nil {
@@ -1021,6 +1060,7 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 		// validation touched each one. AC blobs are uncompressed (size == sizeOnDisk).
 		c.emitACClosureFromHit(ctx, hash, sizeBytes, leafHashes, collector)
 	}
+	validationResult = cache.LookupResultHit
 
 	return result, acdata, nil
 }
