@@ -2,6 +2,7 @@ package backendproxy
 
 import (
 	"io"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 )
@@ -12,6 +13,10 @@ type UploadReq struct {
 	SizeOnDisk  int64
 	Kind        cache.EntryKind
 	Rc          io.ReadCloser
+	// EnqueuedAt is stamped by asynchronous backends immediately before the
+	// queue send. Workers use it to observe active-work drain delay without
+	// exporting fleet-wide queue depth.
+	EnqueuedAt time.Time
 	// StoragePrefix captures the request-scoped physical object-key prefix at
 	// enqueue time. Uploads are asynchronous, so backends cannot rely on the
 	// original request context still being available when workers process this.

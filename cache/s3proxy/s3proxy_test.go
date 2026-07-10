@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
@@ -16,6 +17,16 @@ import (
 
 type recordingObserver struct {
 	outcomes []cache.OperationOutcome
+}
+
+type recordingMetrics struct {
+	queueWaits []time.Duration
+}
+
+func (*recordingMetrics) IncPrefixMissing(string) {}
+
+func (m *recordingMetrics) ObserveQueueWait(wait time.Duration) {
+	m.queueWaits = append(m.queueWaits, wait)
 }
 
 func (r *recordingObserver) RecordOutcome(_ context.Context, outcome cache.OperationOutcome) {
@@ -160,6 +171,27 @@ func TestPutCapturesRequestScopedPrefixForAsyncUpload(t *testing.T) {
 	if item.RequireStoragePrefix {
 		t.Fatal("queued upload RequireStoragePrefix = true, want false")
 	}
+	if item.EnqueuedAt.IsZero() {
+		t.Fatal("queued upload EnqueuedAt is zero")
+	}
+}
+
+func TestObserveQueueWaitRecordsDequeuedWork(t *testing.T) {
+	metrics := &recordingMetrics{}
+	c := &s3Cache{metrics: metrics}
+	c.observeQueueWait(backendproxy.UploadReq{EnqueuedAt: time.Now().Add(-25 * time.Millisecond)})
+
+	if len(metrics.queueWaits) != 1 {
+		t.Fatalf("queue waits len = %d, want 1", len(metrics.queueWaits))
+	}
+	if metrics.queueWaits[0] < 20*time.Millisecond {
+		t.Fatalf("queue wait = %s, want at least 20ms", metrics.queueWaits[0])
+	}
+
+	c.observeQueueWait(backendproxy.UploadReq{})
+	if len(metrics.queueWaits) != 1 {
+		t.Fatalf("zero enqueue time recorded an observation; waits len = %d", len(metrics.queueWaits))
+	}
 }
 
 func TestPutCapturesRequestScopedPrefixForActionCacheAsyncUpload(t *testing.T) {
@@ -245,6 +277,9 @@ func TestPutRecordsUploadQueueDrop(t *testing.T) {
 	if outcome.Method != "backend_upload" || outcome.Status != "dropped" || outcome.Reason != "upload_queue_full" {
 		t.Fatalf("unexpected outcome: %+v", outcome)
 	}
+	if outcome.Kind != cache.CAS {
+		t.Fatalf("dropped outcome kind = %s, want cas", outcome.Kind)
+	}
 	if outcome.Bytes != 4 {
 		t.Fatalf("dropped outcome bytes = %d, want 4 (SizeOnDisk)", outcome.Bytes)
 	}
@@ -273,6 +308,9 @@ func TestObserveUploadReportsSizeOnDisk(t *testing.T) {
 	outcome := observer.outcomes[0]
 	if outcome.Method != "backend_upload" || outcome.Status != "error" || outcome.Reason != "s3_put_failed" {
 		t.Fatalf("unexpected outcome: %+v", outcome)
+	}
+	if outcome.Kind != cache.CAS {
+		t.Fatalf("outcome kind = %s, want cas", outcome.Kind)
 	}
 	if outcome.Bytes != 12 {
 		t.Fatalf("outcome bytes = %d, want 12 (SizeOnDisk, not LogicalSize)", outcome.Bytes)

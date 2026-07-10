@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
@@ -29,6 +30,9 @@ type Metrics interface {
 	// used instead (a potential cross-namespace read/write). operation is one of
 	// "UPLOAD", "DOWNLOAD", "CONTAINS".
 	IncPrefixMissing(operation string)
+	// ObserveQueueWait records the delay from enqueue until an upload worker
+	// begins processing the item. It is invoked only for dequeued work.
+	ObserveQueueWait(time.Duration)
 }
 
 type s3Cache struct {
@@ -205,6 +209,7 @@ func logResponse(log cache.Logger, method, bucket, key string, err error) {
 }
 
 func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
+	c.observeQueueWait(item)
 	prefix := item.StoragePrefix
 	requestScopedPrefix := item.RequestScopedStoragePrefix
 	requirePrefix := item.RequireStoragePrefix
@@ -290,6 +295,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		SizeOnDisk:                 sizeOnDisk,
 		Kind:                       kind,
 		Rc:                         rc,
+		EnqueuedAt:                 time.Now(),
 		StoragePrefix:              prefix,
 		RequestScopedStoragePrefix: requestScopedPrefix,
 		RequireStoragePrefix:       requirePrefix,
@@ -299,6 +305,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		c.errorLogger.Printf("too many uploads queued\n")
 		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
 			Method: "backend_upload",
+			Kind:   kind,
 			Status: "dropped",
 			Reason: "upload_queue_full",
 			Ops:    1,
@@ -407,11 +414,23 @@ func (c *s3Cache) observeUpload(ctx context.Context, item backendproxy.UploadReq
 	// persists; the footprint accumulator and the MinIO drift scan share this unit.
 	cache.ObserveOperation(cache.WithMetricsLabels(ctx, item.MetricsLabels), c.observer, cache.OperationOutcome{
 		Method: "backend_upload",
+		Kind:   item.Kind,
 		Status: status,
 		Reason: reason,
 		Ops:    1,
 		Bytes:  nonNegativeUint64(item.SizeOnDisk),
 	})
+}
+
+func (c *s3Cache) observeQueueWait(item backendproxy.UploadReq) {
+	if c.metrics == nil || item.EnqueuedAt.IsZero() {
+		return
+	}
+	wait := time.Since(item.EnqueuedAt)
+	if wait < 0 {
+		wait = 0
+	}
+	c.metrics.ObserveQueueWait(wait)
 }
 
 func nonNegativeUint64(value int64) uint64 {

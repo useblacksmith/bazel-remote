@@ -37,6 +37,9 @@ type OperationObserver interface {
 type OperationOutcome struct {
 	Labels MetricsLabels
 	Method string
+	// Kind is required for storage outcomes whose consumers distinguish AC and
+	// CAS. Producers of those outcomes must set it explicitly.
+	Kind   EntryKind
 	Status string
 	Reason string
 	Ops    uint64
