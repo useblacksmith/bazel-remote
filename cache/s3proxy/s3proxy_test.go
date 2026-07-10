@@ -29,6 +29,14 @@ func (m *recordingMetrics) ObserveQueueWait(wait time.Duration) {
 	m.queueWaits = append(m.queueWaits, wait)
 }
 
+type panickingMetrics struct{}
+
+func (*panickingMetrics) IncPrefixMissing(string) {}
+
+func (*panickingMetrics) ObserveQueueWait(time.Duration) {
+	panic("metrics sink failure")
+}
+
 func (r *recordingObserver) RecordOutcome(_ context.Context, outcome cache.OperationOutcome) {
 	r.outcomes = append(r.outcomes, outcome)
 }
@@ -192,6 +200,12 @@ func TestObserveQueueWaitRecordsDequeuedWork(t *testing.T) {
 	if len(metrics.queueWaits) != 1 {
 		t.Fatalf("zero enqueue time recorded an observation; waits len = %d", len(metrics.queueWaits))
 	}
+}
+
+func TestObserveQueueWaitIsolatesMetricsPanics(t *testing.T) {
+	c := &s3Cache{metrics: &panickingMetrics{}}
+
+	c.observeQueueWait(backendproxy.UploadReq{EnqueuedAt: time.Now()})
 }
 
 func TestPutCapturesRequestScopedPrefixForActionCacheAsyncUpload(t *testing.T) {

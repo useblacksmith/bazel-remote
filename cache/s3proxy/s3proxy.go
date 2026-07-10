@@ -430,7 +430,15 @@ func (c *s3Cache) observeQueueWait(item backendproxy.UploadReq) {
 	if wait < 0 {
 		wait = 0
 	}
-	c.metrics.ObserveQueueWait(wait)
+	// Metrics are advisory and this runs at the top of an uploader goroutine.
+	// A buggy embedder must not kill that worker before it uploads the item and
+	// closes the reader, permanently reducing backend-write capacity.
+	func() {
+		defer func() {
+			_ = recover()
+		}()
+		c.metrics.ObserveQueueWait(wait)
+	}()
 }
 
 func nonNegativeUint64(value int64) uint64 {
