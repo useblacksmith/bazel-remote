@@ -14,7 +14,9 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - name: checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+        with:
+          persist-credentials: false
       - name: get release version
         id: release_version
         run: echo VERSION=${GITHUB_REF/refs\/tags\/v/} >> $GITHUB_ENV
@@ -30,7 +32,7 @@ jobs:
           bazelisk run --run_under "cp -f " //:bazel-remote-linux-arm64 $(pwd)/bazel-remote-${{ env.VERSION }}-linux-arm64
       - name: upload linux binaries
         id: upload-release-assets-linux
-        uses: xresloader/upload-to-github-release@v1
+        uses: xresloader/upload-to-github-release@7c5757a90c0bcf0c0e1741da8f2abd7b85e675d0 # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -43,7 +45,9 @@ jobs:
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+        with:
+          persist-credentials: false
       - name: get release version
         id: release_version
         run: echo VERSION=${GITHUB_REF/refs\/tags\/v/} >> $GITHUB_ENV
@@ -59,7 +63,7 @@ jobs:
           bazelisk run --run_under "cp -f " //:bazel-remote-darwin-arm64 $(pwd)/bazel-remote-${{ env.VERSION }}-darwin-arm64
       - name: upload darwin binaries
         id: upload-release-assets-darwin
-        uses: xresloader/upload-to-github-release@v1
+        uses: xresloader/upload-to-github-release@7c5757a90c0bcf0c0e1741da8f2abd7b85e675d0 # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
