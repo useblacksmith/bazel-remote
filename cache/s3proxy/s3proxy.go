@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"sync/atomic"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
@@ -43,6 +45,8 @@ type s3Cache struct {
 	updateTimestamps bool
 	objectKey        func(prefix string, hash string, kind cache.EntryKind) string
 	observer         cache.OperationObserver
+	uploadObserver   UploadObserver
+	activeUploads    atomic.Int64
 }
 
 type Option func(*s3Cache)
@@ -50,6 +54,14 @@ type Option func(*s3Cache)
 func WithOperationObserver(observer cache.OperationObserver) Option {
 	return func(c *s3Cache) {
 		c.observer = observer
+	}
+}
+
+// WithUploadObserver records asynchronous queue and backend upload lifecycle
+// events. The observer is best-effort and cannot affect cache behavior.
+func WithUploadObserver(observer UploadObserver) Option {
+	return func(c *s3Cache) {
+		c.uploadObserver = observer
 	}
 }
 
@@ -205,6 +217,23 @@ func logResponse(log cache.Logger, method, bucket, key string, err error) {
 }
 
 func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
+	startedAt := time.Now()
+	activeUploads := c.activeUploads.Add(1)
+	queueWait := time.Duration(0)
+	if !item.EnqueuedAt.IsZero() {
+		queueWait = startedAt.Sub(item.EnqueuedAt)
+	}
+	observeUploadEvent(c.uploadObserver, UploadEvent{
+		Stage:         UploadStageStarted,
+		Kind:          item.Kind,
+		Labels:        item.MetricsLabels,
+		SizeOnDisk:    item.SizeOnDisk,
+		QueueDepth:    len(c.uploadQueue),
+		QueueCapacity: cap(c.uploadQueue),
+		ActiveUploads: activeUploads,
+		QueueWait:     queueWait,
+	})
+
 	prefix := item.StoragePrefix
 	requestScopedPrefix := item.RequestScopedStoragePrefix
 	requirePrefix := item.RequireStoragePrefix
@@ -232,6 +261,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	// already_exists instead of created.
 	opts.SetMatchETagExcept("*")
 
+	backendStartedAt := time.Now()
 	_, err := c.mcore.PutObject(
 		context.Background(),
 		c.bucket,        // bucketName
@@ -247,6 +277,20 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 
 	status, reason := classifyUploadOutcome(err)
 	c.observeUpload(context.Background(), item, status, reason)
+	remainingActiveUploads := c.activeUploads.Add(-1)
+	observeUploadEvent(c.uploadObserver, UploadEvent{
+		Stage:           UploadStageFinished,
+		Status:          status,
+		Reason:          reason,
+		Kind:            item.Kind,
+		Labels:          item.MetricsLabels,
+		SizeOnDisk:      item.SizeOnDisk,
+		QueueDepth:      len(c.uploadQueue),
+		QueueCapacity:   cap(c.uploadQueue),
+		ActiveUploads:   remainingActiveUploads,
+		QueueWait:       queueWait,
+		BackendDuration: time.Since(backendStartedAt),
+	})
 
 	item.Rc.Close()
 }
@@ -283,6 +327,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
 	labels, _ := cache.MetricsLabelsFromContext(ctx)
 
+	enqueuedAt := time.Now()
 	select {
 	case c.uploadQueue <- backendproxy.UploadReq{
 		Hash:                       hash,
@@ -294,8 +339,29 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		RequestScopedStoragePrefix: requestScopedPrefix,
 		RequireStoragePrefix:       requirePrefix,
 		MetricsLabels:              labels,
+		EnqueuedAt:                 enqueuedAt,
 	}:
+		observeUploadEvent(c.uploadObserver, UploadEvent{
+			Stage:         UploadStageEnqueued,
+			Kind:          kind,
+			Labels:        labels,
+			SizeOnDisk:    sizeOnDisk,
+			QueueDepth:    len(c.uploadQueue),
+			QueueCapacity: cap(c.uploadQueue),
+			ActiveUploads: c.activeUploads.Load(),
+		})
 	default:
+		observeUploadEvent(c.uploadObserver, UploadEvent{
+			Stage:         UploadStageDropped,
+			Status:        "dropped",
+			Reason:        "upload_queue_full",
+			Kind:          kind,
+			Labels:        labels,
+			SizeOnDisk:    sizeOnDisk,
+			QueueDepth:    len(c.uploadQueue),
+			QueueCapacity: cap(c.uploadQueue),
+			ActiveUploads: c.activeUploads.Load(),
+		})
 		c.errorLogger.Printf("too many uploads queued\n")
 		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
 			Method: "backend_upload",

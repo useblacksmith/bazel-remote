@@ -2,6 +2,7 @@ package backendproxy
 
 import (
 	"io"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 )
@@ -19,6 +20,7 @@ type UploadReq struct {
 	RequestScopedStoragePrefix bool
 	RequireStoragePrefix       bool
 	MetricsLabels              cache.MetricsLabels
+	EnqueuedAt                 time.Time
 }
 
 type Uploader interface {
