@@ -102,7 +102,7 @@ func grpcTestSetupInternal(t *testing.T, mangleACKeys bool) (tc grpcTestFixtureW
 	}
 }
 
-func grpcTestSetupWithCustomCache(t *testing.T, mangleACKeys bool, validateAC bool, diskCache disk.Cache) (tc grpcTestFixture) {
+func grpcTestSetupWithCustomCache(t *testing.T, mangleACKeys bool, validateAC bool, diskCache disk.Cache, options ...GRPCServerOption) (tc grpcTestFixture) {
 
 	accessLogger := testutils.NewSilentLogger()
 	errorLogger := testutils.NewSilentLogger()
@@ -124,7 +124,7 @@ func grpcTestSetupWithCustomCache(t *testing.T, mangleACKeys bool, validateAC bo
 			mangleACKeys,
 			enableRemoteAssetAPI,
 			testMaxCasBlobSizeBytes,
-			diskCache, accessLogger, errorLogger)
+			diskCache, accessLogger, errorLogger, options...)
 		if err2 != nil {
 			fmt.Println(err2)
 			os.Exit(1)

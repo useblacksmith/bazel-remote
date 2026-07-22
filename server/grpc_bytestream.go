@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc/codes"
@@ -101,13 +102,29 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		return status.Error(codes.OutOfRange, msg)
 	}
 
+	ctx := resp.Context()
+	if s.runtimeMetrics != nil {
+		s.runtimeMetrics.ByteStreamReadStarted(ctx, size)
+		defer s.runtimeMetrics.ByteStreamReadFinished(ctx, size)
+	}
+
+	waitStarted := time.Now()
+	err = s.readLimiter.acquireRead(ctx)
+	if s.runtimeMetrics != nil {
+		s.runtimeMetrics.ByteStreamReadAdmissionWait(ctx, "active_reads", time.Since(waitStarted))
+	}
+	if err != nil {
+		return status.FromContextError(err).Err()
+	}
+	defer s.readLimiter.releaseRead()
+
 	var rc io.ReadCloser
 	var foundSize int64
 
 	if cmp == casblob.Zstandard {
-		rc, foundSize, err = s.cache.GetZstd(resp.Context(), hash, size, req.ReadOffset)
+		rc, foundSize, err = s.cache.GetZstd(ctx, hash, size, req.ReadOffset)
 	} else {
-		rc, foundSize, err = s.cache.Get(resp.Context(), cache.CAS, hash, size, req.ReadOffset)
+		rc, foundSize, err = s.cache.Get(ctx, cache.CAS, hash, size, req.ReadOffset)
 	}
 
 	if rc != nil {
@@ -137,6 +154,23 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	bufSize := size
 	if bufSize > maxChunkSize {
 		bufSize = maxChunkSize
+	}
+
+	waitStarted = time.Now()
+	err = s.readLimiter.acquireBuffer(ctx, bufSize)
+	if s.runtimeMetrics != nil {
+		s.runtimeMetrics.ByteStreamReadAdmissionWait(ctx, "buffer_bytes", time.Since(waitStarted))
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return status.FromContextError(ctx.Err()).Err()
+		}
+		return status.Error(codes.ResourceExhausted, err.Error())
+	}
+	defer s.readLimiter.releaseBuffer(bufSize)
+	if s.runtimeMetrics != nil {
+		s.runtimeMetrics.ByteStreamReadBufferReserved(ctx, bufSize)
+		defer s.runtimeMetrics.ByteStreamReadBufferReleased(ctx, bufSize)
 	}
 
 	buf := make([]byte, bufSize)
