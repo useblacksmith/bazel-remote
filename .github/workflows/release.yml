@@ -1,9 +1,12 @@
 name: create release binaries
 
 on:
-  release:
-    types:
-      - published
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published patchset release tag (vX.Y.Z-blacksmith.N)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,21 +16,28 @@ jobs:
     name: validate patchset release source
     runs-on: blacksmith-4vcpu-ubuntu-2204
     outputs:
+      release_tag: ${{ steps.release_source.outputs.release_tag }}
       source_sha: ${{ steps.release_source.outputs.source_sha }}
       version: ${{ steps.release_source.outputs.version }}
     steps:
       - name: checkout release tag
         uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: refs/tags/${{ inputs.release_tag }}
           fetch-depth: 0
           persist-credentials: false
       - name: validate release source
         id: release_source
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-blacksmith\.[0-9]+$ ]]; then
+            echo "::error::release tag must match vX.Y.Z-blacksmith.N"
+            exit 1
+          fi
 
           if ! git show-ref --verify --quiet refs/remotes/origin/patchset; then
             echo "::error::origin/patchset was not fetched"
@@ -40,13 +50,19 @@ jobs:
             exit 1
           fi
 
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-blacksmith\.[0-9]+$ ]]; then
-            echo "::error::release tag must match vX.Y.Z-blacksmith.N"
+          release_state="$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            --jq '[.draft, (.published_at != null)] | @tsv')"
+          if [[ "$release_state" != $'false\ttrue' ]]; then
+            echo "::error::release tag $RELEASE_TAG must have a published GitHub Release"
             exit 1
           fi
 
-          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_tag=$RELEASE_TAG"
+            echo "source_sha=$source_sha"
+            echo "version=${RELEASE_TAG#v}"
+          } >> "$GITHUB_OUTPUT"
 
   linux:
     name: create linux binaries
@@ -58,6 +74,7 @@ jobs:
     # on a newer image would raise the glibc floor and break older target systems.
     runs-on: blacksmith-4vcpu-ubuntu-2204
     env:
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
       - name: checkout code
@@ -83,7 +100,7 @@ jobs:
         with:
           file: bazel-remote-${{ env.VERSION }}-linux-*
           overwrite: true
-          tags: true
+          tag_name: ${{ env.RELEASE_TAG }}
 
   mac:
     name: create mac binaries
@@ -92,6 +109,7 @@ jobs:
       contents: write
     runs-on: blacksmith-6vcpu-macos-15
     env:
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
       - name: checkout
@@ -117,4 +135,4 @@ jobs:
         with:
           file: bazel-remote-${{ env.VERSION }}-darwin-*
           overwrite: true
-          tags: true
+          tag_name: ${{ env.RELEASE_TAG }}
