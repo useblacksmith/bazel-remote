@@ -7,6 +7,7 @@ go_library(
         "findmissing.go",
         "load.go",
         "lru.go",
+        "lru_capture.go",
         "metrics.go",
         "options.go",
     ],
@@ -23,6 +24,7 @@ go_library(
         "//utils/validate:go_default_library",
         "@com_github_djherbis_atime//:go_default_library",
         "@com_github_prometheus_client_golang//prometheus:go_default_library",
+        "@com_github_prometheus_client_golang//prometheus/promauto:go_default_library",
         "@org_golang_google_grpc//codes:go_default_library",
         "@org_golang_google_grpc//status:go_default_library",
         "@org_golang_google_protobuf//proto:go_default_library",
@@ -36,7 +38,10 @@ go_test(
     srcs = [
         "disk_test.go",
         "findmissing_test.go",
+        "lru_capture_bench_test.go",
+        "lru_capture_test.go",
         "lru_test.go",
+        "operation_observer_test.go",
     ],
     embed = [":go_default_library"],
     deps = [
@@ -49,5 +54,6 @@ go_test(
         "@com_github_prometheus_client_golang//prometheus:go_default_library",
         "@com_github_prometheus_client_golang//prometheus/testutil:go_default_library",
         "@org_golang_google_protobuf//proto:go_default_library",
+        "@org_golang_x_sync//semaphore:go_default_library",
     ],
 )

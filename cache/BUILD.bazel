@@ -1,8 +1,24 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "go_default_library",
-    srcs = ["cache.go"],
+    srcs = [
+        "cache.go",
+        "leaf_size_sink.go",
+        "lru_observer.go",
+        "metrics_context.go",
+        "storage_prefix.go",
+    ],
     importpath = "github.com/buchgr/bazel-remote/v2/cache",
     visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = [
+        "cache_test.go",
+        "lru_observer_test.go",
+        "metrics_context_test.go",
+    ],
+    embed = [":go_default_library"],
 )

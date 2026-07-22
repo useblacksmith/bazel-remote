@@ -9,11 +9,11 @@ Repository location: `github.com/useblacksmith/bazel-remote`.
 ## Upstream base
 
 - Module: `github.com/buchgr/bazel-remote/v2`
-- Version: `v2.4.4`
-- Upstream tag: `refs/tags/v2.4.4`
-- Upstream commit: `54d1782d72b291937988edad32c9752abe269d8e`
-- Module sum: `h1:fYqg5C4COpTO1OTHUHjYvVAOb2rEe2Xt+oYu4JTOlbc=`
-- Go module sum: `h1:Z7rZqDuLXfCyJ9HCu3ZYQsRx/yKHA+XH0eZq6jm80Gk=`
+- Version: `v2.6.1`
+- Upstream tag: `refs/tags/v2.6.1`
+- Upstream commit: `f46bc2030d3f30604d79ef4bf040e3a9c7a4ff89`
+- Module sum: `h1:vTMw3VmzjHfmR9jHcnqzQLLuHXRIFkROOcp5Pjke59c=`
+- Go module sum: `h1:vC7tD62wunH9S286SJ8naNJpKQNUgzlK3VlW816sI1E=`
 
 ## Local use
 
