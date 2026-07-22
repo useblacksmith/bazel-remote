@@ -69,14 +69,23 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   linux:
-    name: create linux binaries
+    name: create linux ${{ matrix.arch }} binary
     needs: validate
     permissions:
       contents: write
-    # Use the oldest available Ubuntu image to keep the glibc version low for the
-    # published, dynamically-linked (cgo, non-static) linux-x86_64 binary. Building
-    # on a newer image would raise the glibc floor and break older target systems.
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            artifact_arch: x86_64
+            runner: blacksmith-4vcpu-ubuntu-2204
+          - arch: arm64
+            artifact_arch: arm64
+            runner: blacksmith-4vcpu-ubuntu-2204-arm
+    # Build each cgo target on its native architecture. The Ubuntu 22.04 images
+    # also keep the glibc floor low for the dynamically-linked Linux binaries.
+    runs-on: ${{ matrix.runner }}
     env:
       RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
       VERSION: ${{ needs.validate.outputs.version }}
@@ -86,32 +95,37 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
           persist-credentials: false
-      - name: build amd64
+      - name: build ${{ matrix.arch }}
         run: |
           set -eu
-          bazelisk build //:bazel-remote-linux-amd64
-          bazelisk run --run_under "cp -f " //:bazel-remote-linux-amd64 $(pwd)/bazel-remote-${{ env.VERSION }}-linux-x86_64
-      - name: build arm64
-        run: |
-          set -eu
-          bazelisk build //:bazel-remote-linux-arm64
-          bazelisk run --run_under "cp -f " //:bazel-remote-linux-arm64 $(pwd)/bazel-remote-${{ env.VERSION }}-linux-arm64
-      - name: upload linux binaries
+          target="//:bazel-remote-linux-${{ matrix.arch }}"
+          output="$(pwd)/bazel-remote-${{ env.VERSION }}-linux-${{ matrix.artifact_arch }}"
+          bazelisk build "$target"
+          bazelisk run --run_under "cp -f " "$target" "$output"
+      - name: upload linux ${{ matrix.arch }} binary
         id: upload-release-assets-linux
         uses: xresloader/upload-to-github-release@7c5757a90c0bcf0c0e1741da8f2abd7b85e675d0 # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          file: bazel-remote-${{ env.VERSION }}-linux-*
+          file: bazel-remote-${{ env.VERSION }}-linux-${{ matrix.artifact_arch }}
           overwrite: true
           tag_name: ${{ env.RELEASE_TAG }}
 
   mac:
-    name: create mac binaries
+    name: create mac ${{ matrix.arch }} binary
     needs: validate
     permissions:
       contents: write
-    runs-on: blacksmith-6vcpu-macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: blacksmith-6vcpu-macos-15
+    runs-on: ${{ matrix.runner }}
     env:
       RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
       VERSION: ${{ needs.validate.outputs.version }}
@@ -121,22 +135,19 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
           persist-credentials: false
-      - name: build amd64
+      - name: build ${{ matrix.arch }}
         run: |
           set -eu
-          bazelisk build //:bazel-remote-darwin-amd64
-          bazelisk run --run_under "cp -f " //:bazel-remote-darwin-amd64 $(pwd)/bazel-remote-${{ env.VERSION }}-darwin-amd64
-      - name: build arm64
-        run: |
-          set -eu
-          bazelisk build //:bazel-remote-darwin-arm64
-          bazelisk run --run_under "cp -f " //:bazel-remote-darwin-arm64 $(pwd)/bazel-remote-${{ env.VERSION }}-darwin-arm64
-      - name: upload darwin binaries
+          target="//:bazel-remote-darwin-${{ matrix.arch }}"
+          output="$(pwd)/bazel-remote-${{ env.VERSION }}-darwin-${{ matrix.arch }}"
+          bazelisk build "$target"
+          bazelisk run --run_under "cp -f " "$target" "$output"
+      - name: upload darwin ${{ matrix.arch }} binary
         id: upload-release-assets-darwin
         uses: xresloader/upload-to-github-release@7c5757a90c0bcf0c0e1741da8f2abd7b85e675d0 # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          file: bazel-remote-${{ env.VERSION }}-darwin-*
+          file: bazel-remote-${{ env.VERSION }}-darwin-${{ matrix.arch }}
           overwrite: true
           tag_name: ${{ env.RELEASE_TAG }}
