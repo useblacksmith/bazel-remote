@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # rules_go 0.57.0 supports Bazel 7.x/8.x. Bazel 9 removes Starlark APIs it uses.
+  USE_BAZEL_VERSION: 8.4.2
+
 jobs:
   validate:
     name: validate patchset release source
