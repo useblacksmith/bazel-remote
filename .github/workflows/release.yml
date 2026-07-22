@@ -5,21 +5,66 @@ on:
     types:
       - published
 
+permissions:
+  contents: read
+
 jobs:
+  validate:
+    name: validate patchset release source
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    outputs:
+      source_sha: ${{ steps.release_source.outputs.source_sha }}
+      version: ${{ steps.release_source.outputs.version }}
+    steps:
+      - name: checkout release tag
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: validate release source
+        id: release_source
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if ! git show-ref --verify --quiet refs/remotes/origin/patchset; then
+            echo "::error::origin/patchset was not fetched"
+            exit 1
+          fi
+
+          source_sha="$(git rev-parse 'HEAD^{commit}')"
+          if ! git merge-base --is-ancestor "$source_sha" refs/remotes/origin/patchset; then
+            echo "::error::release tag $RELEASE_TAG must be reachable from the current patchset branch"
+            exit 1
+          fi
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-blacksmith\.[0-9]+$ ]]; then
+            echo "::error::release tag must match vX.Y.Z-blacksmith.N"
+            exit 1
+          fi
+
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
   linux:
     name: create linux binaries
+    needs: validate
+    permissions:
+      contents: write
     # Use the oldest available Ubuntu image to keep the glibc version low for the
     # published, dynamically-linked (cgo, non-static) linux-x86_64 binary. Building
     # on a newer image would raise the glibc floor and break older target systems.
     runs-on: blacksmith-4vcpu-ubuntu-2204
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
     steps:
       - name: checkout code
         uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
         with:
+          ref: ${{ needs.validate.outputs.source_sha }}
           persist-credentials: false
-      - name: get release version
-        id: release_version
-        run: echo VERSION=${GITHUB_REF/refs\/tags\/v/} >> $GITHUB_ENV
       - name: build amd64
         run: |
           set -eu
@@ -42,15 +87,18 @@ jobs:
 
   mac:
     name: create mac binaries
+    needs: validate
+    permissions:
+      contents: write
     runs-on: blacksmith-6vcpu-macos-15
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
     steps:
       - name: checkout
         uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
         with:
+          ref: ${{ needs.validate.outputs.source_sha }}
           persist-credentials: false
-      - name: get release version
-        id: release_version
-        run: echo VERSION=${GITHUB_REF/refs\/tags\/v/} >> $GITHUB_ENV
       - name: build amd64
         run: |
           set -eu
