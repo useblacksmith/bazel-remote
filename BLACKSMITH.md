@@ -18,10 +18,13 @@ Go module path: `github.com/buchgr/bazel-remote/v2`.
 - Upstream upgrades rebase `patchset` onto an exact, verified upstream release
   tag. Update the remote branch with `--force-with-lease`; do not merge
   `patchset` into `main`.
-- Release tags use `vX.Y.Z-blacksmith.N` and are cut from `patchset`. The release
-  workflow on `main` validates that the published tag is reachable from the
-  current `patchset`, resolves it to one immutable commit, and gives that same
-  commit to every platform build.
+- Release tags use `vX.Y.Z-blacksmith.N` and are cut from `patchset`. After the
+  GitHub Release is published, manually dispatch the release workflow on
+  `main` with that tag. The workflow validates that the tag is reachable from
+  the current `patchset`, resolves it to one immutable commit, and gives that
+  same commit to every platform build. Manual dispatch is required because
+  GitHub resolves release-event workflows from the tagged commit, while release
+  automation is intentionally owned only by `main`.
 
 ## Patchset upstream base
 
@@ -85,7 +88,9 @@ tags, and security advisories for `bazel-remote`. To upgrade the upstream base:
 5. Update this file and any generated build metadata, then run the Go, race,
    vet, Gazelle, and Bazel checks plus the FA cache integration tests.
 6. Update the remote with `git push --force-with-lease origin patchset`.
-7. Cut release tags from `patchset`; `main` only validates and builds them.
+7. Cut and publish release tags from `patchset`, then dispatch the release
+   workflow on `main` with the published tag. `main` only validates and builds
+   it.
 
 BLA-4006 should make CAS namespacing changes in this repository.
 
