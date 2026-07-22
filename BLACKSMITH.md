@@ -7,21 +7,36 @@ cache.
 Repository location: `github.com/useblacksmith/bazel-remote`.
 Go module path: `github.com/buchgr/bazel-remote/v2`.
 
-## Upstream base
+## Branch ownership
+
+- `main` owns release automation and documents the fork's branch and release
+  policy. Going forward, runtime source changes land only on `patchset`; the
+  source tree on `main` is not a release source.
+- `patchset` is the canonical executable source branch. It contains an exact
+  upstream release plus the Blacksmith-owned source patches applied on top.
+  Pull requests that change bazel-remote code target `patchset`.
+- Upstream upgrades rebase `patchset` onto an exact, verified upstream release
+  tag. Update the remote branch with `--force-with-lease`; do not merge
+  `patchset` into `main`.
+- Release tags use `vX.Y.Z-blacksmith.N` and are cut from `patchset`. The release
+  workflow on `main` validates that the published tag is reachable from the
+  current `patchset`, resolves it to one immutable commit, and gives that same
+  commit to every platform build.
+
+## Patchset upstream base
 
 - Module: `github.com/buchgr/bazel-remote/v2`
-- Version: `v2.4.4`
-- Upstream tag: `refs/tags/v2.4.4`
-- Upstream commit: `54d1782d72b291937988edad32c9752abe269d8e`
-- Module sum: `h1:fYqg5C4COpTO1OTHUHjYvVAOb2rEe2Xt+oYu4JTOlbc=`
-- Go module sum: `h1:Z7rZqDuLXfCyJ9HCu3ZYQsRx/yKHA+XH0eZq6jm80Gk=`
+- Version: `v2.6.1`
+- Upstream tag: `refs/tags/v2.6.1`
+- Upstream commit: `f46bc2030d3f30604d79ef4bf040e3a9c7a4ff89`
+- Module sum: `h1:vTMw3VmzjHfmR9jHcnqzQLLuHXRIFkROOcp5Pjke59c=`
+- Go module sum: `h1:vC7tD62wunH9S286SJ8naNJpKQNUgzlK3VlW816sI1E=`
 
 ## Local use
 
-FA replaces `github.com/buchgr/bazel-remote/v2` with a tagged version fetched
-from `github.com/useblacksmith/bazel-remote/v2`. Existing FA imports
-intentionally keep the upstream import path so this fork remains
-behavior-preserving until Blacksmith-specific changes are needed.
+FA replaces `github.com/buchgr/bazel-remote/v2` with a commit or release tag cut
+from `patchset` and fetched from `github.com/useblacksmith/bazel-remote/v2`.
+Existing FA imports intentionally keep the upstream import path.
 
 ## Build cache storage prefixing
 
@@ -60,14 +75,17 @@ back to the configured process-wide prefix. Buck2 should not set this marker.
 ## Security and upstream patch tracking
 
 Track upstream security fixes by monitoring the upstream repository's releases,
-tags, and security advisories for `bazel-remote`. To apply an upstream patch:
+tags, and security advisories for `bazel-remote`. To upgrade the upstream base:
 
-1. Identify the upstream commit or release containing the fix.
-2. Apply or cherry-pick the relevant changes into this repository.
-3. Keep Blacksmith-local changes separate from upstream patch commits when
-   possible.
-4. Update this file with the new upstream base or applied patch commit.
-5. Run the FA agent build and Buck2 cache tests before merging.
+1. Fetch and verify the exact upstream release tag.
+2. Identify the upstream commit on which the current `patchset` is based.
+3. Rebase with `git rebase --onto <target-tag> <old-base> patchset`.
+4. Resolve conflicts only in the Blacksmith patch stack, keeping those commits
+   separate from the upstream history.
+5. Update this file and any generated build metadata, then run the Go, race,
+   vet, Gazelle, and Bazel checks plus the FA cache integration tests.
+6. Update the remote with `git push --force-with-lease origin patchset`.
+7. Cut release tags from `patchset`; `main` only validates and builds them.
 
 BLA-4006 should make CAS namespacing changes in this repository.
 
