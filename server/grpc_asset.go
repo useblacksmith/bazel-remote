@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"google.golang.org/genproto/googleapis/rpc/status"
@@ -25,6 +27,13 @@ import (
 
 var errNilFetchBlobRequest = grpc_status.Error(codes.InvalidArgument,
 	"expected a non-nil *FetchBlobRequest")
+
+var resourceExhaustedResponse = asset.FetchBlobResponse{
+	Status: &status.Status{
+		Code:    int32(codes.ResourceExhausted),
+		Message: "Storage appears to be falling behind",
+	},
+}
 
 func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest) (*asset.FetchBlobResponse, error) {
 
@@ -56,6 +65,10 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 		return nil, errNilFetchBlobRequest
 	}
 
+	globalHeader := http.Header{}
+
+	uriSpecificHeaders := make(map[int]http.Header)
+
 	for _, q := range req.GetQualifiers() {
 		if q == nil {
 			return &asset.FetchBlobResponse{
@@ -64,6 +77,41 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 					Message: "unexpected nil qualifier in FetchBlobRequest",
 				},
 			}, nil
+		}
+
+		const QualifierHTTPHeaderPrefix = "http_header:"
+		const QualifierHTTPHeaderUrlPrefix = "http_header_url:"
+
+		if strings.HasPrefix(q.Name, QualifierHTTPHeaderPrefix) {
+			key := q.Name[len(QualifierHTTPHeaderPrefix):]
+
+			globalHeader[key] = strings.Split(q.Value, ",")
+			continue
+		} else if strings.HasPrefix(q.Name, QualifierHTTPHeaderUrlPrefix) {
+			idxAndKey := q.Name[len(QualifierHTTPHeaderUrlPrefix):]
+			parts := strings.Split(idxAndKey, ":")
+			if len(parts) != 2 {
+				s.errorLogger.Printf("invalid http_header_url qualifier: \"%s\"", idxAndKey)
+				continue
+			}
+
+			uriIndex, err := strconv.Atoi(parts[0])
+			if err != nil {
+				s.errorLogger.Printf("failed to parse URI index as int: %s", err)
+				continue
+			}
+
+			if uriIndex < 0 || uriIndex >= len(req.GetUris()) {
+				s.errorLogger.Printf("URI index for header is out of range [0 - %d]: %d", len(req.GetUris())-1, uriIndex)
+				continue
+			}
+
+			if _, found := uriSpecificHeaders[uriIndex]; !found {
+				uriSpecificHeaders[uriIndex] = make(http.Header)
+			}
+			uriSpecificHeaders[uriIndex].Add(parts[1], q.Value)
+
+			continue
 		}
 
 		if q.Name == "checksum.sri" && strings.HasPrefix(q.Value, "sha256-") {
@@ -89,7 +137,7 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 				// We don't know the size yet (bad http backend?).
 				r, actualSize, err := s.cache.Get(ctx, cache.CAS, sha256Str, -1, 0)
 				if r != nil {
-					defer r.Close()
+					defer func() { _ = r.Close() }()
 				}
 				if err != nil || actualSize < 0 {
 					s.errorLogger.Printf("failed to get CAS %s from proxy backend size: %d err: %v",
@@ -113,9 +161,16 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 
 	// See if we can download one of the URIs.
 
-	for _, uri := range req.GetUris() {
-		ok, actualHash, size := s.fetchItem(ctx, uri, sha256Str)
-		if ok {
+	for uriIndex, uri := range req.GetUris() {
+		uriSpecificHeader := globalHeader.Clone()
+		if header, found := uriSpecificHeaders[uriIndex]; found {
+			for key, value := range header {
+				uriSpecificHeader[key] = value
+			}
+		}
+
+		actualHash, size, err := s.fetchItem(ctx, uri, uriSpecificHeader, sha256Str)
+		if err == nil {
 			return &asset.FetchBlobResponse{
 				Status: &status.Status{Code: int32(codes.OK)},
 				BlobDigest: &pb.Digest{
@@ -126,6 +181,10 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 			}, nil
 		}
 
+		if translateGRPCErrCodeFromClient(err) == codes.ResourceExhausted {
+			return &resourceExhaustedResponse, nil
+		}
+
 		// Not a simple file. Not yet handled...
 	}
 
@@ -134,29 +193,37 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 	}, nil
 }
 
-func (s *grpcServer) fetchItem(ctx context.Context, uri string, expectedHash string) (bool, string, int64) {
+func (s *grpcServer) fetchItem(ctx context.Context, uri string, headers http.Header, expectedHash string) (string, int64, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
 		s.errorLogger.Printf("unable to parse URI: %s err: %v", uri, err)
-		return false, "", int64(-1)
+		return "", int64(-1), err
 	}
 
 	if u.Scheme != "http" && u.Scheme != "https" {
 		s.errorLogger.Printf("unsupported URI: %s", uri)
-		return false, "", int64(-1)
+		return "", int64(-1), fmt.Errorf("unknown URL scheme: %q", u.Scheme)
 	}
 
-	resp, err := http.Get(uri)
+	req, err := http.NewRequest(http.MethodGet, uri, nil)
+	if err != nil {
+		s.errorLogger.Printf("failed to create http.Request: %s err: %v", uri, err)
+		return "", int64(-1), err
+	}
+
+	req.Header = headers
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		s.errorLogger.Printf("failed to get URI: %s err: %v", uri, err)
-		return false, "", int64(-1)
+		return "", int64(-1), err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	rc := resp.Body
 
 	s.accessLogger.Printf("GRPC ASSET FETCH %s %s", uri, resp.Status)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, "", int64(-1)
+		return "", int64(-1), fmt.Errorf("unsuccessful HTTP status code: %d", resp.StatusCode)
 	}
 
 	expectedSize := resp.ContentLength
@@ -166,7 +233,7 @@ func (s *grpcServer) fetchItem(ctx context.Context, uri string, expectedHash str
 		data, err := io.ReadAll(resp.Body)
 		if err != nil {
 			s.errorLogger.Printf("failed to read data: %v", uri)
-			return false, "", int64(-1)
+			return "", int64(-1), err
 		}
 
 		expectedSize = int64(len(data))
@@ -176,7 +243,7 @@ func (s *grpcServer) fetchItem(ctx context.Context, uri string, expectedHash str
 		if expectedHash != "" && hashStr != expectedHash {
 			s.errorLogger.Printf("URI data has hash %s, expected %s",
 				hashStr, expectedHash)
-			return false, "", int64(-1)
+			return "", int64(-1), fmt.Errorf("URI data has hash %s, expected %s", hashStr, expectedHash)
 		}
 
 		expectedHash = hashStr
@@ -186,10 +253,10 @@ func (s *grpcServer) fetchItem(ctx context.Context, uri string, expectedHash str
 	err = s.cache.Put(ctx, cache.CAS, expectedHash, expectedSize, rc)
 	if err != nil && err != io.EOF {
 		s.errorLogger.Printf("failed to Put %s: %v", expectedHash, err)
-		return false, "", int64(-1)
+		return "", int64(-1), err
 	}
 
-	return true, expectedHash, expectedSize
+	return expectedHash, expectedSize, nil
 }
 
 func (s *grpcServer) FetchDirectory(context.Context, *asset.FetchDirectoryRequest) (*asset.FetchDirectoryResponse, error) {

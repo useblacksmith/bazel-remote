@@ -15,8 +15,6 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
 
-	"github.com/klauspost/compress/zstd"
-
 	"github.com/buchgr/bazel-remote/v2/utils/zstdpool"
 	syncpool "github.com/mostynb/zstdpool-syncpool"
 )
@@ -113,7 +111,7 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	}
 
 	if rc != nil {
-		defer rc.Close()
+		defer func() { _ = rc.Close() }()
 	}
 
 	if err != nil {
@@ -367,12 +365,6 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 	resourceNameChan := make(chan string, 1)
 
 	cmp := casblob.Identity
-	var dec *zstd.Decoder
-	defer func() {
-		if dec != nil {
-			dec.Close()
-		}
-	}()
 
 	go func() {
 		firstIteration := true
@@ -454,6 +446,7 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 				}
 
 				go func() {
+					defer func() { _ = rc.Close() }()
 					err := s.cache.Put(srv.Context(), cache.CAS, hash, size, rc)
 					putResult <- err
 				}()
@@ -512,7 +505,7 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 			return status.Error(codes.Internal, msg)
 		}
 		if err == io.EOF {
-			pw.Close()
+			_ = pw.Close()
 			break
 		}
 		if err != nil {
@@ -544,6 +537,7 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 			}
 			return nil
 		}
+
 		if err == nil {
 			// Unexpected early return. Should not happen.
 			msg := fmt.Sprintf("GRPC BYTESTREAM WRITE INTERNAL ERROR %s", resourceName)
@@ -552,8 +546,8 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 		}
 
 		msg := fmt.Sprintf("GRPC BYTESTREAM WRITE CACHE ERROR: %s %v", resourceName, err)
-		s.accessLogger.Printf(msg)
-		return status.Error(codes.Internal, msg)
+		s.logErrorPrintf(err, msg)
+		return status.Error(gRPCErrCode(err, codes.Internal), msg)
 	}
 
 	select {

@@ -18,6 +18,7 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache/disk"
 
 	"github.com/buchgr/bazel-remote/v2/config"
+	"github.com/buchgr/bazel-remote/v2/ldap"
 	"github.com/buchgr/bazel-remote/v2/server"
 	"github.com/buchgr/bazel-remote/v2/utils/flags"
 	"github.com/buchgr/bazel-remote/v2/utils/idle"
@@ -41,6 +42,10 @@ import (
 // is set through linker options.
 var gitCommit string
 
+// gitTags is another version stamp, with the set of tags for the current
+// commit joined by commas.
+var gitTags string
+
 func main() {
 	app := cli.NewApp()
 
@@ -61,18 +66,18 @@ func main() {
 func run(ctx *cli.Context) error {
 	c, err := config.Get(ctx)
 	if err != nil {
-		fmt.Fprintf(ctx.App.Writer, "%v\n\n", err)
+		_, _ = fmt.Fprintf(ctx.App.Writer, "%v\n\n", err)
 		_ = cli.ShowAppHelp(ctx)
 		return cli.Exit(err.Error(), 1)
 	}
 
 	if ctx.NArg() > 0 {
-		fmt.Fprintf(ctx.App.Writer,
+		_, _ = fmt.Fprintf(ctx.App.Writer,
 			"Error: bazel-remote does not take positional aguments\n")
 		for i := 0; i < ctx.NArg(); i++ {
-			fmt.Fprintf(ctx.App.Writer, "arg: %s\n", ctx.Args().Get(i))
+			_, _ = fmt.Fprintf(ctx.App.Writer, "arg: %s\n", ctx.Args().Get(i))
 		}
-		fmt.Fprintf(ctx.App.Writer, "\n")
+		_, _ = fmt.Fprintf(ctx.App.Writer, "\n")
 
 		_ = cli.ShowAppHelp(ctx)
 		os.Exit(1)
@@ -82,8 +87,12 @@ func run(ctx *cli.Context) error {
 	if len(gitCommit) > 0 && gitCommit != "{STABLE_GIT_COMMIT}" {
 		maybeGitCommitMsg = fmt.Sprintf(" from git commit %s", gitCommit)
 	}
-	log.Printf("bazel-remote built with %s%s.",
-		runtime.Version(), maybeGitCommitMsg)
+	maybeGitTagsMsg := ""
+	if len(gitTags) > 0 && gitTags != "{GIT_TAGS}" {
+		maybeGitTagsMsg = " " + gitTags
+	}
+	log.Printf("bazel-remote built with %s%s%s.",
+		runtime.Version(), maybeGitCommitMsg, maybeGitTagsMsg)
 
 	rlimit.Raise()
 
@@ -140,6 +149,7 @@ func run(ctx *cli.Context) error {
 		disk.WithZstdImplementation(c.ZstdImplementation),
 		disk.WithMaxBlobSize(c.MaxBlobSize),
 		disk.WithProxyMaxBlobSize(c.MaxProxyBlobSize),
+		disk.WithMaxSizeHardLimit(int64(c.MaxSizeHardLimit) * 1024 * 1024 * 1024),
 		disk.WithAccessLogger(c.AccessLogger),
 	}
 	if c.ProxyBackend != nil {
@@ -239,9 +249,10 @@ func startHttpServer(c *config.Config, httpServer **http.Server,
 	checkClientCertForWrites := c.TLSCaFile != ""
 	validateAC := !c.DisableHTTPACValidation
 	h := server.NewHTTPCache(diskCache, c.AccessLogger, c.ErrorLogger, validateAC,
-		c.EnableACKeyInstanceMangling, checkClientCertForReads, checkClientCertForWrites, gitCommit)
+		c.EnableACKeyInstanceMangling, checkClientCertForReads, checkClientCertForWrites, gitCommit, gitTags)
 
 	cacheHandler := h.CacheHandler
+	var ldapAuthenticator authenticator
 	var basicAuthenticator auth.BasicAuth
 	if c.HtpasswdFile != "" {
 		if c.AllowUnauthenticatedReads {
@@ -249,6 +260,16 @@ func startHttpServer(c *config.Config, httpServer **http.Server,
 		} else {
 			basicAuthenticator = auth.BasicAuth{Realm: c.HTTPAddress, Secrets: htpasswdSecrets}
 			cacheHandler = basicAuthWrapper(cacheHandler, &basicAuthenticator)
+		}
+	} else if c.LDAP != nil {
+		if c.AllowUnauthenticatedReads {
+			cacheHandler = unauthenticatedReadWrapper(cacheHandler, htpasswdSecrets, c.HTTPAddress)
+		} else {
+			var ldap_err error
+			if ldapAuthenticator, ldap_err = ldap.New(c.LDAP); ldap_err != nil {
+				log.Fatal("Failed to create LDAP connection: ", ldap_err)
+			}
+			cacheHandler = ldapAuthWrapper(cacheHandler, ldapAuthenticator)
 		}
 	}
 
@@ -267,14 +288,22 @@ func startHttpServer(c *config.Config, httpServer **http.Server,
 			statusHandler = h.VerifyClientCertHandler(statusHandler).ServeHTTP
 		} else if c.HtpasswdFile != "" {
 			statusHandler = basicAuthWrapper(statusHandler, &basicAuthenticator)
+		} else if c.LDAP != nil {
+			statusHandler = ldapAuthWrapper(statusHandler, ldapAuthenticator)
 		}
 	}
 
 	if c.EnableEndpointMetrics {
 		log.Println("Endpoint metrics: enabled")
 
+		prefix := ""
+		if c.HttpMetricsPrefix {
+			prefix = "bazel_remote"
+		}
+
 		metricsMdlw := middleware.New(middleware.Config{
 			Recorder: httpmetrics.NewRecorder(httpmetrics.Config{
+				Prefix:          prefix,
 				DurationBuckets: c.MetricsDurationBuckets,
 			}),
 		})
@@ -285,6 +314,8 @@ func startHttpServer(c *config.Config, httpServer **http.Server,
 				middlewareHandler = h.VerifyClientCertHandler(middlewareHandler)
 			} else if c.HtpasswdFile != "" {
 				middlewareHandler = basicAuthWrapper(middlewareHandler.ServeHTTP, &basicAuthenticator)
+			} else if c.LDAP != nil {
+				middlewareHandler = ldapAuthWrapper(middlewareHandler.ServeHTTP, ldapAuthenticator)
 			}
 		}
 		mux.Handle("/metrics", middlewareHandler)
@@ -429,12 +460,22 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 		validateAC,
 		c.EnableACKeyInstanceMangling,
 		enableRemoteAssetAPI,
+		c.MaxBlobSize,
 		diskCache, c.AccessLogger, c.ErrorLogger)
+}
+
+type authenticator interface {
+	NewContext(ctx context.Context, r *http.Request) context.Context
+	Wrap(auth.AuthenticatedHandlerFunc) http.HandlerFunc
 }
 
 // A http.HandlerFunc wrapper which requires successful basic
 // authentication for all requests.
 func basicAuthWrapper(handler http.HandlerFunc, authenticator *auth.BasicAuth) http.HandlerFunc {
+	return auth.JustCheck(authenticator, handler)
+}
+
+func ldapAuthWrapper(handler http.HandlerFunc, authenticator authenticator) http.HandlerFunc {
 	return auth.JustCheck(authenticator, handler)
 }
 

@@ -20,6 +20,7 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
 	"github.com/buchgr/bazel-remote/v2/utils/annotate"
+	"github.com/buchgr/bazel-remote/v2/utils/sha256verifier"
 	"github.com/buchgr/bazel-remote/v2/utils/tempfile"
 	"github.com/buchgr/bazel-remote/v2/utils/validate"
 
@@ -81,8 +82,12 @@ type diskCache struct {
 	// Limit the number of simultaneous proxy Contains checks.
 	containsSem *semaphore.Weighted
 
-	// Limit the number of simultaneous file removals.
-	fileRemovalSem *semaphore.Weighted
+	// Limit the number of simultaneous file removals and filesystem write
+	// operations (apart from atime updates, which we hope are fast).
+	// When acquiring both the "diskWaitSem" semaphore and the "mu" mutex,
+	// the "diskWaitSem" must be acquired before "mu" in order to avoid
+	// potential deadlocks.
+	diskWaitSem *semaphore.Weighted
 
 	// Aggregate byte budget for in-memory AC capture buffers (LRU
 	// observation, D15). Lazily initialized; see lruCaptureBudgetBytes.
@@ -122,6 +127,21 @@ func (c *diskCache) RegisterMetrics() {
 	// but since the updater func must lock the cache mu, it was deemed
 	// necessary to have greater control of when to get the cache age
 	go c.pollCacheAge()
+
+	go c.shiftMetricPeriodContinuously()
+}
+
+// Shift to new period for metrics every 30 seconds. A period of
+// 30 seconds should give margin to catch all peaks (with for example
+// a 10 second scrape interval) even in cases of delayed or missed
+// scrapes from prometheus.
+func (c *diskCache) shiftMetricPeriodContinuously() {
+	ticker := time.NewTicker(30 * time.Second)
+	for range ticker.C {
+		c.mu.Lock()
+		c.lru.shiftToNextMetricPeriod()
+		c.mu.Unlock()
+	}
 }
 
 // Update metric every minute with the idle time of the least recently used item in the cache
@@ -136,20 +156,24 @@ func (c *diskCache) pollCacheAge() {
 func (c *diskCache) updateCacheAgeMetric() {
 	c.mu.Lock()
 
-	key, value := c.lru.getTailItem()
+	key, value, ok := c.lru.getTailItem()
+	if !ok {
+		// No items in the cache.
+		c.mu.Unlock()
+		return
+	}
+
 	age := 0.0
 	validAge := true
 
-	if key != nil {
-		f := c.getElementPath(key, value)
-		ts, err := atime.Stat(f)
+	f := c.getElementPath(key, value)
+	ts, err := atime.Stat(f)
 
-		if err != nil {
-			log.Printf("ERROR: failed to determine time of least recently used cache item: %v, unable to stat %s", err, f)
-			validAge = false
-		} else {
-			age = time.Since(ts).Seconds()
-		}
+	if err != nil {
+		log.Printf("ERROR: failed to determine time of least recently used cache item: %v, unable to stat %s", err, f)
+		validAge = false
+	} else {
+		age = time.Since(ts).Seconds()
 	}
 
 	c.mu.Unlock()
@@ -159,8 +183,8 @@ func (c *diskCache) updateCacheAgeMetric() {
 	}
 }
 
-func (c *diskCache) getElementPath(key Key, value lruItem) string {
-	ks := key.(string)
+func (c *diskCache) getElementPath(key string, value lruItem) string {
+	ks := key
 	kind, hash, storagePrefixID := lookupKeyParts(ks)
 	return filepath.Join(c.dir, c.FileLocationForStoragePrefixID(storagePrefixID, kind, value.legacy, hash, value.size, value.random))
 }
@@ -192,12 +216,6 @@ func lookupKeyParts(key string) (cache.EntryKind, string, string) {
 }
 
 func (c *diskCache) removeFile(f string) {
-	if err := c.fileRemovalSem.Acquire(context.Background(), 1); err != nil {
-		log.Printf("ERROR: failed to aquire semaphore: %v, unable to remove %s", err, f)
-		return
-	}
-	defer c.fileRemovalSem.Release(1)
-
 	err := os.Remove(f)
 	if err != nil {
 		log.Printf("ERROR: failed to remove evicted cache file: %s", f)
@@ -297,6 +315,16 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 		return nil
 	}
 
+	// Put requests are processed using blocking file syscalls, which
+	// consume one operating system thread per request. We throttle
+	// these requests with a semaphore to avoid creating too many
+	// operating system threads.
+	if err := c.diskWaitSem.Acquire(context.Background(), 1); err != nil {
+		log.Printf("ERROR: failed to acquire semaphore: %v", err)
+		return internalErr(err)
+	}
+	defer c.diskWaitSem.Release(1)
+
 	// LRU capture (D15): for managed AC writes, buffer and parse the
 	// ActionResult so we can emit a closure after a successful commit. AC
 	// blobs are usually small and this only runs when an observer is
@@ -349,12 +377,15 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 	defer func() {
 		// No lock required to remove stray tempfiles.
 		if removeTempfile {
-			os.Remove(blobFile)
+			err := os.Remove(blobFile)
+			if err != nil {
+				log.Printf("warning: failed to remove temp file: %q", blobFile)
+			}
 		} else if blobFile != "" {
 			// Mark the file as "complete".
 			err := os.Chmod(blobFile, tempfile.FinalMode)
 			if err != nil {
-				log.Println("Failed to mark", blobFile, "as complete:", err)
+				log.Println("failed to mark", blobFile, "as complete:", err)
 			}
 		}
 
@@ -372,21 +403,10 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	if size > 0 {
 		c.mu.Lock()
-		ok, err := c.lru.Reserve(size)
+		err := c.lru.Reserve(size)
 		if err != nil {
 			c.mu.Unlock()
-			return &cache.Error{
-				Code: http.StatusInsufficientStorage,
-				Text: err.Error(),
-			}
-		}
-		if !ok {
-			c.mu.Unlock()
-			return &cache.Error{
-				Code: http.StatusInsufficientStorage,
-				Text: fmt.Sprintf("The item (%d) + reserved space is larger than the cache's maximum size (%d).",
-					size, c.lru.MaxSize()),
-			}
+			return err
 		}
 		c.mu.Unlock()
 		unreserve = true
@@ -449,7 +469,7 @@ func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cac
 	closeFile := true
 	defer func() {
 		if closeFile {
-			f.Close()
+			_ = f.Close()
 		}
 	}()
 
@@ -465,22 +485,31 @@ func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cac
 		return sizeOnDisk, nil
 	}
 
-	if sizeOnDisk, err = io.Copy(f, r); err != nil {
+	var writeCloser io.WriteCloser = f
+	if kind == cache.CAS { // c.storageMode == casblob.Identity
+		writeCloser = sha256verifier.New(hash, size, f)
+	}
+
+	sizeOnDisk, err = io.Copy(writeCloser, r)
+	if err != nil {
 		return -1, annotate.Err(ctx, "Failed to copy data to disk", err)
 	}
 
 	if isSizeMismatch(sizeOnDisk, size) {
 		return -1, fmt.Errorf(
-			"Sizes don't match. Expected %d, found %d", size, sizeOnDisk)
+			"sizes don't match. Expected %d, found %d", size, sizeOnDisk)
 	}
 
-	if err = f.Sync(); err != nil {
-		return -1, fmt.Errorf("Failed to sync file to disk: %w", err)
+	err = f.Sync()
+	if err != nil {
+		return -1, fmt.Errorf("failed to sync file to disk: %w", err)
 	}
 
-	if err = f.Close(); err != nil {
-		return -1, fmt.Errorf("Failed to close file: %w", err)
+	err = writeCloser.Close()
+	if err != nil {
+		return -1, fmt.Errorf("failed to verify hash: %w", err)
 	}
+
 	closeFile = false
 
 	return sizeOnDisk, nil
@@ -534,8 +563,8 @@ func (c *diskCache) availableOrTryProxy(ctx context.Context, kind cache.EntryKin
 	c.mu.Lock()
 
 	key := cache.LookupKeyForContext(ctx, kind, hash)
-	item, available := c.lru.Get(key)
-	if available {
+	item, listElem := c.lru.Get(key)
+	if listElem != nil {
 		c.mu.Unlock() // We expect a cache hit below.
 		locked = false
 
@@ -549,8 +578,8 @@ func (c *diskCache) availableOrTryProxy(ctx context.Context, kind cache.EntryKin
 				// Enter slow path.
 
 				c.mu.Lock()
-				item, available = c.lru.Get(key)
-				if available {
+				item, listElem = c.lru.Get(key)
+				if listElem != nil {
 					blobPath = path.Join(c.dir, c.FileLocationForContext(ctx, kind, item.legacy, hash, item.size, item.random))
 					f, err = os.Open(blobPath)
 				}
@@ -580,8 +609,13 @@ func (c *diskCache) availableOrTryProxy(ctx context.Context, kind cache.EntryKin
 				}
 
 				if err != nil {
-					log.Printf("Warning: expected item to be on disk, but something happened: %v", err)
-					f.Close()
+					log.Printf("Warning: expected item to be on disk, but something happened when retrieving %s (compressed: %v, legacy: %v): %v",
+						blobPath, zstd, item.legacy, err)
+					_ = f.Close()
+
+					c.mu.Lock()
+					c.lru.RemoveElement(listElem)
+					c.mu.Unlock()
 				} else {
 					return rc, item.size, false, nil
 				}
@@ -589,7 +623,7 @@ func (c *diskCache) availableOrTryProxy(ctx context.Context, kind cache.EntryKin
 				var fileInfo os.FileInfo
 				fileInfo, err = f.Stat()
 				if err != nil {
-					f.Close()
+					_ = f.Close()
 					return nil, -1, true, err
 				}
 				foundSize := fileInfo.Size()
@@ -614,7 +648,10 @@ func (c *diskCache) availableOrTryProxy(ctx context.Context, kind cache.EntryKin
 			if !locked {
 				c.mu.Lock()
 			}
-			tryProxy, err = c.lru.Reserve(size)
+			err = c.lru.Reserve(size)
+			if err == nil {
+				tryProxy = true
+			}
 			c.mu.Unlock()
 			locked = false
 		} else {
@@ -691,12 +728,15 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	defer func() {
 		// No lock required to remove stray tempfiles.
 		if removeTempfile {
-			os.Remove(blobFile)
+			err := os.Remove(blobFile)
+			if err != nil {
+				log.Printf("warning: failed to remove temp file: %q", blobFile)
+			}
 		} else if blobFile != "" {
 			// Mark the file as "complete".
 			err := os.Chmod(blobFile, tempfile.FinalMode)
 			if err != nil {
-				log.Println("Failed to mark", blobFile, "as complete:", err)
+				log.Println("failed to mark", blobFile, "as complete:", err)
 			}
 		}
 
@@ -714,7 +754,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	f, foundSize, tryProxy, err := c.availableOrTryProxy(ctx, kind, hash, size, offset, zstd)
 	if err != nil {
-		return nil, -1, internalErr(err)
+		return nil, -1, err
 	}
 	if tryProxy && size > 0 {
 		unreserve = true
@@ -727,9 +767,23 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		return nil, -1, nil
 	}
 
+	// Non-proxied Get requests do not seem to consume any significant amount of OS threads,
+	// and are therefore not throttled. However, it is assumed that proxied Get requests might,
+	// at least when storing the result from the proxy to disk, and perhaps also when
+	// waiting for the proxy. Proxied Get requests are therefore throttled by a semaphore.
+	// Unfortunately, this proxy-specific throttling does not limit the size reservation
+	// performed inside availableOrTryProxy. It should still be effective in limiting the number
+	// of OS threads, but it does not help reduce the risk of http.StatusInsufficientStorage.
+	err = c.diskWaitSem.Acquire(context.Background(), 1)
+	if err != nil {
+		log.Printf("ERROR: failed to acquire semaphore: %v", err)
+		return nil, -1, internalErr(err)
+	}
+	defer c.diskWaitSem.Release(1)
+
 	r, foundSize, err := c.proxy.Get(ctx, kind, hash, size)
 	if r != nil {
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 	}
 	if err != nil {
 		return nil, -1, internalErr(err)
@@ -738,7 +792,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		return nil, -1, nil
 	}
 	if foundSize > c.maxProxyBlobSize {
-		r.Close()
+		_ = r.Close()
 		return nil, -1, nil
 	}
 
@@ -762,7 +816,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	var sizeOnDisk int64
 	sizeOnDisk, err = io.Copy(tf, r)
-	tf.Close()
+	_ = tf.Close()
 	if err != nil {
 		return nil, -1, internalErr(err)
 	}
@@ -799,7 +853,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	unreserve, removeTempfile, err = c.commit(key, legacy, blobFile, size, foundSize, sizeOnDisk, random)
 	if err != nil {
-		rc.Close()
+		_ = rc.Close()
 		return nil, -1, internalErr(err)
 	}
 
@@ -828,7 +882,8 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 	key := cache.LookupKeyForContext(ctx, kind, hash)
 
 	c.mu.Lock()
-	item, exists := c.lru.Get(key)
+	item, listElem := c.lru.Get(key)
+	exists := listElem != nil
 	if exists {
 		foundSize = item.size
 	}
@@ -884,7 +939,7 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 
 	rc, sizeBytes, err := c.Get(ctx, cache.AC, hash, -1, 0)
 	if rc != nil {
-		defer rc.Close()
+		defer func() { _ = rc.Close() }()
 	}
 	if err != nil {
 		return nil, nil, err
@@ -935,18 +990,18 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 			return nil, nil, err // aka "not found", or an err if non-nil
 		}
 		if err != nil {
-			r.Close()
+			_ = r.Close()
 			return nil, nil, err
 		}
 		if size != d.TreeDigest.SizeBytes {
-			r.Close()
+			_ = r.Close()
 			return nil, nil, fmt.Errorf("expected %d bytes, found %d",
 				d.TreeDigest.SizeBytes, size)
 		}
 
 		var oddata []byte
 		oddata, err = io.ReadAll(r)
-		r.Close()
+		_ = r.Close()
 		if err != nil {
 			return nil, nil, err
 		}

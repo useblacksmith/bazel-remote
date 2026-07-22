@@ -1,21 +1,11 @@
-load("@bazel_gazelle//:def.bzl", "gazelle")
+load("@gazelle//:def.bzl", "gazelle")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
-load("@rules_oci//oci:defs.bzl", "oci_image", "oci_push")
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
 load("@rules_pkg//:pkg.bzl", "pkg_tar")
 
 gazelle(
     name = "gazelle",
     prefix = "github.com/buchgr/bazel-remote/v2",
-)
-
-gazelle(
-    name = "gazelle-update-repos",
-    args = [
-        "-from_file=go.mod",
-        "-to_macro=deps.bzl%go_dependencies",
-        "-prune",
-    ],
-    command = "update-repos",
 )
 
 go_library(
@@ -26,6 +16,7 @@ go_library(
     deps = [
         "//cache/disk:go_default_library",
         "//config:go_default_library",
+        "//ldap:go_default_library",
         "//server:go_default_library",
         "//utils/flags:go_default_library",
         "//utils/idle:go_default_library",
@@ -51,7 +42,10 @@ go_binary(
     pure = "off",
     static = "off",
     visibility = ["//visibility:public"],
-    x_defs = {"main.gitCommit": "{STABLE_GIT_COMMIT}"},
+    x_defs = {
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+        "main.gitTags": "{GIT_TAGS}",
+    },
 )
 
 go_binary(
@@ -63,7 +57,10 @@ go_binary(
     pure = "off",
     static = "off",
     visibility = ["//visibility:public"],
-    x_defs = {"main.gitCommit": "{STABLE_GIT_COMMIT}"},
+    x_defs = {
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+        "main.gitTags": "{GIT_TAGS}",
+    },
 )
 
 go_binary(
@@ -75,7 +72,10 @@ go_binary(
     pure = "off",
     static = "on",
     visibility = ["//visibility:public"],
-    x_defs = {"main.gitCommit": "{STABLE_GIT_COMMIT}"},
+    x_defs = {
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+        "main.gitTags": "{GIT_TAGS}",
+    },
 )
 
 go_binary(
@@ -87,7 +87,10 @@ go_binary(
     pure = "off",
     #static = "on", # With static enabled, I get the following error: "ld: library not found for -lcrt0.o"
     visibility = ["//visibility:public"],
-    x_defs = {"main.gitCommit": "{STABLE_GIT_COMMIT}"},
+    x_defs = {
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+        "main.gitTags": "{GIT_TAGS}",
+    },
 )
 
 go_binary(
@@ -99,22 +102,25 @@ go_binary(
     pure = "off",
     #static = "on", # With static enabled, I get the following error: "ld: library not found for -lcrt0.o"
     visibility = ["//visibility:public"],
-    x_defs = {"main.gitCommit": "{STABLE_GIT_COMMIT}"},
+    x_defs = {
+        "main.gitCommit": "{STABLE_GIT_COMMIT}",
+        "main.gitTags": "{GIT_TAGS}",
+    },
 )
 
 # The distroless static container image's nonroot user id.
 BAZEL_REMOTE_USER_ID = 65532
 
 pkg_tar(
-    name = "bazel-remote_tar",
-    srcs = [":bazel-remote"],
+    name = "bazel-remote-linux-amd64_tar",
+    srcs = [":bazel-remote-linux-amd64"],
 )
 
 oci_image(
     name = "bazel-remote-image",
     base = "@cgo_amd64_base",  # Does not include openssl.
     entrypoint = [
-        "/bazel-remote",
+        "/bazel-remote-linux-amd64",
         "--http_address=:8080",
         "--dir=/data",
 
@@ -126,10 +132,16 @@ oci_image(
     exposed_ports = ["8080"],
     tars = [
         "data.tar",
-        ":bazel-remote_tar",
+        ":bazel-remote-linux-amd64_tar",
     ],
     user = str(BAZEL_REMOTE_USER_ID),
     visibility = ["//visibility:public"],
+)
+
+oci_load(
+    name = "bazel-remote-image-tarball",
+    image = ":bazel-remote-image",
+    repo_tags = ["buchgr/bazel-remote-cache:tmp-amd64"],
 )
 
 pkg_tar(
@@ -157,6 +169,12 @@ oci_image(
     ],
     user = str(BAZEL_REMOTE_USER_ID),
     visibility = ["//visibility:private"],
+)
+
+oci_load(
+    name = "bazel-remote-image-arm64-tarball",
+    image = ":bazel-remote-image-arm64",
+    repo_tags = ["buchgr/bazel-remote-cache:tmp-arm64"],
 )
 
 # The following container_push targets push to "tmp-amd64" and "tmp-arm64"

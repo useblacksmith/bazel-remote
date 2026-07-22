@@ -45,6 +45,7 @@ type httpCache struct {
 	validateAC               bool
 	mangleACKeys             bool
 	gitCommit                string
+	gitTags                  string
 	checkClientCertForReads  bool
 	checkClientCertForWrites bool
 }
@@ -57,6 +58,7 @@ type statusPageData struct {
 	NumFiles         int
 	ServerTime       int64
 	GitCommit        string
+	GitTags          string
 	NumGoroutines    int
 }
 
@@ -64,7 +66,7 @@ type statusPageData struct {
 // accessLogger will print one line for each HTTP request to stdout.
 // errorLogger will print unexpected server errors. Inexistent files and malformed URLs will not
 // be reported.
-func NewHTTPCache(cache disk.Cache, accessLogger cache.Logger, errorLogger cache.Logger, validateAC bool, mangleACKeys bool, checkClientCertForReads bool, checkClientCertForWrites bool, commit string) HTTPCache {
+func NewHTTPCache(cache disk.Cache, accessLogger cache.Logger, errorLogger cache.Logger, validateAC bool, mangleACKeys bool, checkClientCertForReads bool, checkClientCertForWrites bool, commit string, gitTags string) HTTPCache {
 
 	_, _, numItems, _ := cache.Stats()
 
@@ -82,6 +84,10 @@ func NewHTTPCache(cache disk.Cache, accessLogger cache.Logger, errorLogger cache
 
 	if commit != "{STABLE_GIT_COMMIT}" {
 		hc.gitCommit = commit
+	}
+
+	if gitTags != "{GIT_TAGS}" {
+		hc.gitTags = gitTags
 	}
 
 	return hc
@@ -203,7 +209,7 @@ func (h *httpCache) logResponse(code int, r *http.Request) {
 }
 
 func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	kind, hash, instance, err := parseRequestURL(r.URL.Path, h.validateAC)
 	if err != nil {
@@ -212,7 +218,7 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.mangleACKeys && kind == cache.AC {
+	if h.mangleACKeys && (kind == cache.AC || kind == cache.RAW) {
 		hash = cache.TransformActionCacheKey(hash, instance, h.accessLogger)
 	}
 
@@ -254,7 +260,7 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 			h.logResponse(http.StatusNotFound, r)
 			return
 		}
-		defer rdr.Close()
+		defer func() { _ = rdr.Close() }()
 
 		w.Header().Set("Content-Type", "application/octet-stream")
 		if zstdCompressed {
@@ -410,7 +416,7 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			rc := z.IOReadCloser()
-			defer rc.Close()
+			defer func() { _ = rc.Close() }()
 			rdr = rc
 		}
 
@@ -420,11 +426,18 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 			if cerr, ok := err.(*cache.Error); ok {
 				msg = cerr.Text
 				http.Error(w, msg, cerr.Code)
+				if cerr.Code == http.StatusInsufficientStorage {
+					// Using accessLogger to prevent too verbose logging
+					// to errorLogger.
+					h.logResponse(cerr.Code, r)
+				} else {
+					h.errorLogger.Printf("PUT %s: %s", path(kind, hash), msg)
+				}
 			} else {
 				msg = "Unexpected error adding item to cache: " + err.Error()
 				http.Error(w, msg, http.StatusInternalServerError)
+				h.errorLogger.Printf("PUT %s: %s", path(kind, hash), msg)
 			}
-			h.errorLogger.Printf("PUT %s: %s", path(kind, hash), msg)
 		} else {
 			h.logResponse(http.StatusOK, r)
 		}
@@ -493,7 +506,7 @@ func addWorkerMetadataHTTP(addr string, ct string, orig []byte) (actionResult *p
 
 // Produce a debugging page with some stats about the cache.
 func (h *httpCache) StatusPageHandler(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	totalSize, reservedSize, numItems, uncompressedSize := h.cache.Stats()
 
@@ -510,6 +523,7 @@ func (h *httpCache) StatusPageHandler(w http.ResponseWriter, r *http.Request) {
 		NumFiles:         numItems,
 		ServerTime:       time.Now().Unix(),
 		GitCommit:        h.gitCommit,
+		GitTags:          h.gitTags,
 		NumGoroutines:    goroutines,
 	})
 	if err != nil {

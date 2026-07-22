@@ -41,7 +41,7 @@ func getTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 		}
 		caCertPool := x509.NewCertPool()
 		if added := caCertPool.AppendCertsFromPEM(caCert); !added {
-			return nil, fmt.Errorf("Failed to add ca cert to cert pool.")
+			return nil, fmt.Errorf("failed to add CA cert to cert pool")
 		}
 		config.RootCAs = caCertPool
 	}
@@ -95,7 +95,7 @@ func (c *Config) setProxy() error {
 		opts = append(opts, grpc.WithChainStreamInterceptor(metrics.StreamClientInterceptor()))
 		opts = append(opts, grpc.WithChainUnaryInterceptor(metrics.UnaryClientInterceptor()))
 
-		conn, err := grpc.Dial(c.GRPCBackend.BaseURL.Host, opts...)
+		conn, err := grpc.NewClient(c.GRPCBackend.BaseURL.Host, opts...)
 		if err != nil {
 			return err
 		}
@@ -150,6 +150,7 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.DisableSSL,
 			c.S3CloudStorage.UpdateTimestamps,
 			c.S3CloudStorage.Region,
+			c.S3CloudStorage.MaxIdleConns,
 			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
 			nil)
 		return nil
@@ -185,7 +186,7 @@ func parseBucketLookupType(typeStr string) (minio.BucketLookupType, error) {
 
 	val, ok := valMap[typeStr]
 	if !ok {
-		return 0, fmt.Errorf("Unsupported value: %s", typeStr)
+		return 0, fmt.Errorf("unsupported bucket_lookup_type value : %s", typeStr)
 	}
 
 	return val, nil

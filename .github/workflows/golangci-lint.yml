@@ -22,3 +22,4 @@ jobs:
         with:
           version: latest
           args: --timeout=10m
+          only-new-issues: true

@@ -67,8 +67,9 @@ $ curl http://localhost:8080/status
  "ReservedSize": 876400,
  "MaxSize": 8589934592000,
  "NumFiles": 621413,
- "ServerTime": 1588329927,
- "GitCommit": "940d540d3a7f17939c3df0038530122eabef2f19",
+ "ServerTime": 1746258977,
+ "GitCommit": "d0f166cdd973342ec4aa8a51228cfd3a7a205414",
+ "GitTags": "v2.5.1",
  "NumGoroutines": 12
 }
 ```
@@ -157,8 +158,8 @@ OPTIONS:
    --storage_mode value Which format to store CAS blobs in. Must be one of
       "zstd" or "uncompressed". (default: "zstd") [$BAZEL_REMOTE_STORAGE_MODE]
 
-   --zstd_implementation value ZSTD implementation to use. Must be one of
-      "go" or "cgo". (default: "go") [$BAZEL_REMOTE_ZSTD_IMPLEMENTATION]
+   --zstd_implementation value ZSTD implementation to use. Supported values:
+      "cgo", "go" (default: "go") [$BAZEL_REMOTE_ZSTD_IMPLEMENTATION]
 
    --http_address value Address specification for the HTTP server listener,
       formatted either as [host]:port for TCP or unix://path.sock for Unix
@@ -292,6 +293,30 @@ OPTIONS:
       Google credentials for the Google Cloud Storage proxy backend.
       [$BAZEL_REMOTE_GCS_JSON_CREDENTIALS_FILE]
 
+   --ldap.url value The LDAP URL which may include a port. LDAP over SSL
+      (LDAPs) is also supported. Note that this feature is currently considered
+      experimental. [$BAZEL_REMOTE_LDAP_URL]
+
+   --ldap.base_dn value The distinguished name of the search base.
+      [$BAZEL_REMOTE_LDAP_BASE_DN]
+
+   --ldap.bind_user value The user who is allowed to perform a search within
+      the base DN. If none is specified the connection and the search is
+      performed without an authentication. It is recommended to use a read-only
+      account. [$BAZEL_REMOTE_LDAP_BIND_USER]
+
+   --ldap.bind_password value The password of the bind user.
+      [$BAZEL_REMOTE_LDAP_BIND_PASSWORD]
+
+   --ldap.username_attribute value The user attribute of a connecting user.
+      (default: "uid") [$BAZEL_REMOTE_LDAP_USER_ATTRIBUTE]
+
+   --ldap.groups_query value Filter clause for searching groups.
+      [$BAZEL_REMOTE_LDAP_GROUPS_QUERY]
+
+   --ldap.cache_time value The amount of time to cache a successful
+      authentication in seconds. (default: 3600) [$BAZEL_REMOTE_LDAP_CACHE_TIME]
+
    --s3.endpoint value The S3/minio endpoint to use when using S3 proxy
       backend. [$BAZEL_REMOTE_S3_ENDPOINT]
 
@@ -316,6 +341,10 @@ OPTIONS:
    --s3.secret_access_key value The S3/minio secret access key to use when
       using S3 proxy backend. Applies to s3 auth method(s): access_key.
       [$BAZEL_REMOTE_S3_SECRET_ACCESS_KEY]
+
+   --s3.session_token value The S3/minio session token to use when using S3
+      proxy backend. Optional. Applies to s3 auth method(s): access_key.
+      [$BAZEL_REMOTE_S3_SESSION_TOKEN]
 
    --s3.signature_type value Which type of s3 signature to use when using S3
       proxy backend. Only applies when using the s3 access_key auth method.
@@ -351,6 +380,10 @@ OPTIONS:
    --s3.key_version value DEPRECATED. Key version 2 now is the only supported
       value. This flag will be removed. (default: 2)
       [$BAZEL_REMOTE_S3_KEY_VERSION]
+
+   --s3.max_idle_conns value The maximum number of idle connections to use
+      when using the S3 proxy backend. (default: 1024)
+      [$BAZEL_REMOTE_S3_MAX_IDLE_CONNS]
 
    --azblob.tenant_id value The Azure blob storage tenant id to use when
       using azblob proxy backend. [$BAZEL_REMOTE_AZBLOB_TENANT_ID,
@@ -408,6 +441,9 @@ OPTIONS:
       endpoint. (default: false, ie disable metrics)
       [$BAZEL_REMOTE_ENABLE_ENDPOINT_METRICS]
 
+   --http_metrics_prefix Whether to prefix http metrics with "bazel_remote"
+      or not (default: false, ie no prefix) [$BAZEL_REMOTE_HTTP_METRICS_PREFIX]
+
    --experimental_remote_asset_api Whether to enable the experimental remote
       asset API implementation. (default: false, ie disable remote asset API)
       [$BAZEL_REMOTE_EXPERIMENTAL_REMOTE_ASSET_API]
@@ -429,6 +465,18 @@ OPTIONS:
 # These two are the only required options:
 dir: path/to/cache-dir
 max_size: 100
+
+# If specified, write requests will be rejected when max_size_hard_limit is
+# reached. Clients can then decide which requests to retry. This setting can
+# be used to avoid running out of disk space when new blobs are uploaded faster
+# than old blobs can be evicted. A reasonable value might be 5% larger than
+# max_size. A higher limit might be needed when using a proxy backend.
+#
+# The max_size_hard_limit can be tuned by watching how the prometheus query
+# max_over_time(bazel_remote_disk_cache_size_bytes[$__interval]) varies
+# between bazel_remote_disk_cache_size_bytes_limit{type="evict"} and
+# bazel_remote_disk_cache_size_bytes_limit{type="reject"}.
+#max_size_hard_limit: 105
 
 # The form to store CAS blobs in ("zstd" or "uncompressed"):
 #storage_mode: zstd
@@ -469,7 +517,15 @@ http_address: 0.0.0.0:8080
 # Alternatively, you can use simple authentication:
 #htpasswd_file: path/to/.htpasswd
 
-
+# At most one authentication mechanism can be used
+#ldap:
+#  url: ldaps://ldap.example.com:636
+#  base_dn: OU=My Users,DC=example,DC=com
+#  username_attribute: sAMAccountName      # defaults to "uid"
+#  bind_user: ldapuser
+#  bind_password: ldappassword
+#  cache_time: 3600                        # in seconds (default 1 hour)
+#  groups_query: (memberOf=CN=bazel-users,OU=Groups,OU=My Users,DC=example,DC=com)
 
 # If tls_ca_file or htpasswd_file are specified, you can choose
 # whether or not to allow unauthenticated read access:
@@ -513,6 +569,7 @@ http_address: 0.0.0.0:8080
 #  prefix: test-prefix
 #  disable_ssl: true
 #  bucket_lookup_type: auto
+#  max_idle_conns: 1024
 #
 # Provide exactly one auth_method (access_key, iam_role, or credentials_file) and accompanying configuration.
 #
@@ -520,6 +577,7 @@ http_address: 0.0.0.0:8080
 #  auth_method: access_key
 #  access_key_id: EXAMPLE_ACCESS_KEY
 #  secret_access_key: EXAMPLE_SECRET_KEY
+#  session_token: EXAMPLE_SESSION_TOKEN
 #  signature_type: v4
 #
 # IAM Role authentication.
@@ -652,22 +710,26 @@ See [examples/docker-compose.yml](examples/docker-compose.yml) for an example co
   alb.ingress.kubernetes.io/target-type: ip
   ```
 
-### Build your own
+### Build your own docker image
 
 The command below will build a docker image from source and install it into your local docker registry.
 
 ```bash
-$ bazel run :bazel-remote-image -- --max_size 5 --dir /your/path/to/data
+$ bazel run :bazel-remote-image-tarball
+# Ensure /your/path/to/data exists and is writable (e.g. by UID 65532)
+$ docker run -v /your/path/to/data:/data buchgr/bazel-remote-cache:tmp-amd64 --max_size 5 --dir /data
 ```
 
-### ARM Support
+### ARM64 docker image
 
-Bazel remote cache server can be run on an ARM architecture (i.e.: on a Raspberry Pi).
+Bazel-remote can also run on ARM64 architecture devices, for example on a Raspberry Pi.
 
-To build for ARM, use:
+To build a docker image for ARM64:
 
 ```bash
-$ bazel run :bazel-remote-image-arm64 -- --max_size 5 --dir /your/path/to/data
+$ bazel run :bazel-remote-image-arm64-tarball
+# Ensure /your/path/to/data exists and is writable (e.g. by UID 65532)
+$ docker run -v /your/path/to/data:/data buchgr/bazel-remote-cache:tmp-arm64 --max_size 5 --dir /data
 ```
 
 ## Build a standalone Linux binary
@@ -679,7 +741,12 @@ $ bazel build :bazel-remote
 ### Authentication
 
 bazel-remote defaults to allow unauthenticated access, but basic `.htpasswd`
-style authentication and mutual TLS authentication are also supported.
+style authentication, mutual TLS authentication and (experimental) LDAP are
+also supported.
+
+Note that only one authentication mechanism can be used at a time.
+
+#### htpasswd
 
 In order to pass a `.htpasswd` and/or server key file(s) to the cache
 inside a docker container, you first need to mount the file in the
@@ -698,6 +765,8 @@ $ docker run -v /path/to/cache/dir:/data \
 	--htpasswd_file /etc/bazel-remote/htpasswd --max_size 5
 ```
 
+#### mTLS
+
 If you prefer not using `.htpasswd` files it is also possible to
 authenticate with mTLS (also can be known as "authenticating client
 certificates"). You can do this by passing in the the cert/key the
@@ -714,6 +783,27 @@ $ docker run -v /path/to/cache/dir:/data \
 	--tls_cert_file=/etc/bazel-remote/server_cert \
 	--tls_key_file=/etc/bazel-remote/server_key \
 	--max_size 5
+```
+
+#### LDAP
+
+There is also an experimental LDAP authentication method. A configuration
+file is advised to avoid leaking the ldap.bind_password value to local
+users, but command line arguments are also supported.
+
+Note that the configuration options for this feature might change while
+the feature is still considered "experimental".
+
+```bash
+$ docker run -v /path/to/cache/dir:/data \
+   -p 9090:8080 -p 9092:9092 buchgr/bazel-remote-cache \
+   --ldap.url="ldaps://ldap.example.com:636" \
+   --ldap.base_dn="OU=My Users,DC=example,DC=com" \
+   --ldap.groups_query="(|(memberOf=CN=bazel-users,OU=Groups,OU=My Users,DC=example,DC=com)(memberOf=CN=other-users,OU=Groups2,OU=Alien Users,DC=foo,DC=org))" \
+   --ldap.cache_time=100 \
+   --ldap.bind_user="cn=readonly.username,ou=readonly,OU=Other Users,DC=example,DC=com" \
+   --ldap.bind_password="secret4Sure" \
+   --max_size 5
 ```
 
 ### Using bazel-remote with AWS Credential file authentication for S3 inside a docker container

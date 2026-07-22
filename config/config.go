@@ -38,6 +38,16 @@ type URLBackendConfig struct {
 	CaFile   string   `yaml:"ca_file"`
 }
 
+type LDAPConfig struct {
+	URL               string        `yaml:"url"`
+	BaseDN            string        `yaml:"base_dn"`
+	BindUser          string        `yaml:"bind_user"`
+	BindPassword      string        `yaml:"bind_password"`
+	UsernameAttribute string        `yaml:"username_attribute"`
+	GroupsQuery       string        `yaml:"groups_query"`
+	CacheTime         time.Duration `yaml:"cache_time"`
+}
+
 func (c *URLBackendConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type Aux URLBackendConfig
 	aux := &struct {
@@ -60,21 +70,21 @@ func (c *URLBackendConfig) UnmarshalYAML(unmarshal func(interface{}) error) erro
 
 func (c *URLBackendConfig) validate(protocol string) error {
 	if c.BaseURL == nil {
-		return fmt.Errorf("The 'url' field is required for '%s_proxy'", protocol)
+		return fmt.Errorf("the 'url' field is required for '%s_proxy'", protocol)
 	}
 	if c.BaseURL.Scheme != protocol && c.BaseURL.Scheme != protocol+"s" {
-		return fmt.Errorf("The %[1]s proxy backend protocol must be either %[1]s or %[1]ss", protocol)
+		return fmt.Errorf("the %[1]s proxy backend protocol must be either %[1]s or %[1]ss", protocol)
 	}
 	if c.KeyFile != "" || c.CertFile != "" {
 		if c.KeyFile == "" || c.CertFile == "" {
-			return fmt.Errorf("To use mTLS with the %s proxy, both a key and a certificate must be provided", protocol)
+			return fmt.Errorf("to use mTLS with the %s proxy, both a key and a certificate must be provided", protocol)
 		}
 		if c.BaseURL.Scheme != protocol+"s" {
-			return fmt.Errorf("When mTLS is enabled, the %[1]s proxy backend protocol must be %[1]ss", protocol)
+			return fmt.Errorf("when mTLS is enabled, the %[1]s proxy backend protocol must be %[1]ss", protocol)
 		}
 	}
 	if c.CaFile != "" && c.BaseURL.Scheme != protocol+"s" {
-		return fmt.Errorf("When TLS is enabled, the %[1]s proxy backend protocol must be %[1]s", protocol)
+		return fmt.Errorf("when TLS is enabled, the %[1]s proxy backend protocol must be %[1]s", protocol)
 	}
 	return nil
 }
@@ -86,9 +96,11 @@ type Config struct {
 	ProfileAddress              string                    `yaml:"profile_address"`
 	Dir                         string                    `yaml:"dir"`
 	MaxSize                     int                       `yaml:"max_size"`
+	MaxSizeHardLimit            int                       `yaml:"max_size_hard_limit"`
 	StorageMode                 string                    `yaml:"storage_mode"`
 	ZstdImplementation          string                    `yaml:"zstd_implementation"`
 	HtpasswdFile                string                    `yaml:"htpasswd_file"`
+	LDAP                        *LDAPConfig               `yaml:"ldap,omitempty"`
 	MinTLSVersion               string                    `yaml:"min_tls_version"`
 	TLSCaFile                   string                    `yaml:"tls_ca_file"`
 	TLSCertFile                 string                    `yaml:"tls_cert_file"`
@@ -107,6 +119,7 @@ type Config struct {
 	EnableACKeyInstanceMangling bool                      `yaml:"enable_ac_key_instance_mangling"`
 	EnableEndpointMetrics       bool                      `yaml:"enable_endpoint_metrics"`
 	MetricsDurationBuckets      []float64                 `yaml:"endpoint_metrics_duration_buckets"`
+	HttpMetricsPrefix           bool                      `yaml:"http_metrics_prefix"`
 	ExperimentalRemoteAssetAPI  bool                      `yaml:"experimental_remote_asset_api"`
 	HTTPReadTimeout             time.Duration             `yaml:"http_read_timeout"`
 	HTTPWriteTimeout            time.Duration             `yaml:"http_write_timeout"`
@@ -157,17 +170,20 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 	hc *URLBackendConfig,
 	grpcb *URLBackendConfig,
 	gcs *GoogleCloudStorageConfig,
+	ldap *LDAPConfig,
 	s3 *S3CloudStorageConfig,
 	azblob *AzBlobStorageConfig,
 	disableHTTPACValidation bool,
 	disableGRPCACDepsCheck bool,
 	enableACKeyInstanceMangling bool,
 	enableEndpointMetrics bool,
+	httpMetricsPrefix bool,
 	experimentalRemoteAssetAPI bool,
 	httpReadTimeout time.Duration,
 	httpWriteTimeout time.Duration,
 	accessLogLevel string,
 	logTimezone string,
+	maxSizeHardLimit int,
 	maxBlobSize int64,
 	maxProxyBlobSize int64) (*Config, error) {
 
@@ -177,6 +193,7 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 		ProfileAddress:              profileAddress,
 		Dir:                         dir,
 		MaxSize:                     maxSize,
+		MaxSizeHardLimit:            maxSizeHardLimit,
 		StorageMode:                 storageMode,
 		ZstdImplementation:          zstdImplementation,
 		HtpasswdFile:                htpasswdFile,
@@ -192,12 +209,14 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 		GoogleCloudStorage:          gcs,
 		HTTPBackend:                 hc,
 		GRPCBackend:                 grpcb,
+		LDAP:                        ldap,
 		IdleTimeout:                 idleTimeout,
 		DisableHTTPACValidation:     disableHTTPACValidation,
 		DisableGRPCACDepsCheck:      disableGRPCACDepsCheck,
 		EnableACKeyInstanceMangling: enableACKeyInstanceMangling,
 		EnableEndpointMetrics:       enableEndpointMetrics,
 		MetricsDurationBuckets:      defaultDurationBuckets,
+		HttpMetricsPrefix:           httpMetricsPrefix,
 		ExperimentalRemoteAssetAPI:  experimentalRemoteAssetAPI,
 		HTTPReadTimeout:             httpReadTimeout,
 		HTTPWriteTimeout:            httpWriteTimeout,
@@ -220,19 +239,19 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 func newFromYamlFile(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to open config file '%s': %v", path, err)
+		return nil, fmt.Errorf("failed to open config file '%s': %v", path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	data, err := io.ReadAll(file)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to read config file '%s': %v", path, err)
+		return nil, fmt.Errorf("failed to read config file '%s': %v", path, err)
 	}
 
-	return newFromYaml(data)
+	return NewFromYaml(data)
 }
 
-func newFromYaml(data []byte) (*Config, error) {
+func NewFromYaml(data []byte) (*Config, error) {
 	yc := YamlConfig{
 		Config: Config{
 			StorageMode:            "zstd",
@@ -250,7 +269,7 @@ func newFromYaml(data []byte) (*Config, error) {
 
 	err := yaml.Unmarshal(data, &yc)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to parse YAML config: %v", err)
+		return nil, fmt.Errorf("failed to parse YAML config: %v", err)
 	}
 	c := yc.Config
 
@@ -280,11 +299,11 @@ func newFromYaml(data []byte) (*Config, error) {
 
 func validateConfig(c *Config) error {
 	if c.Dir == "" {
-		return errors.New("The 'dir' flag/key is required")
+		return errors.New("the 'dir' flag/key is required")
 	}
 
 	if c.MaxSize <= 0 {
-		return errors.New("The 'max_size' flag/key must be set to a value > 0")
+		return errors.New("the 'max_size' flag/key must be set to a value > 0")
 	}
 
 	if c.StorageMode != "zstd" && c.StorageMode != "uncompressed" {
@@ -312,7 +331,7 @@ func validateConfig(c *Config) error {
 	}
 
 	if proxyCount > 1 {
-		return errors.New("At most one of the S3/GCS/HTTP proxy backends is allowed")
+		return errors.New("at most one of the S3/GCS/HTTP proxy backends is allowed")
 	}
 
 	var httpPort string
@@ -354,39 +373,39 @@ func validateConfig(c *Config) error {
 	}
 
 	if c.GRPCAddress == disabledGRPCListener && c.ExperimentalRemoteAssetAPI {
-		return errors.New("Remote Asset API support depends on gRPC being enabled")
+		return errors.New("remote Asset API support depends on gRPC being enabled")
 	}
 
 	if (c.TLSCertFile != "" && c.TLSKeyFile == "") || (c.TLSCertFile == "" && c.TLSKeyFile != "") {
-		return errors.New("When enabling TLS one must specify both " +
+		return errors.New("when enabling TLS one must specify both " +
 			"'tls_key_file' and 'tls_cert_file'")
 	}
 
 	if c.TLSCaFile != "" && (c.TLSCertFile == "" || c.TLSKeyFile == "") {
-		return errors.New("When enabling mTLS (authenticating client " +
+		return errors.New("when enabling mTLS (authenticating client " +
 			"certificates) the server must have it's own 'tls_key_file' " +
-			"and 'tls_cert_file' specified.")
+			"and 'tls_cert_file' specified")
 	}
 
-	if c.AllowUnauthenticatedReads && c.TLSCaFile == "" && c.HtpasswdFile == "" {
+	if c.AllowUnauthenticatedReads && c.TLSCaFile == "" && c.HtpasswdFile == "" && c.LDAP == nil {
 		return errors.New("AllowUnauthenticatedReads setting is only available when authentication is enabled")
 	}
 
 	if c.MaxBlobSize <= 0 {
-		return errors.New("The 'max_blob_size' flag/key must be a positive integer")
+		return errors.New("the 'max_blob_size' flag/key must be a positive integer")
 	}
 
 	if c.MaxProxyBlobSize <= 0 {
-		return errors.New("The 'max_proxy_blob_size' flag/key must be a positive integer")
+		return errors.New("the 'max_proxy_blob_size' flag/key must be a positive integer")
 	}
 
 	if c.GoogleCloudStorage != nil && c.HTTPBackend != nil && c.S3CloudStorage != nil {
-		return errors.New("One can specify at most one proxying backend")
+		return errors.New("one can specify at most one proxying backend")
 	}
 
 	if c.GoogleCloudStorage != nil {
 		if c.GoogleCloudStorage.Bucket == "" {
-			return errors.New("The 'bucket' field is required for 'gcs_proxy'")
+			return errors.New("the 'bucket' field is required for 'gcs_proxy'")
 		}
 	}
 
@@ -427,15 +446,15 @@ func validateConfig(c *Config) error {
 
 	if c.AzBlobConfig != nil {
 		if c.AzBlobConfig.StorageAccount == "" {
-			return errors.New("The 'storage_account' field is required for 'azblob_proxy'")
+			return errors.New("the 'storage_account' field is required for 'azblob_proxy'")
 		}
 
 		if c.AzBlobConfig.ContainerName == "" {
-			return errors.New("The 'container_name' field is required for 'azblob_proxy'")
+			return errors.New("the 'container_name' field is required for 'azblob_proxy'")
 		}
 
 		if !azblobproxy.IsValidAuthMethod(c.AzBlobConfig.AuthMethod) {
-			return fmt.Errorf("Invalid azblob.auth_method: %s", c.AzBlobConfig.AuthMethod)
+			return fmt.Errorf("invalid azblob.auth_method: %s", c.AzBlobConfig.AuthMethod)
 		}
 	}
 
@@ -447,6 +466,25 @@ func validateConfig(c *Config) error {
 				return errors.New("'endpoint_metrics_duration_buckets' must not contain duplicate buckets")
 			}
 			duplicates[bucket] = true
+		}
+	}
+
+	if c.HtpasswdFile != "" && c.TLSCaFile != "" && c.LDAP != nil {
+		return errors.New("at most one authentication mechanism can be specified")
+	}
+
+	if c.LDAP != nil {
+		if c.LDAP.URL == "" {
+			return errors.New("the 'url' field is required for 'ldap'")
+		}
+		if c.LDAP.BaseDN == "" {
+			return errors.New("the 'base_dn' field is required for 'ldap'")
+		}
+		if c.LDAP.UsernameAttribute == "" {
+			c.LDAP.UsernameAttribute = "uid"
+		}
+		if c.LDAP.CacheTime <= 0 {
+			c.LDAP.CacheTime = 3600
 		}
 	}
 
@@ -526,6 +564,7 @@ func get(ctx *cli.Context) (*Config, error) {
 			AuthMethod:               ctx.String("s3.auth_method"),
 			AccessKeyID:              ctx.String("s3.access_key_id"),
 			SecretAccessKey:          ctx.String("s3.secret_access_key"),
+			SessionToken:             ctx.String("s3.session_token"),
 			SignatureType:            ctx.String("s3.signature_type"),
 			DisableSSL:               ctx.Bool("s3.disable_ssl"),
 			UpdateTimestamps:         ctx.Bool("s3.update_timestamps"),
@@ -533,6 +572,7 @@ func get(ctx *cli.Context) (*Config, error) {
 			Region:                   ctx.String("s3.region"),
 			AWSProfile:               ctx.String("s3.aws_profile"),
 			AWSSharedCredentialsFile: ctx.String("s3.aws_shared_credentials_file"),
+			MaxIdleConns:             ctx.Int("s3.max_idle_conns"),
 		}
 	}
 
@@ -590,6 +630,19 @@ func get(ctx *cli.Context) (*Config, error) {
 		}
 	}
 
+	var ldap *LDAPConfig
+	if ctx.String("ldap.url") != "" {
+		ldap = &LDAPConfig{
+			URL:               ctx.String("ldap.url"),
+			BaseDN:            ctx.String("ldap.base_dn"),
+			BindUser:          ctx.String("ldap.bind_user"),
+			BindPassword:      ctx.String("ldap.bind_password"),
+			UsernameAttribute: ctx.String("ldap.username_attribute"),
+			GroupsQuery:       ctx.String("ldap.groups_query"),
+			CacheTime:         ctx.Duration("ldap.cache_time"),
+		}
+	}
+
 	return newFromArgs(
 		ctx.String("dir"),
 		ctx.Int("max_size"),
@@ -610,17 +663,20 @@ func get(ctx *cli.Context) (*Config, error) {
 		hc,
 		grpcb,
 		gcs,
+		ldap,
 		s3,
 		azblob,
 		ctx.Bool("disable_http_ac_validation"),
 		ctx.Bool("disable_grpc_ac_deps_check"),
 		ctx.Bool("enable_ac_key_instance_mangling"),
 		ctx.Bool("enable_endpoint_metrics"),
+		ctx.Bool("http_metrics_prefix"),
 		ctx.Bool("experimental_remote_asset_api"),
 		ctx.Duration("http_read_timeout"),
 		ctx.Duration("http_write_timeout"),
 		ctx.String("access_log_level"),
 		ctx.String("log_timezone"),
+		ctx.Int("max_size_hard_limit"),
 		ctx.Int64("max_blob_size"),
 		ctx.Int64("max_proxy_blob_size"),
 	)

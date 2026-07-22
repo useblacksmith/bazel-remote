@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,7 +25,7 @@ import (
 
 func TestDownloadFile(t *testing.T) {
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	blobSize := int64(1024)
 
@@ -37,7 +38,7 @@ func TestDownloadFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "")
+	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "", "")
 
 	rr := httptest.NewRecorder()
 	handler := http.HandlerFunc(h.CacheHandler)
@@ -86,7 +87,7 @@ func TestDownloadFile(t *testing.T) {
 
 func TestUploadFilesConcurrently(t *testing.T) {
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	const NumUploads = 1000
 	const blobSize = 1024
@@ -105,7 +106,7 @@ func TestUploadFilesConcurrently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "")
+	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "", "")
 	handler := http.HandlerFunc(h.CacheHandler)
 
 	var wg sync.WaitGroup
@@ -131,7 +132,7 @@ func TestUploadFilesConcurrently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	files, err := f.Readdir(-1)
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +157,7 @@ func TestUploadFilesConcurrently(t *testing.T) {
 
 func TestUploadSameFileConcurrently(t *testing.T) {
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	data, hash := testutils.RandomDataAndHash(1024)
 
@@ -169,7 +170,7 @@ func TestUploadSameFileConcurrently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "")
+	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "", "")
 	handler := http.HandlerFunc(h.CacheHandler)
 
 	var wg sync.WaitGroup
@@ -199,7 +200,7 @@ func TestUploadSameFileConcurrently(t *testing.T) {
 
 func TestUploadCorruptedFile(t *testing.T) {
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	data, hash := testutils.RandomDataAndHash(1024)
 	corruptedData := data[:999]
@@ -210,7 +211,7 @@ func TestUploadCorruptedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "")
+	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "", "")
 	rr := httptest.NewRecorder()
 	handler := http.HandlerFunc(h.CacheHandler)
 	handler.ServeHTTP(rr, r)
@@ -226,7 +227,7 @@ func TestUploadCorruptedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	entries, err := f.Readdir(-1)
 	if err != nil {
 		t.Fatal(err)
@@ -240,7 +241,7 @@ func TestUploadCorruptedFile(t *testing.T) {
 
 func TestUploadEmptyActionResult(t *testing.T) {
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	data, hash := testutils.RandomDataAndHash(0)
 
@@ -254,7 +255,7 @@ func TestUploadEmptyActionResult(t *testing.T) {
 	mangle := false
 	checkClientCertForReads := false
 	checkClientCertForWrites := false
-	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), validate, mangle, checkClientCertForReads, checkClientCertForWrites, "")
+	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), validate, mangle, checkClientCertForReads, checkClientCertForWrites, "", "")
 	rr := httptest.NewRecorder()
 	handler := http.HandlerFunc(h.CacheHandler)
 	handler.ServeHTTP(rr, r)
@@ -303,7 +304,7 @@ func TestEmptyBlobAvailable(t *testing.T) {
 
 func testEmptyBlobAvailable(t *testing.T, method string) {
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	data, hash := testutils.RandomDataAndHash(0)
 	r := httptest.NewRequest(method, "/cas/"+hash, bytes.NewReader(data))
@@ -316,7 +317,7 @@ func testEmptyBlobAvailable(t *testing.T, method string) {
 	mangle := false
 	checkClientCertForReads := false
 	checkClientCertForWrites := false
-	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), validate, mangle, checkClientCertForReads, checkClientCertForWrites, "")
+	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), validate, mangle, checkClientCertForReads, checkClientCertForWrites, "", "")
 	rr := httptest.NewRecorder()
 	handler := http.HandlerFunc(h.CacheHandler)
 	handler.ServeHTTP(rr, r)
@@ -331,7 +332,7 @@ func testEmptyBlobAvailable(t *testing.T, method string) {
 
 func TestStatusPage(t *testing.T) {
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	r := httptest.NewRequest("GET", "/status", nil)
 
@@ -339,7 +340,7 @@ func TestStatusPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "")
+	h := NewHTTPCache(c, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "", "")
 	rr := httptest.NewRecorder()
 	handler := http.HandlerFunc(h.StatusPageHandler)
 	handler.ServeHTTP(rr, r)
@@ -477,13 +478,13 @@ func TestRemoteReturnsNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	emptyCache, err := disk.New(cacheDir, 1024, disk.WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	h := NewHTTPCache(emptyCache, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "")
+	h := NewHTTPCache(emptyCache, testutils.NewSilentLogger(), testutils.NewSilentLogger(), true, false, false, false, "", "")
 	// create a fake http.Request
 	_, hash := testutils.RandomDataAndHash(1024)
 	url, _ := url.Parse(fmt.Sprintf("http://localhost:8080/ac/%s", hash))
@@ -501,6 +502,62 @@ func TestRemoteReturnsNotFound(t *testing.T) {
 	respWriter := &fakeResponseWriter{
 		statusCode: &statusCode,
 	}
+	h.CacheHandler(respWriter, req)
+	if statusCode != http.StatusNotFound {
+		t.Errorf("Wrong status code, expected %d, got %d", http.StatusNotFound, statusCode)
+	}
+}
+
+func TestManglingACKeys(t *testing.T) {
+	cacheDir, err := os.MkdirTemp("", "bazel-remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(cacheDir) }()
+
+	blobSize := int64(1024)
+	cacheSize := blobSize*2 + disk.BlockSize
+	diskCache, err := disk.New(cacheDir, cacheSize, disk.WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewHTTPCache(diskCache, testutils.NewSilentLogger(), testutils.NewSilentLogger(), false, true, false, false, "", "")
+	// create a fake http.Request
+	data, hash := testutils.RandomDataAndHash(blobSize)
+	err = diskCache.Put(context.Background(), cache.RAW, hash, int64(len(data)), bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	url, _ := url.Parse(fmt.Sprintf("http://localhost:8080/ac/%s", hash))
+	reader := bytes.NewReader([]byte{})
+	body := io.NopCloser(reader)
+	req := &http.Request{
+		Method:     "GET",
+		URL:        url,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Body:       body,
+	}
+	statusCode := 0
+	respWriter := &fakeResponseWriter{
+		statusCode: &statusCode,
+	}
+	h.CacheHandler(respWriter, req)
+	if statusCode != 0 {
+		t.Errorf("Wrong status code, expected %d, got %d", 0, statusCode)
+	}
+
+	url, _ = url.Parse(fmt.Sprintf("http://localhost:8080/test-instance/ac/%s", hash))
+	reader.Reset([]byte{})
+	_ = body.Close()
+	body = io.NopCloser(reader)
+	req.URL = url
+	req.Body = body
+	statusCode = 0
+
 	h.CacheHandler(respWriter, req)
 	if statusCode != http.StatusNotFound {
 		t.Errorf("Wrong status code, expected %d, got %d", http.StatusNotFound, statusCode)

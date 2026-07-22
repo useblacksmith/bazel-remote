@@ -44,19 +44,22 @@ func New(dir string, maxSizeBytes int64, opts ...Option) (Cache, error) {
 		return nil, err
 	}
 
-	// Go defaults to a limit of 10,000 operating system threads.
-	// We probably don't need half of those for file removals at
-	// any given point in time, unless the disk/fs can't keep up.
-	// I suppose it's better to slow down processing than to crash
-	// when hitting the 10k limit or to run out of disk space.
+	// Go defaults to a limit of 10,000 operating system threads. Going
+	// over that limit would result in a crash and therefore we use a
+	// semaphore to throttle amount of concurrently running blocking
+	// file syscalls. A semaphore weight of 5,000 should give plenty of
+	// margin. The weight should not be set too low because the
+	// average latency could increase if a few slow clients could block
+	// all other clients.
 	semaphoreWeight := int64(5000)
 
-	if strings.HasPrefix(runtime.GOOS, "darwin") {
+	if runtime.GOOS == "darwin" {
 		// Mac seems to fail to create os threads when removing
 		// lots of files, so allow fewer than linux.
 		semaphoreWeight = 3000
 	}
-	log.Printf("Limiting concurrent file removals to %d\n", semaphoreWeight)
+
+	log.Printf("Limiting concurrent disk waiting requests to %d\n", semaphoreWeight)
 
 	zi, err := zstdimpl.Get("go")
 	if err != nil {
@@ -72,8 +75,12 @@ func New(dir string, maxSizeBytes int64, opts ...Option) (Cache, error) {
 		maxBlobSize:      math.MaxInt64,
 		maxProxyBlobSize: math.MaxInt64,
 
-		fileRemovalSem: semaphore.NewWeighted(semaphoreWeight),
-		lruCaptureSem:  semaphore.NewWeighted(lruCaptureBudgetBytes),
+		// Acquire 1 of these before starting filesystem writes/deletes, or
+		// reject filesystem writes upon failure (since this will create a
+		// new OS thread and we don't want to hit Go's default 10,000 OS
+		// thread limit.
+		diskWaitSem:   semaphore.NewWeighted(semaphoreWeight),
+		lruCaptureSem: semaphore.NewWeighted(lruCaptureBudgetBytes),
 
 		gaugeCacheAge: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "bazel_remote_disk_cache_longest_item_idle_time_seconds",
@@ -113,11 +120,11 @@ func New(dir string, maxSizeBytes int64, opts ...Option) (Cache, error) {
 
 	err = c.migrateDirectories()
 	if err != nil {
-		return nil, fmt.Errorf("Attempting to migrate the old directory structure failed: %w", err)
+		return nil, fmt.Errorf("attempting to migrate the old directory structure failed: %w", err)
 	}
-	err = c.loadExistingFiles(maxSizeBytes)
+	err = c.loadExistingFiles(maxSizeBytes, cc)
 	if err != nil {
-		return nil, fmt.Errorf("Loading of existing cache entries failed due to error: %w", err)
+		return nil, fmt.Errorf("loading of existing cache entries failed due to error: %w", err)
 	}
 
 	if cc.metrics == nil {
@@ -268,17 +275,17 @@ func migrateV1Subdir(oldDir string, destDir string, kind cache.EntryKind) error 
 
 			if !validate.HashKeyRegex.MatchString(name) {
 				if strings.ToLower(name) == lowercaseDSStoreFile {
-					os.Remove(oldPath)
+					_ = os.Remove(oldPath)
 					continue
 				}
 
-				return fmt.Errorf("Unexpected file: %s", oldPath)
+				return fmt.Errorf("unexpected file: %s", oldPath)
 			}
 
 			destPath := path.Join(destDir, name) + "-556677.v1"
 			err = os.Rename(oldPath, destPath)
 			if err != nil {
-				return fmt.Errorf("Failed to migrate CAS blob %s: %w",
+				return fmt.Errorf("failed to migrate CAS blob %s: %w",
 					oldPath, err)
 			}
 		}
@@ -293,11 +300,11 @@ func migrateV1Subdir(oldDir string, destDir string, kind cache.EntryKind) error 
 
 		if !validate.HashKeyRegex.MatchString(name) {
 			if strings.ToLower(name) == lowercaseDSStoreFile {
-				os.Remove(oldPath)
+				_ = os.Remove(oldPath)
 				continue
 			}
 
-			return fmt.Errorf("Unexpected file: %s %s", oldPath, name)
+			return fmt.Errorf("unexpected file: %s %s", oldPath, name)
 		}
 
 		destPath := path.Join(destDir, name) + "-112233"
@@ -305,7 +312,7 @@ func migrateV1Subdir(oldDir string, destDir string, kind cache.EntryKind) error 
 		// TODO: support cross-filesystem migration.
 		err = os.Rename(oldPath, destPath)
 		if err != nil {
-			return fmt.Errorf("Failed to migrate blob %s: %w", oldPath, err)
+			return fmt.Errorf("failed to migrate blob %s: %w", oldPath, err)
 		}
 	}
 
@@ -423,7 +430,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 				} else if strings.HasPrefix(cacheDir, "raw.v2/") {
 					lookupKeyKind = cache.RAW
 				} else {
-					return fmt.Errorf("Unrecognised directory in cache dir: %q", dirName)
+					return fmt.Errorf("unrecognised directory in cache dir: %q", dirName)
 				}
 
 				des, err := os.ReadDir(dirName)
@@ -445,12 +452,12 @@ func (c *diskCache) scanDir() (scanResult, error) {
 							continue
 						}
 
-						return fmt.Errorf("Unexpected directory: %q", path.Join(dirName, name))
+						return fmt.Errorf("unexpected directory: %q", path.Join(dirName, name))
 					}
 
 					info, err := de.Info()
 					if err != nil {
-						return fmt.Errorf("Failed to get file info for %q: %w", path.Join(dirName, name), err)
+						return fmt.Errorf("failed to get file info for %q: %w", path.Join(dirName, name), err)
 					}
 
 					fields := strings.Split(name, "/")
@@ -458,7 +465,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 
 					sm := re.FindStringSubmatch(file)
 					if len(sm) != 5 {
-						return fmt.Errorf("Unrecognized file: %q", path.Join(dirName, name))
+						return fmt.Errorf("unrecognized file: %q", path.Join(dirName, name))
 					}
 
 					hash := sm[1]
@@ -473,14 +480,14 @@ func (c *diskCache) scanDir() (scanResult, error) {
 					if len(sm[2]) > 0 {
 						item[n].size, err = strconv.ParseInt(sm[2], 10, 64)
 						if err != nil {
-							return fmt.Errorf("Failed to parse int from %q in file %q: %w",
+							return fmt.Errorf("failed to parse int from %q in file %q: %w",
 								sm[2], path.Join(dirName, name), err)
 						}
 					}
 
 					item[n].random = sm[3]
 					if len(item[n].random) == 0 {
-						return fmt.Errorf("Unrecognized file (no random string): %q", path.Join(dirName, name))
+						return fmt.Errorf("unrecognized file (no random string): %q", path.Join(dirName, name))
 					}
 
 					item[n].legacy = sm[4] == ".v1"
@@ -571,7 +578,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 
 	des, err := os.ReadDir(c.dir)
 	if err != nil {
-		return scanResult{}, fmt.Errorf("Failed to read cache dir %q: %w", c.dir, err)
+		return scanResult{}, fmt.Errorf("failed to read cache dir %q: %w", c.dir, err)
 	}
 
 	hasUnscopedDirs := false
@@ -590,7 +597,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 				continue
 			}
 
-			return scanResult{}, fmt.Errorf("Unexpected file: %s", name)
+			return scanResult{}, fmt.Errorf("unexpected file: %s", name)
 		}
 
 		if name == lostAndFound {
@@ -598,7 +605,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 		}
 
 		if name != "ac.v2" && name != "cas.v2" && name != "raw.v2" {
-			return scanResult{}, fmt.Errorf("Unexpected dir: %s", name)
+			return scanResult{}, fmt.Errorf("unexpected dir: %s", name)
 		}
 
 		hasUnscopedDirs = true
@@ -628,7 +635,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 // loadExistingFiles lists all files in the cache directory, and adds them to the
 // LRU index so that they can be served. Files are sorted by access time first,
 // so that the eviction behavior is preserved across server restarts.
-func (c *diskCache) loadExistingFiles(maxSizeBytes int64) error {
+func (c *diskCache) loadExistingFiles(maxSizeBytes int64, cc CacheConfig) error {
 	log.Printf("Loading existing files in %s.\n", c.dir)
 
 	result, err := c.scanDir()
@@ -641,17 +648,39 @@ func (c *diskCache) loadExistingFiles(maxSizeBytes int64) error {
 	sort.Sort(result)
 
 	// The eviction callback deletes the file from disk.
-	// This function is only called while the lock is held
+	// This function is only called while the lock is not held
 	// by the current goroutine.
-	onEvict := func(key Key, value lruItem) {
+	onEvict := func(key string, value lruItem) {
 		f := c.getElementPath(key, value)
-		// Run in a goroutine so we can release the lock sooner.
-		go c.removeFile(f)
+		c.removeFile(f)
 	}
 
 	log.Println("Building LRU index.")
 
 	c.lru = NewSizedLRU(maxSizeBytes, onEvict, len(result.item))
+
+	log.Printf("Will evict at max size: %.2f GB", bytesToGigaBytes(maxSizeBytes))
+
+	if cc.maxSizeHardLimit > 0 {
+		// Only set and print if optional limit is enabled.
+		c.lru.maxSizeHardLimit = cc.maxSizeHardLimit
+		log.Printf("Will reject requests at hard limit: %.2f GB",
+			bytesToGigaBytes(c.lru.maxSizeHardLimit))
+	}
+
+	// Start one single goroutine running in background, continuously
+	// waiting for files to be removed and removing them. Benchmarks on
+	// Linux with the XFS file system have surprisingly shown that removal
+	// sequentially with a single goroutine is much faster than starting
+	// separate go routines for each file and removing them in parallel
+	// despite SSDs with high IOPS performance. Benchmarks have also shown
+	// that the single background goroutine is still slightly faster even
+	// if the parallel goroutines would be serialized with a semaphore.
+	// Sequentially evicting all files helps ensure that Go's default
+	// limit of 10,000 operating system threads is not reached. Otherwise,
+	// the number of concurrent removals could explode when a large new
+	// file suddenly evicts thousands of old small files.
+	go c.lru.performQueuedEvictionsContinuously()
 
 	for i := 0; i < len(result.item); i++ {
 		ok := c.lru.Add(result.metadata[i].lookupKey, *result.item[i])
@@ -663,7 +692,25 @@ func (c *diskCache) loadExistingFiles(maxSizeBytes int64) error {
 		}
 	}
 
+	if c.lru.queuedEvictionsSize.Load() > 0 {
+		// We were either restarted with a lower cache size, or there is still
+		// a backlog of blobs to be removed. Wait for them to be removed before
+		// accepting connections, to avoid confusing error logs.
+
+		log.Println("Waiting for blob eviction backlog to complete.")
+
+		for c.lru.queuedEvictionsSize.Load() > 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		log.Println("Finished waiting for blob evictions.")
+	}
+
 	log.Println("Finished loading disk cache files.")
 
 	return nil
+}
+
+func bytesToGigaBytes(bytes int64) float64 {
+	return float64(bytes) / (1024.0 * 1024.0 * 1024.0)
 }

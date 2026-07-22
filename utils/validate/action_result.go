@@ -11,7 +11,7 @@ import (
 var (
 	errNilActionResult = fmt.Errorf("nil *ActionResult")
 
-	errNegativeDigest = fmt.Errorf("Digest has negative SizeBytes")
+	errNegativeDigest = fmt.Errorf("digest has negative SizeBytes")
 
 	errNilOutputFile = fmt.Errorf("nil output file")
 	errEmptyPath     = fmt.Errorf("empty path")
@@ -73,10 +73,11 @@ func ActionResult(ar *pb.ActionResult) error {
 		}
 		err = maybeNilDigest(d.TreeDigest) // No need to re-check for nil.
 		if err != nil {
-			return fmt.Errorf("Invalid TreeDigest for path %q: %w", d.Path, err)
+			return fmt.Errorf("invalid TreeDigest for path %q: %w", d.Path, err)
 		}
 	}
 
+	//nolint:staticcheck // validate deprecated field without giving lint errors
 	for _, s := range ar.OutputFileSymlinks {
 		if s == nil {
 			return errNilOuputFileSymlink
@@ -107,6 +108,7 @@ func ActionResult(ar *pb.ActionResult) error {
 		}
 	}
 
+	//nolint:staticcheck // validate deprecated field without giving lint errors
 	for _, s := range ar.OutputDirectorySymlinks {
 		if s == nil {
 			return errNilOuputDirSymlink
@@ -144,7 +146,7 @@ func maybeNilDigest(d *pb.Digest) error {
 		return errNegativeDigest
 	}
 	if !HashKeyRegex.MatchString(d.Hash) {
-		return fmt.Errorf("Invalid hash: %q", d.Hash)
+		return fmt.Errorf("invalid hash: %q", d.Hash)
 	}
 
 	return nil

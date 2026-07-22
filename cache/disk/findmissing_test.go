@@ -186,9 +186,9 @@ func TestFindMissingCasBlobsWithProxy(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	proxyCacheDir := tempDir(t)
-	defer os.RemoveAll(proxyCacheDir)
+	defer func() { _ = os.RemoveAll(proxyCacheDir) }()
 
 	cacheForProxy, err := New(proxyCacheDir, 10*1024, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
@@ -243,9 +243,9 @@ func TestFindMissingCasBlobsWithProxyFailFast(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	proxyCacheDir := tempDir(t)
-	defer os.RemoveAll(proxyCacheDir)
+	defer func() { _ = os.RemoveAll(proxyCacheDir) }()
 
 	cacheForProxy, err := New(proxyCacheDir, 10*1024, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
@@ -298,9 +298,9 @@ func TestFindMissingCasBlobsWithProxyFailFastNoneMissing(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	proxyCacheDir := tempDir(t)
-	defer os.RemoveAll(proxyCacheDir)
+	defer func() { _ = os.RemoveAll(proxyCacheDir) }()
 
 	cacheForProxy, err := New(proxyCacheDir, 40*1024, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
@@ -368,9 +368,9 @@ func TestFindMissingCasBlobsWithProxyFailFastMaxProxyBlobSize(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	proxyCacheDir := tempDir(t)
-	defer os.RemoveAll(proxyCacheDir)
+	defer func() { _ = os.RemoveAll(proxyCacheDir) }()
 
 	cacheForProxy, err := New(proxyCacheDir, 10*1024, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
@@ -431,9 +431,9 @@ func TestFindMissingCasBlobsWithProxyMaxProxyBlobSize(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	proxyCacheDir := tempDir(t)
-	defer os.RemoveAll(proxyCacheDir)
+	defer func() { _ = os.RemoveAll(proxyCacheDir) }()
 
 	cacheForProxy, err := New(proxyCacheDir, 10*1024, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {

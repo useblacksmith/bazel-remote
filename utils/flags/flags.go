@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/buchgr/bazel-remote/v2/cache/azblobproxy"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
 	"github.com/buchgr/bazel-remote/v2/cache/s3proxy"
 
 	"github.com/urfave/cli/v2"
@@ -18,6 +19,15 @@ func s3AuthMsg(authMethods ...string) string {
 
 func azBlobAuthMsg(authMethods ...string) string {
 	return fmt.Sprintf("Applies to AzBlob auth method(s): %s.", strings.Join(authMethods, ", "))
+}
+
+func getSupportedZstdImplsString() string {
+	impls := zstdimpl.GetImplementations()
+	for i, name := range impls {
+		impls[i] = "\"" + name + "\""
+	}
+
+	return strings.Join(impls, ", ")
 }
 
 // GetCliFlags returns a slice of cli.Flag's that bazel-remote accepts.
@@ -41,6 +51,14 @@ func GetCliFlags() []cli.Flag {
 			Usage:   "The maximum size of bazel-remote's disk cache in GiB. This flag is required.",
 			EnvVars: []string{"BAZEL_REMOTE_MAX_SIZE"},
 		},
+		&cli.Int64Flag{
+			Name:  "max_size_hard_limit",
+			Value: -1,
+			Usage: "If enabled, the maximum size of bazel-remote's disk cache including files queued " +
+				"for eviction in GiB, before bazel-remote will reject write requests. A reasonable " +
+				"value might be 5% larger than --max_size.",
+			EnvVars: []string{"BAZEL_REMOTE_MAX_SIZE_HARD_LIMIT"},
+		},
 		&cli.StringFlag{
 			Name:    "storage_mode",
 			Value:   "zstd",
@@ -50,7 +68,7 @@ func GetCliFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:    "zstd_implementation",
 			Value:   "go",
-			Usage:   "ZSTD implementation to use. Must be one of \"go\" or \"cgo\".",
+			Usage:   "ZSTD implementation to use. Supported values: " + getSupportedZstdImplsString(),
 			EnvVars: []string{"BAZEL_REMOTE_ZSTD_IMPLEMENTATION"},
 		},
 		&cli.StringFlag{
@@ -255,6 +273,48 @@ func GetCliFlags() []cli.Flag {
 			EnvVars: []string{"BAZEL_REMOTE_GCS_JSON_CREDENTIALS_FILE"},
 		},
 		&cli.StringFlag{
+			Name:    "ldap.url",
+			Value:   "",
+			Usage:   "The LDAP URL which may include a port. LDAP over SSL (LDAPs) is also supported. Note that this feature is currently considered experimental.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_URL"},
+		},
+		&cli.StringFlag{
+			Name:    "ldap.base_dn",
+			Value:   "",
+			Usage:   "The distinguished name of the search base.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_BASE_DN"},
+		},
+		// to allow anonymous access do not require BindUser or BindPassword
+		&cli.StringFlag{
+			Name:    "ldap.bind_user",
+			Value:   "",
+			Usage:   "The user who is allowed to perform a search within the base DN. If none is specified the connection and the search is performed without an authentication. It is recommended to use a read-only account.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_BIND_USER"},
+		},
+		&cli.StringFlag{
+			Name:    "ldap.bind_password",
+			Value:   "",
+			Usage:   "The password of the bind user.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_BIND_PASSWORD"},
+		},
+		&cli.StringFlag{
+			Name:    "ldap.username_attribute",
+			Value:   "uid",
+			Usage:   "The user attribute of a connecting user.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_USER_ATTRIBUTE"},
+		},
+		&cli.StringFlag{
+			Name:    "ldap.groups_query",
+			Usage:   "Filter clause for searching groups.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_GROUPS_QUERY"},
+		},
+		&cli.IntFlag{
+			Name:    "ldap.cache_time",
+			Value:   3600,
+			Usage:   "The amount of time to cache a successful authentication in seconds.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_CACHE_TIME"},
+		},
+		&cli.StringFlag{
 			Name:    "s3.endpoint",
 			Value:   "",
 			Usage:   "The S3/minio endpoint to use when using S3 proxy backend.",
@@ -295,6 +355,12 @@ func GetCliFlags() []cli.Flag {
 			Value:   "",
 			Usage:   "The S3/minio secret access key to use when using S3 proxy backend. " + s3AuthMsg(s3proxy.AuthMethodAccessKey),
 			EnvVars: []string{"BAZEL_REMOTE_S3_SECRET_ACCESS_KEY"},
+		},
+		&cli.StringFlag{
+			Name:    "s3.session_token",
+			Value:   "",
+			Usage:   "The S3/minio session token to use when using S3 proxy backend. Optional. " + s3AuthMsg(s3proxy.AuthMethodAccessKey),
+			EnvVars: []string{"BAZEL_REMOTE_S3_SESSION_TOKEN"},
 		},
 		&cli.StringFlag{
 			Name:        "s3.signature_type",
@@ -344,6 +410,12 @@ func GetCliFlags() []cli.Flag {
 			Value:       2,
 			DefaultText: "2",
 			EnvVars:     []string{"BAZEL_REMOTE_S3_KEY_VERSION"},
+		},
+		&cli.IntFlag{
+			Name:        "s3.max_idle_conns",
+			Usage:       "The maximum number of idle connections to use when using the S3 proxy backend.",
+			DefaultText: "1024",
+			EnvVars:     []string{"BAZEL_REMOTE_S3_MAX_IDLE_CONNS"},
 		},
 		&cli.StringFlag{
 			Name:    "azblob.tenant_id",
@@ -428,6 +500,12 @@ func GetCliFlags() []cli.Flag {
 			Usage:       "Whether to enable metrics for each HTTP/gRPC endpoint.",
 			DefaultText: "false, ie disable metrics",
 			EnvVars:     []string{"BAZEL_REMOTE_ENABLE_ENDPOINT_METRICS"},
+		},
+		&cli.BoolFlag{
+			Name:        "http_metrics_prefix",
+			Usage:       "Whether to prefix http metrics with \"bazel_remote\" or not",
+			DefaultText: "false, ie no prefix",
+			EnvVars:     []string{"BAZEL_REMOTE_HTTP_METRICS_PREFIX"},
 		},
 		&cli.BoolFlag{
 			Name:        "experimental_remote_asset_api",

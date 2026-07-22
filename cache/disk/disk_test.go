@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -50,7 +51,7 @@ func TestCacheBasics(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	itemSize := int64(256)
 
@@ -339,7 +340,7 @@ func TestCachePutWrongSize(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	testCache, err := New(cacheDir, BlockSize, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
 		t.Fatal(err)
@@ -375,7 +376,7 @@ func TestCacheGetContainsWrongSize(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	testCache, err := New(cacheDir, BlockSize, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
 		t.Fatal(err)
@@ -415,7 +416,7 @@ func TestCacheGetContainsWrongSizeWithProxy(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	testCacheI, err := New(cacheDir, BlockSize, WithProxyBackend(new(proxyStub)), WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
 		t.Fatal(err)
@@ -481,7 +482,7 @@ func (d proxyStub) Get(ctx context.Context, kind cache.EntryKind, hash string, _
 		return nil, -1, err
 	}
 	tfn := tmpfile.Name()
-	defer os.Remove(tfn)
+	defer func() { _ = os.Remove(tfn) }()
 
 	var zi zstdimpl.ZstdImpl
 	zi, err = zstdimpl.Get("go")
@@ -567,7 +568,7 @@ func TestOverwrite(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	testCacheI, err := New(cacheDir, BlockSize, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
@@ -617,7 +618,7 @@ func TestCacheExistingFiles(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	items := []struct {
 		contents string
@@ -690,10 +691,10 @@ func TestCacheExistingFiles(t *testing.T) {
 	}
 	testCache := testCacheI.(*diskCache)
 
-	evicted := []Key{}
+	evicted := []string{}
 	origOnEvict := testCache.lru.onEvict
-	testCache.lru.onEvict = func(key Key, value lruItem) {
-		evicted = append(evicted, key.(string))
+	testCache.lru.onEvict = func(key string, value lruItem) {
+		evicted = append(evicted, key)
 		origOnEvict(key, value)
 	}
 
@@ -735,14 +736,16 @@ func TestCacheExistingFiles(t *testing.T) {
 	}
 }
 
-// Make sure that the cache returns http.StatusInsufficientStorage when trying to upload an item
-// that's bigger than the maximum size.
+// Make sure that the cache returns http.StatusBadRequest when trying to upload an item
+// that's bigger than the maximum size. Since diskCache.Put handles all errors from
+// lru.Reserve via the same code path, it should be sufficient to test only
+// http.StatusBadRequest and not http.StatusInsufficientStorage.
 func TestCacheBlobTooLarge(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	testCacheI, err := New(cacheDir, BlockSize, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
 		t.Fatal(err)
@@ -757,8 +760,8 @@ func TestCacheBlobTooLarge(t *testing.T) {
 		}
 
 		if cerr, ok := err.(*cache.Error); ok {
-			if cerr.Code != http.StatusInsufficientStorage {
-				t.Fatalf("Expected error code %d but received %d", http.StatusInsufficientStorage, cerr.Code)
+			if cerr.Code != http.StatusBadRequest {
+				t.Fatalf("Expected error code %d but received %d", http.StatusBadRequest, cerr.Code)
 			}
 		} else {
 			t.Fatal("Expected error to be of type Error")
@@ -772,7 +775,7 @@ func TestCacheCorruptedCASBlob(t *testing.T) {
 	defer cancel()
 
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 	testCacheI, err := New(cacheDir, BlockSize, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
 		t.Fatal(err)
@@ -827,7 +830,7 @@ func TestMigrateFromOldDirectoryStructure(t *testing.T) {
 	defer cancel()
 
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	acHash, err := createRandomFile(cacheDir+"/ac", 512)
 	if err != nil {
@@ -881,7 +884,7 @@ func TestLoadExistingEntries(t *testing.T) {
 
 	// Test that loading existing items works
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	numBlobs := int64(5)
 	blobSize := int64(1024)
@@ -1000,7 +1003,7 @@ func TestDistinctKeyspaces(t *testing.T) {
 	defer cancel()
 
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	blobSize := 1024
 
@@ -1055,9 +1058,10 @@ func (s *testServer) handler(w http.ResponseWriter, r *http.Request) {
 	fields := strings.Split(r.URL.Path, "/")
 
 	kindMap := s.ac
-	if fields[1] == "ac" {
+	switch fields[1] {
+	case "ac":
 		kindMap = s.ac
-	} else if fields[1] == "cas" {
+	case "cas":
 		kindMap = s.cas
 	}
 	hash := fields[2]
@@ -1129,7 +1133,7 @@ func TestHttpProxyBackend(t *testing.T) {
 	}
 
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	// Add some overhead for likely CAS blob storage expansion.
 	cacheSize := int64(1024*10) * 2
@@ -1172,7 +1176,7 @@ func TestHttpProxyBackend(t *testing.T) {
 
 	// Create a new (empty) testCache, without a proxy backend.
 	cacheDir = testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	testCacheI, err = New(cacheDir, cacheSize, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
@@ -1254,7 +1258,7 @@ func TestGetValidatedActionResult(t *testing.T) {
 	defer cancel()
 
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	testCacheI, err := New(cacheDir, 1024*32, WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
@@ -1428,7 +1432,7 @@ func TestGetWithOffset(t *testing.T) {
 	defer cancel()
 
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	const blobSize = 2048 + 256
 
@@ -1460,7 +1464,10 @@ func TestGetWithOffset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rc.Close()
+	err = rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !bytes.Equal(data, foundData) {
 		t.Fatal("Got back different data")
 	}
@@ -1480,7 +1487,10 @@ func TestGetWithOffset(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		rc.Close()
+		err = rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !bytes.Equal(data[offset:], foundData) {
 			t.Fatalf("Expected data (%d bytes), differs from actual data (%d bytes) for offset %d",
 				len(data[offset:]), len(foundData), offset)
@@ -1496,7 +1506,7 @@ func count(counter *prometheus.CounterVec, kind string, status string) float64 {
 
 func TestMetricsUnvalidatedAC(t *testing.T) {
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	cacheSize := int64(100000)
 
@@ -1606,7 +1616,7 @@ func TestMetricsUnvalidatedAC(t *testing.T) {
 
 func TestMetricsValidatedAC(t *testing.T) {
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	cacheSize := int64(100000)
 
@@ -1683,7 +1693,7 @@ func TestMetricsValidatedAC(t *testing.T) {
 
 func TestCacheDirLostAndFound(t *testing.T) {
 	cacheDir := tempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	var err error
 
@@ -1713,4 +1723,371 @@ func TestCacheDirLostAndFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestValidatesCasHash(t *testing.T) {
+	ctx := context.Background()
+
+	data := []byte("test data")
+	hashBytes := sha256.Sum256(data)
+	hash := hex.EncodeToString(hashBytes[:])
+
+	_, differentHash := testutils.RandomDataAndHash(int64(len(data)) + 1)
+
+	cacheSize := int64(10000)
+
+	for _, storage := range []string{"zstd", "uncompressed"} {
+		t.Run(storage, func(t *testing.T) {
+			cacheDir := tempDir(t)
+			defer func() { _ = os.RemoveAll(cacheDir) }()
+
+			testCache, err := New(cacheDir, cacheSize, WithEndpointMetrics(), WithStorageMode(storage))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = testCache.Put(ctx, cache.CAS, differentHash, int64(len(data)), bytes.NewReader(data))
+			if err == nil {
+				t.Fatal("Expected error, got nil")
+			}
+
+			err = testCache.Put(ctx, cache.CAS, hash, int64(len(data)), bytes.NewReader(data))
+			if err != nil {
+				t.Fatal("Expected nil, got error:", err)
+			}
+		})
+	}
+}
+
+// DelayedReader is a wrapper around an io.Reader that delays reads until allowed to proceed.
+// It is useful in testing scenarios where you want to control the timing of concurrent reads.
+type DelayedReader struct {
+	Reader       io.Reader
+	ReadEvents   chan struct{}
+	AllowProceed chan struct{}
+}
+
+func (r *DelayedReader) Read(p []byte) (n int, err error) {
+	// Signal that a read started.
+	r.ReadEvents <- struct{}{}
+
+	// Wait until permission to continue.
+	<-r.AllowProceed
+
+	// Perform the actual read.
+	return r.Reader.Read(p)
+}
+
+// Verifies that Put operations are throttled to 5000 concurrent operations (3000 on mac).
+func TestPutRequestThrottling(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cacheDir := tempDir(t)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
+
+	numberOfExpectedConcurrentOperations := 5000
+	if runtime.GOOS == "darwin" {
+		numberOfExpectedConcurrentOperations = 3000
+	}
+
+	const numberOfAdditionalOperations = 77 // arbitrarily chosen
+	numberOfOperations := numberOfExpectedConcurrentOperations + numberOfAdditionalOperations
+
+	// By limiting maxSize to only the expected concurrent operations, it is implicitly verified
+	// that throttling is performed not only for the disk writes but already from the point of
+	// size reservation. If reservations would not have been throttled, then that would be
+	// detected by reservations exceeding the max size.
+	maxSize := numberOfExpectedConcurrentOperations * BlockSize
+
+	// The maxSizeHardLimit needs to accept all operations, because the test case does not control
+	// when eviction takes place.
+	maxSizeHardLimit := int64(numberOfOperations) * BlockSize
+
+	testCache, err := New(cacheDir,
+		int64(maxSize),
+		WithAccessLogger(testutils.NewSilentLogger()),
+		WithStorageMode("uncompressed"), // Predictable sizes for exact fit.
+		WithMaxSizeHardLimit(maxSizeHardLimit),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readEvents := make(chan struct{}, numberOfOperations)
+	allowProceed := make(chan struct{}, numberOfOperations)
+	putResults := make(chan error, numberOfOperations)
+
+	// Start all Put operations in background.
+	for i := 0; i < numberOfOperations; i++ {
+		go func() {
+			data, hash := testutils.RandomDataAndHash(BlockSize)
+			putResults <- testCache.Put(ctx,
+				cache.CAS,
+				hash,
+				BlockSize,
+				&DelayedReader{
+					Reader:       bytes.NewReader(data),
+					ReadEvents:   readEvents,
+					AllowProceed: allowProceed,
+				},
+			)
+		}()
+	}
+
+	// Wait for exepcted number of concurrent Put operations to start reading.
+	for i := 0; i < numberOfExpectedConcurrentOperations; i++ {
+		<-readEvents
+	}
+
+	// Wait briefly to allow any unexpected operations to begin reading, thereby
+	// increasing confidence in detecting any lack of throttling.
+	time.Sleep(1 * time.Second)
+
+	// Verify that throttling was effective.
+	select {
+	case <-readEvents:
+		t.Fatal("Operations are not throttled. Expected channel to " +
+			"be empty, but received unexpected read event")
+	default:
+		// Good, no unexpected reads started.
+	}
+
+	// Don't care any longer about future read events. Drain them to prevent blocking.
+	go func() {
+		for range readEvents {
+		}
+	}()
+
+	// Allow all read operations to continue.
+	close(allowProceed)
+
+	// All Put requests are expected to succeed.
+	for i := 0; i < numberOfOperations; i++ {
+		err := <-putResults
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+	}
+
+	close(readEvents)
+}
+
+// fakeProxy is a proxy implementation designed for unit testing purposes.
+// It allows tests to control not only the data returned by the proxy but also the timing,
+// enabling synchronization and deterministic testing of asynchronous logic.
+type fakeProxy struct {
+	cacheStore   *sync.Map
+	getEvents    chan struct{}
+	allowProceed chan struct{}
+}
+
+func (p fakeProxy) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
+	// Not implemented.
+}
+
+func (p fakeProxy) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64) (io.ReadCloser, int64, error) {
+	// Signal that a Get invocation started.
+	p.getEvents <- struct{}{}
+
+	// Wait until permission to continue
+	<-p.allowProceed
+
+	value, ok := p.cacheStore.Load(hash)
+	if ok {
+		if byteValue, ok := value.([]byte); ok {
+			return io.NopCloser(bytes.NewReader(byteValue)), size, nil
+		} else {
+			return nil, -1, fmt.Errorf("Internal fakeProxy error, expected []byte, got %T", value)
+		}
+	} else {
+		return nil, -1, nil
+	}
+}
+
+func (p fakeProxy) Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64) {
+	_, isFound := p.cacheStore.Load(hash)
+	return isFound, size
+}
+
+// Verifies that proxy downloads for Get operations are throttled to 5000 concurrent operations (3000 on mac).
+func TestProxiedGetRequestThrottling(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cacheDir := tempDir(t)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
+
+	numberOfExpectedConcurrentOperations := 5000
+	if runtime.GOOS == "darwin" {
+		numberOfExpectedConcurrentOperations = 3000
+	}
+
+	const numberOfAdditionalOperations = 77 // arbitrarily chosen
+	numberOfOperations := numberOfExpectedConcurrentOperations + numberOfAdditionalOperations
+
+	// If would have been preferable if throttling for proxy downloading was
+	// applied also for their reservation phase, but that is not the case
+	// with the current implementation. If that is implemented later this
+	// test case could assert it by calculating maxSize by
+	// numberOfExpectedConcurrentOperations instead of numberOfOperations,
+	// but for now calculate based on numberOfOperations.
+	maxSize := numberOfOperations * BlockSize
+
+	// The maxSizeHardLimit needs to accept all operations, because the
+	// test case does not control when eviction takes place.
+	maxSizeHardLimit := int64(numberOfOperations) * BlockSize
+
+	fakeProxy := &fakeProxy{
+		cacheStore:   &sync.Map{},
+		getEvents:    make(chan struct{}, numberOfOperations),
+		allowProceed: make(chan struct{}, numberOfOperations),
+	}
+
+	testCache, err := New(cacheDir,
+		int64(maxSize),
+		WithProxyBackend(fakeProxy),
+		WithAccessLogger(testutils.NewSilentLogger()),
+		WithStorageMode("uncompressed"), // Predictable sizes for exact fit.
+		WithMaxSizeHardLimit(maxSizeHardLimit),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start all Get operations in background.
+	getResultsFromBackground := make(chan error, numberOfOperations)
+	for i := 0; i < numberOfOperations; i++ {
+		go func() {
+			// Populate the fake proxy with an unique blob.
+			data, hash := testutils.RandomDataAndHash(BlockSize)
+			fakeProxy.cacheStore.Store(hash, data)
+			// Request the unique blob via the main disk cache configured with the fake proxy.
+			rdr, _, err := testCache.Get(ctx, cache.CAS, hash, BlockSize, 0)
+			if rdr != nil {
+				_ = rdr.Close()
+			}
+			getResultsFromBackground <- err
+		}()
+	}
+
+	// Wait for expected number of concurrent Get operations to reach the proxy.
+	for i := 0; i < numberOfExpectedConcurrentOperations; i++ {
+		<-fakeProxy.getEvents
+	}
+
+	// Wait briefly to allow any unexpected operations to begin, thereby
+	// increasing confidence in detecting any lack of throttling.
+	time.Sleep(1 * time.Second)
+
+	// Verify that throttling was effective.
+	select {
+	case <-fakeProxy.getEvents:
+		t.Fatal("Operations are not throttled. Expected channel to " +
+			"be empty, but received unexpected get event")
+	default:
+		// Good, no unexpected get proxy started.
+	}
+
+	// Don't care any longer about future getEvents. Drain them to prevent blocking.
+	go func() {
+		for range fakeProxy.getEvents {
+		}
+	}()
+
+	// Allow all operations to continue.
+	close(fakeProxy.allowProceed)
+
+	// All Get requests are expected to succeed.
+	for i := 0; i < numberOfOperations; i++ {
+		err := <-getResultsFromBackground
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+
+	}
+
+	close(fakeProxy.getEvents)
+}
+
+// Verifies that concurrently running proxy downloads are rejected with
+// http.StatusInsufficientStorage when they together try to reserve
+// more space than is currently available.
+func TestResultFromProxyTooLargeToReserve(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cacheDir := tempDir(t)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
+
+	fakeProxy := &fakeProxy{
+		cacheStore:   &sync.Map{},
+		getEvents:    make(chan struct{}, 1),
+		allowProceed: make(chan struct{}, 1),
+	}
+
+	// Small disk cache with storage capacity for only one block.
+	testCache, err := New(cacheDir,
+		int64(BlockSize),
+		WithProxyBackend(fakeProxy),
+		WithStorageMode("uncompressed"), // Accept blob without header from proxy
+		WithAccessLogger(testutils.NewSilentLogger()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blob1Data, blob1Hash := testutils.RandomDataAndHash(BlockSize)
+	fakeProxy.cacheStore.Store(blob1Hash, blob1Data)
+
+	blob2Data, blob2Hash := testutils.RandomDataAndHash(BlockSize)
+	fakeProxy.cacheStore.Store(blob2Hash, blob2Data)
+
+	// Trigger a get request to proxy for blob1Hash that is missing in disk cache.
+	getResultsFromBackground := make(chan error, 1)
+	go func() {
+		rdr, _, err := testCache.Get(ctx, cache.CAS, blob1Hash, BlockSize, 0)
+		if rdr != nil {
+			_ = rdr.Close()
+		}
+		getResultsFromBackground <- err
+	}()
+
+	// Wait for the get request to reach the proxy. After that we know the size is reserved
+	// and we don't allow it to proceed yet, so it will be kept reserved.
+	<-fakeProxy.getEvents
+
+	// Don't care any longer about future getEvents. Drain them to prevent blocking.
+	go func() {
+		for range fakeProxy.getEvents {
+		}
+	}()
+
+	// Verify that additional proxy reservation fail when previous reservation occupies
+	// the whole disk cache.
+	_, _, err = testCache.Get(ctx, cache.CAS, blob2Hash, BlockSize, 0)
+	testutils.AssertFailureWithCode(t, err, http.StatusInsufficientStorage)
+
+	// Allow all previous and future proxy requests to proceed.
+	close(fakeProxy.allowProceed)
+
+	// Wait for the first retrieval to complete. After that we know it is not reserved
+	// any longer and can be evicted to make room for blob2.
+	<-getResultsFromBackground
+
+	// Verify that a new attempt of blob2 download succeed. This implicitly verifies that
+	// any internal mutexes involved during the previous failed reservation has been released
+	// correctly.
+	rdr, _, err := testCache.Get(ctx, cache.CAS, blob2Hash, BlockSize, 0)
+	testutils.AssertSuccess(t, err)
+	_ = rdr.Close()
+
+	close(fakeProxy.getEvents)
 }

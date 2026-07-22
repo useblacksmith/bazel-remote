@@ -14,20 +14,22 @@ import (
 type Option func(*CacheConfig) error
 
 type CacheConfig struct {
-	diskCache *diskCache        // Assumed to be non-nil.
-	metrics   *metricsDecorator // May be nil.
+	diskCache        *diskCache        // Assumed to be non-nil.
+	metrics          *metricsDecorator // May be nil.
+	maxSizeHardLimit int64
 }
 
 func WithStorageMode(mode string) Option {
 	return func(c *CacheConfig) error {
-		if mode == "zstd" {
+		switch mode {
+		case "zstd":
 			c.diskCache.storageMode = casblob.Zstandard
 			return nil
-		} else if mode == "uncompressed" {
+		case "uncompressed":
 			c.diskCache.storageMode = casblob.Identity
 			return nil
-		} else {
-			return fmt.Errorf("Unsupported storage mode: %s", mode)
+		default:
+			return fmt.Errorf("unsupported storage mode: %s", mode)
 		}
 	}
 }
@@ -43,7 +45,7 @@ func WithZstdImplementation(impl string) Option {
 func WithMaxBlobSize(size int64) Option {
 	return func(c *CacheConfig) error {
 		if size <= 0 {
-			return fmt.Errorf("Invalid MaxBlobSize: %d", size)
+			return fmt.Errorf("invalid MaxBlobSize: %d", size)
 		}
 
 		c.diskCache.maxBlobSize = size
@@ -54,7 +56,7 @@ func WithMaxBlobSize(size int64) Option {
 func WithProxyBackend(proxy cache.Proxy) Option {
 	return func(c *CacheConfig) error {
 		if c.diskCache.proxy != nil && proxy != nil {
-			return fmt.Errorf("Proxy backends may be set only once")
+			return fmt.Errorf("proxy backends may be set only once")
 		}
 
 		if proxy != nil {
@@ -69,7 +71,7 @@ func WithProxyBackend(proxy cache.Proxy) Option {
 func WithProxyMaxBlobSize(maxProxyBlobSize int64) Option {
 	return func(c *CacheConfig) error {
 		if maxProxyBlobSize <= 0 {
-			return fmt.Errorf("Invalid MaxProxyBlobSize: %d", maxProxyBlobSize)
+			return fmt.Errorf("invalid MaxProxyBlobSize: %d", maxProxyBlobSize)
 		}
 
 		c.diskCache.maxProxyBlobSize = maxProxyBlobSize
@@ -106,6 +108,13 @@ func WithEndpointMetrics() Option {
 		c.metrics.counter.WithLabelValues("get", "ac", "hit").Add(0)
 		c.metrics.counter.WithLabelValues("get", "ac", "miss").Add(0)
 
+		return nil
+	}
+}
+
+func WithMaxSizeHardLimit(maxSizeHardLimit int64) Option {
+	return func(cc *CacheConfig) error {
+		cc.maxSizeHardLimit = maxSizeHardLimit
 		return nil
 	}
 }

@@ -1,12 +1,18 @@
 package disk
 
 import (
+	"fmt"
 	"math"
+	"net/http"
 	"reflect"
+	"strconv"
 	"testing"
+
+	testutils "github.com/buchgr/bazel-remote/v2/utils"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-func checkSizeAndNumItems(t *testing.T, lru SizedLRU, expSize int64, expNum int) {
+func checkSizeAndNumItems(t *testing.T, lru *SizedLRU, expSize int64, expNum int) {
 	currentSize := lru.TotalSize()
 	if currentSize != expSize {
 		t.Fatalf("TotalSize: expected %d, got %d", expSize, currentSize)
@@ -27,41 +33,41 @@ func TestBasics(t *testing.T) {
 		t.Fatalf("MaxSize: expected %d, got %d", maxSize, lru.MaxSize())
 	}
 
-	_, ok := lru.Get("1")
-	if ok {
+	_, listElem := lru.Get("1")
+	if listElem != nil {
 		t.Fatalf("Get: unexpected element found")
 	}
 
-	checkSizeAndNumItems(t, lru, 0, 0)
+	checkSizeAndNumItems(t, &lru, 0, 0)
 
 	// Add an item
 	aKey := "akey"
 	anItem := lruItem{size: 5, sizeOnDisk: 5}
-	ok = lru.Add(aKey, anItem)
+	ok := lru.Add(aKey, anItem)
 	if !ok {
 		t.Fatalf("Add: failed inserting item")
 	}
 
-	getItem, getOk := lru.Get(aKey)
-	if !getOk {
+	getItem, listElem := lru.Get(aKey)
+	if listElem == nil {
 		t.Fatalf("Get: failed getting item")
 	}
 	if getItem.size != anItem.size {
 		t.Fatalf("Get: got a different item back")
 	}
 
-	checkSizeAndNumItems(t, lru, BlockSize, 1)
+	checkSizeAndNumItems(t, &lru, BlockSize, 1)
 
 	// Remove the item
-	lru.Remove(aKey)
-	checkSizeAndNumItems(t, lru, 0, 0)
+	lru.RemoveKey(aKey)
+	checkSizeAndNumItems(t, &lru, 0, 0)
 }
 
 func TestEviction(t *testing.T) {
 	// Keep track of evictions using the callback
-	var evictions []int
-	onEvict := func(key Key, value lruItem) {
-		evictions = append(evictions, key.(int))
+	var evictions []string
+	onEvict := func(key string, value lruItem) {
+		evictions = append(evictions, key)
 	}
 
 	lru := NewSizedLRU(10*BlockSize, onEvict, 0)
@@ -69,28 +75,30 @@ func TestEviction(t *testing.T) {
 	expectedSizesNumItems := []struct {
 		expBlocks   int64
 		expNumItems int
-		expEvicted  []int
+		expEvicted  []string
 	}{
-		{0, 1, []int{}},           // 0
-		{1, 2, []int{}},           // 0, 1
-		{3, 3, []int{}},           // 0, 1, 2
-		{6, 4, []int{}},           // 0, 1, 2, 3
-		{10, 5, []int{}},          // 0, 1, 2, 3, 4
-		{9, 2, []int{0, 1, 2, 3}}, // 4, 5
-		{6, 1, []int{4, 5}},       // 6
-		{7, 1, []int{6}},          // 7
+		{0, 1, []string{}},                   // 0
+		{1, 2, []string{}},                   // 0, 1
+		{3, 3, []string{}},                   // 0, 1, 2
+		{6, 4, []string{}},                   // 0, 1, 2, 3
+		{10, 5, []string{}},                  // 0, 1, 2, 3, 4
+		{9, 2, []string{"0", "1", "2", "3"}}, // 4, 5
+		{6, 1, []string{"4", "5"}},           // 6
+		{7, 1, []string{"6"}},                // 7
 	}
 
-	var expectedEvictions []int
+	var expectedEvictions []string
 
 	for i, thisExpected := range expectedSizesNumItems {
 		item := lruItem{size: int64(i) * BlockSize, sizeOnDisk: int64(i) * BlockSize}
-		ok := lru.Add(i, item)
+		ok := lru.Add(strconv.Itoa(i), item)
 		if !ok {
 			t.Fatalf("Add: failed adding %d", i)
 		}
-
-		checkSizeAndNumItems(t, lru, thisExpected.expBlocks*BlockSize, thisExpected.expNumItems)
+		if len(lru.queuedEvictionsChan) > 0 {
+			lru.performQueuedEvictions()
+		}
+		checkSizeAndNumItems(t, &lru, thisExpected.expBlocks*BlockSize, thisExpected.expNumItems)
 
 		expectedEvictions = append(expectedEvictions, thisExpected.expEvicted...)
 		if !reflect.DeepEqual(expectedEvictions, evictions) {
@@ -100,9 +108,9 @@ func TestEviction(t *testing.T) {
 }
 
 func TestPeekDoesNotPromote(t *testing.T) {
-	var evictions []int
-	onEvict := func(key Key, value lruItem) {
-		evictions = append(evictions, key.(int))
+	var evictions []string
+	onEvict := func(key string, value lruItem) {
+		evictions = append(evictions, key)
 	}
 
 	// Room for exactly two single-block items.
@@ -110,13 +118,14 @@ func TestPeekDoesNotPromote(t *testing.T) {
 
 	item := lruItem{size: 1, sizeOnDisk: 1}
 	for i := 0; i < 2; i++ {
-		if ok := lru.Add(i, item); !ok {
+		key := fmt.Sprintf("%d", i)
+		if ok := lru.Add(key, item); !ok {
 			t.Fatalf("Add: failed adding %d", i)
 		}
 	}
 
 	// Peek the LRU-side entry; this must not change its recency.
-	peeked, ok := lru.Peek(0)
+	peeked, ok := lru.Peek("0")
 	if !ok {
 		t.Fatalf("Peek: failed getting item")
 	}
@@ -125,10 +134,13 @@ func TestPeekDoesNotPromote(t *testing.T) {
 	}
 
 	// Adding a third item must still evict key 0, not key 1.
-	if ok := lru.Add(2, item); !ok {
+	if ok := lru.Add("2", item); !ok {
 		t.Fatalf("Add: failed adding 2")
 	}
-	if !reflect.DeepEqual(evictions, []int{0}) {
+	if len(lru.queuedEvictionsChan) > 0 {
+		lru.performQueuedEvictions()
+	}
+	if !reflect.DeepEqual(evictions, []string{"0"}) {
 		t.Fatalf("Expecting evictions [0], found %v", evictions)
 	}
 }
@@ -142,7 +154,7 @@ func TestRejectBigItem(t *testing.T) {
 		t.Fatalf("Add succeeded, expected it to fail")
 	}
 
-	checkSizeAndNumItems(t, lru, 0, 0)
+	checkSizeAndNumItems(t, &lru, 0, 0)
 }
 
 func TestReserveZeroAlwaysPossible(t *testing.T) {
@@ -150,47 +162,37 @@ func TestReserveZeroAlwaysPossible(t *testing.T) {
 
 	lru := NewSizedLRU(math.MaxInt64, nil, 0)
 	lru.Add("foo", largeItem)
-	ok, err := lru.Reserve(0)
+	err := lru.Reserve(0)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("Should always be able to reserve 0")
+		t.Fatalf("Should always be able to reserve 0, but got: %v", err)
 	}
 }
 
 func TestReserveAtCapacity(t *testing.T) {
-	var ok bool
 	var err error
 
 	lru := NewSizedLRU(math.MaxInt64, nil, 0)
 
-	ok, err = lru.Reserve(math.MaxInt64)
+	err = lru.Reserve(math.MaxInt64)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("Should be able to reserve all the space")
+		t.Fatalf("Should be able to reserve all the space, but got: %v", err)
 	}
 	if lru.TotalSize() != math.MaxInt64 {
 		t.Fatalf("Expected total size %d, actual size %d", math.MaxInt64,
 			lru.TotalSize())
 	}
 
-	ok, err = lru.Reserve(0)
+	err = lru.Reserve(0)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("Should always be able to reserve 0")
+		t.Fatalf("Should always be able to reserve 0, but got: %v", err)
 	}
 	if lru.TotalSize() != math.MaxInt64 {
 		t.Fatalf("Expected total size %d, actual size %d", math.MaxInt64,
 			lru.TotalSize())
 	}
 
-	ok, err = lru.Reserve(1)
-	if ok || err == nil {
+	err = lru.Reserve(1)
+	if err == nil {
 		t.Fatal("Should not be able to reserve any space")
 	}
 	if lru.TotalSize() != math.MaxInt64 {
@@ -199,47 +201,107 @@ func TestReserveAtCapacity(t *testing.T) {
 	}
 }
 
+func TestReserveAtEvictionQueueLimit(t *testing.T) {
+
+	lru := NewSizedLRU(BlockSize*2, func(string, lruItem) {}, 0)
+	lru.maxSizeHardLimit = BlockSize * 3
+
+	blockSize1Key := "7777"
+	blockSize1Item := lruItem{size: BlockSize * 1, sizeOnDisk: BlockSize * 1}
+
+	blockSize2Key := "8888"
+	blockSize2Item := lruItem{size: BlockSize * 2, sizeOnDisk: BlockSize * 2}
+
+	// Add large item.
+	testutils.AssertSuccess(t, lru.Add(blockSize2Key, blockSize2Item))
+	testutils.AssertEquals(t, BlockSize*2, lru.totalDiskSizePeak)
+
+	// Move large item into eviction queue.
+	lru.RemoveKey(blockSize2Key)
+	testutils.AssertEquals(t, BlockSize*2, lru.queuedEvictionsSize.Load())
+
+	// Accept reservation since not exceeding maxSizeHardLimit.
+	testutils.AssertSuccess(t, lru.Reserve(BlockSize))
+	testutils.AssertEquals(t, BlockSize*2, lru.queuedEvictionsSize.Load())
+	testutils.AssertEquals(t, BlockSize*3, lru.totalDiskSizePeak)
+
+	// Reject reservation when the item + reserved + queued > maxSizeHardLimit.
+	testutils.AssertFailureWithCode(t, lru.Reserve(BlockSize), http.StatusInsufficientStorage)
+	testutils.AssertEquals(t, BlockSize*4, lru.totalDiskSizePeak) // Includes rejected item.
+
+	// Convert reservation into added item.
+	testutils.AssertSuccess(t, lru.Unreserve(BlockSize))
+	testutils.AssertSuccess(t, lru.Add(blockSize1Key, blockSize1Item))
+
+	// Reject reservation when the item + added + queued > maxSizeHardLimit.
+	testutils.AssertFailureWithCode(t, lru.Reserve(BlockSize), http.StatusInsufficientStorage)
+	testutils.AssertEquals(t, BlockSize*4, lru.totalDiskSizePeak) // Includes rejected item.
+
+	// Complete queued evictions
+	lru.performQueuedEvictions()
+	testutils.AssertEquals(t, BlockSize*0, lru.queuedEvictionsSize.Load())
+	testutils.AssertEquals(t, BlockSize*4, lru.totalDiskSizePeak) // Not reset until next period.
+
+	// Accept reservation since more space is available after completed evictions.
+	testutils.AssertSuccess(t, lru.Reserve(BlockSize))
+	testutils.AssertEquals(t, BlockSize*4, lru.totalDiskSizePeak)
+}
+
+func TestPeriodicMetricUpdate(t *testing.T) {
+
+	lru := NewSizedLRU(BlockSize*10, nil, 0)
+
+	// Reserve so that peak become 5 + 2 = 7
+	testutils.AssertSuccess(t, lru.Reserve(BlockSize*5))
+	testutils.AssertSuccess(t, lru.Reserve(BlockSize*2))
+	testutils.AssertEquals(t, BlockSize*7, lru.totalDiskSizePeak)
+
+	// Peak remains the same while in same period even after unreserve.
+	testutils.AssertSuccess(t, lru.Unreserve(BlockSize*2))
+	testutils.AssertEquals(t, BlockSize*7, lru.totalDiskSizePeak)
+
+	lru.shiftToNextMetricPeriod()
+	testutils.AssertEquals(t, BlockSize*5, lru.totalDiskSizePeak)
+	testutils.AssertEquals(t, BlockSize*7, promtestutil.ToFloat64(lru.gaugeCacheSizeBytes))
+
+	lru.shiftToNextMetricPeriod()
+	testutils.AssertEquals(t, BlockSize*5, lru.totalDiskSizePeak)
+	testutils.AssertEquals(t, BlockSize*5, promtestutil.ToFloat64(lru.gaugeCacheSizeBytes))
+}
+
 func TestReserveOverflow(t *testing.T) {
 	var lru SizedLRU
-	var ok bool
 	var err error
 
 	lru = NewSizedLRU(1, nil, 0)
 
-	ok, err = lru.Reserve(1)
+	err = lru.Reserve(1)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatalf("Expected to be able to reserve 1")
+		t.Fatalf("Expected to be able to reserve 1, but got: %v", err)
 	}
 
-	ok, err = lru.Reserve(math.MaxInt64)
-	if ok || err == nil {
+	err = lru.Reserve(math.MaxInt64)
+	if err == nil {
 		t.Fatal("Expected overflow")
 	}
 
 	lru = NewSizedLRU(10, nil, 0)
-	ok, err = lru.Reserve(math.MaxInt64)
-	if ok || err == nil {
+	err = lru.Reserve(math.MaxInt64)
+	if err == nil {
 		t.Fatal("Expected overflow")
 	}
 }
 
 func TestUnreserve(t *testing.T) {
-	var ok bool
 	var err error
 
 	cap := int64(10)
 	lru := NewSizedLRU(cap, nil, 0)
 
 	for i := int64(1); i <= cap; i++ {
-		ok, err = lru.Reserve(1)
+		err = lru.Reserve(1)
 		if err != nil {
-			t.Fatal(err)
-		}
-		if !ok {
-			t.Fatal("Expected to be able to reserve 1")
+			t.Fatalf("Expected to be able to reserve 1, but got: %v", err)
 		}
 		if lru.TotalSize() != i {
 			t.Fatalf("Expected total size %d, actual size %d", i,
@@ -272,15 +334,12 @@ func TestUnreserve(t *testing.T) {
 func TestAddWithSpaceReserved(t *testing.T) {
 	lru := NewSizedLRU(roundUp4k(2), nil, 0)
 
-	ok, err := lru.Reserve(1)
+	err := lru.Reserve(1)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatalf("Expected to be able to reserve 1")
+		t.Fatalf("Expected to be able to reserve 1, but got: %v", err)
 	}
 
-	ok = lru.Add("hello", lruItem{size: 2, sizeOnDisk: 2})
+	ok := lru.Add("hello", lruItem{size: 2, sizeOnDisk: 2})
 	if ok {
 		t.Fatal("Expected to not be able to add item with size 2")
 	}

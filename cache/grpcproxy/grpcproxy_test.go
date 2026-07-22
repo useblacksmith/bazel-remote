@@ -31,6 +31,7 @@ import (
 var logger = testutils.NewSilentLogger()
 
 type testProxy struct {
+	pb.UnimplementedContentAddressableStorageServer
 	dir    string
 	server *grpc.Server
 	proxy  cache.Proxy
@@ -63,8 +64,7 @@ func newProxy(t *testing.T, dir string, storageMode string) *testProxy {
 	dialer := func(context.Context, string) (net.Conn, error) {
 		return listener.Dial()
 	}
-	cc, err := grpc.Dial(
-		"bufconn",
+	cc, err := grpc.NewClient("passthrough://bufnet",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(dialer),
 	)
@@ -108,7 +108,7 @@ func (p *testProxy) UpdateActionResult(ctx context.Context, req *pb.UpdateAction
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	_, err = io.Copy(f, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -122,7 +122,7 @@ func (p *testProxy) GetActionResult(ctx context.Context, req *pb.GetActionResult
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	data, err := io.ReadAll(f)
 	result := &pb.ActionResult{}
 	if proto.Unmarshal(data, result) != nil {
@@ -152,7 +152,7 @@ func (p *testProxy) Read(req *bs.ReadRequest, resp bs.ByteStream_ReadServer) err
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return err
@@ -185,25 +185,13 @@ func (p *testProxy) Write(srv bs.ByteStream_WriteServer) error {
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 		}
 		_, err = f.Write(req.Data)
 		if err != nil {
 			return err
 		}
 	}
-}
-
-func (p *testProxy) BatchReadBlobs(context.Context, *pb.BatchReadBlobsRequest) (*pb.BatchReadBlobsResponse, error) {
-	return nil, nil
-}
-
-func (p *testProxy) BatchUpdateBlobs(context.Context, *pb.BatchUpdateBlobsRequest) (*pb.BatchUpdateBlobsResponse, error) {
-	return nil, nil
-}
-
-func (p *testProxy) GetTree(*pb.GetTreeRequest, pb.ContentAddressableStorage_GetTreeServer) error {
-	return nil
 }
 
 func (p *testProxy) QueryWriteStatus(context.Context, *bs.QueryWriteStatusRequest) (*bs.QueryWriteStatusResponse, error) {
@@ -223,8 +211,7 @@ func newFixture(t *testing.T, proxy cache.Proxy, storageMode string) *fixture {
 		return listener.Dial()
 	}
 
-	cc, err := grpc.Dial(
-		"bufconn",
+	cc, err := grpc.NewClient("passthrough://bufnet",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(dialer),
 	)
@@ -240,11 +227,15 @@ func newFixture(t *testing.T, proxy cache.Proxy, storageMode string) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	unlimitedMaxCasBlobSize := int64(0)
+
 	grpcServer := grpc.NewServer()
+
 	go func() {
-		err := server.ServeGRPC(listener, grpcServer, false, false, true, diskCache, logger, logger)
+		err := server.ServeGRPC(listener, grpcServer, false, false, true, unlimitedMaxCasBlobSize, diskCache, logger, logger)
 		if err != nil {
-			logger.Print(err.Error())
+			logger.Printf("%s", err.Error())
 		}
 	}()
 

@@ -178,8 +178,6 @@ func filterNonNil(blobs []*pb.Digest) []*pb.Digest {
 // Set blobs that exist in the disk cache to nil, and return the number
 // of missing blobs.
 func (c *diskCache) findMissingLocalCAS(ctx context.Context, blobs []*pb.Digest) int {
-	var exists bool
-	var item lruItem
 	var key string
 	missing := 0
 
@@ -198,12 +196,12 @@ func (c *diskCache) findMissingLocalCAS(ctx context.Context, blobs []*pb.Digest)
 
 		foundSize := int64(-1)
 		key = cache.LookupKeyForContext(ctx, cache.CAS, blobs[i].Hash)
-		item, exists = c.lru.Get(key)
-		if exists {
+		item, listElem := c.lru.Get(key)
+		if listElem != nil {
 			foundSize = item.size
 		}
 
-		if exists && !isSizeMismatch(blobs[i].SizeBytes, foundSize) {
+		if listElem != nil && !isSizeMismatch(blobs[i].SizeBytes, foundSize) {
 			if sink != nil {
 				// Local hit: sizeOnDisk is already in hand, no extra round trip.
 				sink.RecordLeafSize(blobs[i].Hash, item.sizeOnDisk, false)

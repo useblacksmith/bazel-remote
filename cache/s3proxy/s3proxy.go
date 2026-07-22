@@ -78,6 +78,7 @@ func New(
 	DisableSSL bool,
 	UpdateTimestamps bool,
 	Region string,
+	MaxIdleConns int,
 
 	storageMode string, accessLogger cache.Logger,
 	errorLogger cache.Logger, numUploaders, maxQueuedUploads int,
@@ -92,13 +93,23 @@ func New(
 		log.Fatalf("Failed to determine s3proxy credentials")
 	}
 
+	secure := !DisableSSL
+	tr, err := minio.DefaultTransport(secure)
+	if err != nil {
+		log.Fatalf("Failed to create default minio transport: %v", err)
+	}
+
+	tr.MaxIdleConns = MaxIdleConns
+	tr.MaxIdleConnsPerHost = MaxIdleConns
+
 	// Initialize minio client with credentials
 	minioOpts := &minio.Options{
 		Creds:        Credentials,
 		BucketLookup: BucketLookupType,
 
-		Region: Region,
-		Secure: !DisableSSL,
+		Region:    Region,
+		Secure:    secure,
+		Transport: tr,
 	}
 	minioCore, err = minio.NewCore(Endpoint, minioOpts)
 	if err != nil {
@@ -248,7 +259,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	status, reason := classifyUploadOutcome(err)
 	c.observeUpload(context.Background(), item, status, reason)
 
-	item.Rc.Close()
+	_ = item.Rc.Close()
 }
 
 // classifyUploadOutcome maps a create-if-absent backend PutObject result to a
@@ -277,7 +288,7 @@ func classifyUploadOutcome(err error) (status string, reason string) {
 
 func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
 	if c.uploadQueue == nil {
-		rc.Close()
+		_ = rc.Close()
 		return
 	}
 	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
@@ -304,7 +315,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 			Ops:    1,
 			Bytes:  nonNegativeUint64(sizeOnDisk),
 		})
-		rc.Close()
+		_ = rc.Close()
 	}
 }
 
