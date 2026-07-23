@@ -109,12 +109,12 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	}
 
 	waitStarted := time.Now()
-	err = s.readLimiter.acquireRead(ctx)
-	if s.runtimeMetrics != nil {
-		s.runtimeMetrics.ByteStreamReadAdmissionWait(ctx, "active_reads", time.Since(waitStarted))
+	readLimited, readLimitErr := s.readLimiter.acquireRead(ctx)
+	if s.runtimeMetrics != nil && readLimited {
+		s.runtimeMetrics.ByteStreamReadAdmissionWait(ctx, ByteStreamReadAdmissionStageActiveReads, time.Since(waitStarted))
 	}
-	if err != nil {
-		return status.FromContextError(err).Err()
+	if readLimitErr != nil {
+		return status.FromContextError(readLimitErr).Err()
 	}
 	defer s.readLimiter.releaseRead()
 
@@ -157,15 +157,15 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	}
 
 	waitStarted = time.Now()
-	err = s.readLimiter.acquireBuffer(ctx, bufSize)
-	if s.runtimeMetrics != nil {
-		s.runtimeMetrics.ByteStreamReadAdmissionWait(ctx, "buffer_bytes", time.Since(waitStarted))
+	bufferLimited, bufferLimitErr := s.readLimiter.acquireBuffer(ctx, bufSize)
+	if s.runtimeMetrics != nil && bufferLimited {
+		s.runtimeMetrics.ByteStreamReadAdmissionWait(ctx, ByteStreamReadAdmissionStageBufferBytes, time.Since(waitStarted))
 	}
-	if err != nil {
+	if bufferLimitErr != nil {
 		if ctx.Err() != nil {
 			return status.FromContextError(ctx.Err()).Err()
 		}
-		return status.Error(codes.ResourceExhausted, err.Error())
+		return status.Error(codes.ResourceExhausted, bufferLimitErr.Error())
 	}
 	defer s.readLimiter.releaseBuffer(bufSize)
 	if s.runtimeMetrics != nil {

@@ -8,6 +8,15 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+const (
+	// ByteStreamReadAdmissionStageActiveReads identifies waits for an active
+	// ByteStream handler slot.
+	ByteStreamReadAdmissionStageActiveReads = "active_reads"
+	// ByteStreamReadAdmissionStageBufferBytes identifies waits for a
+	// bazel-remote response-buffer reservation.
+	ByteStreamReadAdmissionStageBufferBytes = "buffer_bytes"
+)
+
 // RuntimeMetrics receives low-cardinality process-level measurements for
 // memory-bearing read paths. Implementations must be safe for concurrent use.
 type RuntimeMetrics interface {
@@ -83,11 +92,11 @@ func newReadLimiter(maxActiveReads, maxBufferBytes int64) *readLimiter {
 	return l
 }
 
-func (l *readLimiter) acquireRead(ctx context.Context) error {
+func (l *readLimiter) acquireRead(ctx context.Context) (bool, error) {
 	if l == nil || l.activeReads == nil {
-		return nil
+		return false, nil
 	}
-	return l.activeReads.Acquire(ctx, 1)
+	return true, l.activeReads.Acquire(ctx, 1)
 }
 
 func (l *readLimiter) releaseRead() {
@@ -96,14 +105,14 @@ func (l *readLimiter) releaseRead() {
 	}
 }
 
-func (l *readLimiter) acquireBuffer(ctx context.Context, size int64) error {
+func (l *readLimiter) acquireBuffer(ctx context.Context, size int64) (bool, error) {
 	if l == nil || l.bufferBytes == nil || size == 0 {
-		return nil
+		return false, nil
 	}
 	if size > l.maxBufferBytes {
-		return fmt.Errorf("read buffer reservation %d exceeds configured budget %d", size, l.maxBufferBytes)
+		return true, fmt.Errorf("read buffer reservation %d exceeds configured budget %d", size, l.maxBufferBytes)
 	}
-	return l.bufferBytes.Acquire(ctx, size)
+	return true, l.bufferBytes.Acquire(ctx, size)
 }
 
 func (l *readLimiter) releaseBuffer(size int64) {

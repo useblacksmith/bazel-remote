@@ -8,18 +8,18 @@ import (
 
 func TestReadLimiterBoundsAggregateBuffers(t *testing.T) {
 	limiter := newReadLimiter(0, 10)
-	if err := limiter.acquireBuffer(context.Background(), 6); err != nil {
+	if limited, err := limiter.acquireBuffer(context.Background(), 6); !limited || err != nil {
 		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	if err := limiter.acquireBuffer(ctx, 5); err != context.DeadlineExceeded {
+	if limited, err := limiter.acquireBuffer(ctx, 5); !limited || err != context.DeadlineExceeded {
 		t.Fatalf("expected deadline while budget was exhausted, got %v", err)
 	}
 
 	limiter.releaseBuffer(6)
-	if err := limiter.acquireBuffer(context.Background(), 5); err != nil {
+	if limited, err := limiter.acquireBuffer(context.Background(), 5); !limited || err != nil {
 		t.Fatalf("expected reservation after release: %v", err)
 	}
 	limiter.releaseBuffer(5)
@@ -27,21 +27,32 @@ func TestReadLimiterBoundsAggregateBuffers(t *testing.T) {
 
 func TestReadLimiterBoundsActiveReads(t *testing.T) {
 	limiter := newReadLimiter(1, 0)
-	if err := limiter.acquireRead(context.Background()); err != nil {
+	if limited, err := limiter.acquireRead(context.Background()); !limited || err != nil {
 		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	if err := limiter.acquireRead(ctx); err != context.DeadlineExceeded {
+	if limited, err := limiter.acquireRead(ctx); !limited || err != context.DeadlineExceeded {
 		t.Fatalf("expected deadline while active-read slot was occupied, got %v", err)
 	}
 
 	limiter.releaseRead()
-	if err := limiter.acquireRead(context.Background()); err != nil {
+	if limited, err := limiter.acquireRead(context.Background()); !limited || err != nil {
 		t.Fatalf("expected admission after release: %v", err)
 	}
 	limiter.releaseRead()
+}
+
+func TestReadLimiterReportsDisabledLimits(t *testing.T) {
+	limiter := newReadLimiter(0, 0)
+
+	if limited, err := limiter.acquireRead(context.Background()); limited || err != nil {
+		t.Fatalf("disabled active-read limit returned limited=%t, err=%v", limited, err)
+	}
+	if limited, err := limiter.acquireBuffer(context.Background(), 1); limited || err != nil {
+		t.Fatalf("disabled buffer limit returned limited=%t, err=%v", limited, err)
+	}
 }
 
 func TestReadLimitOptionsRejectNegativeValues(t *testing.T) {
