@@ -70,3 +70,27 @@ func TestReadLimitOptionsRejectNegativeValues(t *testing.T) {
 		t.Fatal("expected negative batch limit to fail")
 	}
 }
+
+func TestReadChunkSizeOption(t *testing.T) {
+	s := &grpcServer{readChunkSizeBytes: maxChunkSize}
+	if err := WithReadChunkSizeBytes(256 * 1024)(s); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := s.readChunkSizeBytes, int64(256*1024); got != want {
+		t.Fatalf("read chunk size = %d, want %d", got, want)
+	}
+
+	if err := WithReadChunkSizeBytes(0)(s); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := s.readChunkSizeBytes, int64(256*1024); got != want {
+		t.Fatalf("zero changed read chunk size to %d, want %d", got, want)
+	}
+
+	if err := WithReadChunkSizeBytes(-1)(s); err == nil {
+		t.Fatal("expected negative read chunk size to fail")
+	}
+	if err := WithReadChunkSizeBytes(maxChunkSize + 1)(s); err == nil {
+		t.Fatal("expected oversized read chunk size to fail")
+	}
+}

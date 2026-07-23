@@ -77,7 +77,7 @@ func grpcTestSetup(t *testing.T) (tc grpcTestFixtureWithTmpDirCache) {
 
 var testMaxCasBlobSizeBytes int64 = 123456789
 
-func grpcTestSetupInternal(t *testing.T, mangleACKeys bool) (tc grpcTestFixtureWithTmpDirCache) {
+func grpcTestSetupInternal(t *testing.T, mangleACKeys bool, options ...GRPCServerOption) (tc grpcTestFixtureWithTmpDirCache) {
 
 	dir, err := os.MkdirTemp("", "bazel-remote-grpc-tests-"+t.Name())
 	if err != nil {
@@ -93,7 +93,7 @@ func grpcTestSetupInternal(t *testing.T, mangleACKeys bool) (tc grpcTestFixtureW
 		os.Exit(1)
 	}
 	validateAC := true
-	baseFixture := grpcTestSetupWithCustomCache(t, mangleACKeys, validateAC, diskCache)
+	baseFixture := grpcTestSetupWithCustomCache(t, mangleACKeys, validateAC, diskCache, options...)
 	return grpcTestFixtureWithTmpDirCache{
 		grpcTestFixture: baseFixture,
 
@@ -801,7 +801,8 @@ func TestGrpcByteStreamEmptySha256(t *testing.T) {
 func TestGrpcByteStream(t *testing.T) {
 	t.Parallel()
 
-	fixture := grpcTestSetup(t)
+	const readChunkSize = 256 * 1024
+	fixture := grpcTestSetupInternal(t, false, WithReadChunkSizeBytes(readChunkSize))
 	defer func() { _ = os.Remove(fixture.tempdir) }()
 
 	// Must be large enough to test multiple iterations of the
@@ -905,6 +906,9 @@ func TestGrpcByteStream(t *testing.T) {
 		}
 		if bsrResp == nil {
 			t.Fatalf("Expected non-nil response")
+		}
+		if len(bsrResp.Data) > readChunkSize {
+			t.Fatalf("Read response size = %d, want at most %d", len(bsrResp.Data), readChunkSize)
 		}
 
 		downloadedBlob = append(downloadedBlob, bsrResp.Data...)

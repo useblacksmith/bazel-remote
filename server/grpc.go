@@ -44,6 +44,7 @@ type grpcServer struct {
 	mangleACKeys           bool
 	maxCasBlobSizeBytes    int64
 	maxBatchTotalSizeBytes int64
+	readChunkSizeBytes     int64
 	runtimeMetrics         RuntimeMetrics
 	readLimiter            *readLimiter
 }
@@ -91,6 +92,7 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 		depsCheck:           validateACDepsCheck,
 		mangleACKeys:        mangleACKeys,
 		maxCasBlobSizeBytes: maxCasBlobSizeBytes,
+		readChunkSizeBytes:  maxChunkSize,
 	}
 	for _, option := range options {
 		if err := option(s); err != nil {

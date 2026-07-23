@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	// The maximum chunk size to write back to the client in Send calls.
+	// The default maximum chunk size to write back to the client in Send calls.
 	// Inspired by Goma's FileBlob.FILE_CHUNK maxium size.
 	maxChunkSize = 2 * 1024 * 1024 // 2M
 )
@@ -152,8 +152,8 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	}
 
 	bufSize := size
-	if bufSize > maxChunkSize {
-		bufSize = maxChunkSize
+	if bufSize > s.readChunkSizeBytes {
+		bufSize = s.readChunkSizeBytes
 	}
 
 	waitStarted = time.Now()

@@ -53,6 +53,23 @@ func WithReadLimits(maxActiveReads, maxBufferBytes int64) GRPCServerOption {
 	}
 }
 
+// WithReadChunkSizeBytes sets the maximum ByteStream response payload. Zero
+// preserves bazel-remote's default.
+func WithReadChunkSizeBytes(chunkSizeBytes int64) GRPCServerOption {
+	return func(s *grpcServer) error {
+		if chunkSizeBytes < 0 {
+			return fmt.Errorf("read chunk size must not be negative: %d", chunkSizeBytes)
+		}
+		if chunkSizeBytes > maxChunkSize {
+			return fmt.Errorf("read chunk size %d exceeds the default maximum %d", chunkSizeBytes, maxChunkSize)
+		}
+		if chunkSizeBytes > 0 {
+			s.readChunkSizeBytes = chunkSizeBytes
+		}
+		return nil
+	}
+}
+
 // WithMaxBatchTotalSizeBytes advertises and enforces a BatchReadBlobs total
 // payload limit. Zero preserves the REAPI "no limit" value.
 func WithMaxBatchTotalSizeBytes(maxBytes int64) GRPCServerOption {
