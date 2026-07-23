@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"math"
 
 	"google.golang.org/genproto/googleapis/rpc/code"
 	"google.golang.org/genproto/googleapis/rpc/status"
@@ -54,6 +53,7 @@ func (s *grpcServer) FindMissingBlobs(ctx context.Context,
 		if digest == nil {
 			return nil, errNilDigest
 		}
+
 		err := s.validateHash(digest.Hash, digest.SizeBytes, errorPrefix)
 		if err != nil {
 			return nil, err
@@ -247,37 +247,6 @@ func (s *grpcServer) BatchReadBlobs(ctx context.Context,
 		return nil, errNilBatchReadBlobsRequest
 	}
 
-	errorPrefix := "GRPC CAS GET"
-	var declaredBytes int64
-	for _, digest := range in.Digests {
-		if digest == nil {
-			return nil, errNilDigest
-		}
-		if digest.SizeBytes < 0 {
-			return nil, grpc_status.Error(codes.InvalidArgument, "BatchReadBlobs digest size must not be negative")
-		}
-
-		err := s.validateHash(digest.Hash, digest.SizeBytes, errorPrefix)
-		if err != nil {
-			return nil, err
-		}
-		if digest.SizeBytes > math.MaxInt64-declaredBytes {
-			return nil, grpc_status.Error(codes.InvalidArgument, "BatchReadBlobs declared size overflows int64")
-		}
-		declaredBytes += digest.SizeBytes
-	}
-
-	if s.maxBatchTotalSizeBytes > 0 && declaredBytes > s.maxBatchTotalSizeBytes {
-		return nil, grpc_status.Errorf(codes.ResourceExhausted,
-			"BatchReadBlobs declared size %d exceeds configured limit %d",
-			declaredBytes, s.maxBatchTotalSizeBytes)
-	}
-
-	if s.runtimeMetrics != nil {
-		s.runtimeMetrics.BatchReadStarted(ctx, declaredBytes)
-		defer s.runtimeMetrics.BatchReadFinished(ctx, declaredBytes)
-	}
-
 	resp := pb.BatchReadBlobsResponse{
 		Responses: make([]*pb.BatchReadBlobsResponse_Response,
 			0, len(in.Digests)),
@@ -291,8 +260,18 @@ func (s *grpcServer) BatchReadBlobs(ctx context.Context,
 		}
 	}
 
+	errorPrefix := "GRPC CAS GET"
 	for _, digest := range in.Digests {
 		// TODO: consider fanning-out goroutines here.
+
+		if digest == nil {
+			return nil, errNilDigest
+		}
+
+		err := s.validateHash(digest.Hash, digest.SizeBytes, errorPrefix)
+		if err != nil {
+			return nil, err
+		}
 		resp.Responses = append(resp.Responses, s.getBlobResponse(ctx, digest, allowZstd))
 	}
 

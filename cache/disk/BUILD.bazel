@@ -10,7 +10,6 @@ go_library(
         "lru_capture.go",
         "metrics.go",
         "options.go",
-		"runtime.go",
     ],
     importpath = "github.com/buchgr/bazel-remote/v2/cache/disk",
     visibility = ["//visibility:public"],
@@ -43,7 +42,6 @@ go_test(
         "lru_capture_test.go",
         "lru_test.go",
         "operation_observer_test.go",
-		"runtime_test.go",
     ],
     embed = [":go_default_library"],
     deps = [

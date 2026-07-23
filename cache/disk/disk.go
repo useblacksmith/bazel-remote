@@ -78,8 +78,6 @@ type diskCache struct {
 	maxBlobSize      int64
 	maxProxyBlobSize int64
 	accessLogger     *log.Logger
-	runtimeMetrics   RuntimeMetrics
-	proxyGetSem      *semaphore.Weighted
 
 	// Limit the number of simultaneous proxy Contains checks.
 	containsSem *semaphore.Weighted
@@ -776,12 +774,12 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	// Unfortunately, this proxy-specific throttling does not limit the size reservation
 	// performed inside availableOrTryProxy. It should still be effective in limiting the number
 	// of OS threads, but it does not help reduce the risk of http.StatusInsufficientStorage.
-	err = c.acquireProxyGet(ctx)
+	err = c.diskWaitSem.Acquire(context.Background(), 1)
 	if err != nil {
 		log.Printf("ERROR: failed to acquire semaphore: %v", err)
 		return nil, -1, internalErr(err)
 	}
-	defer c.releaseProxyGet(ctx)
+	defer c.diskWaitSem.Release(1)
 
 	r, foundSize, err := c.proxy.Get(ctx, kind, hash, size)
 	if r != nil {

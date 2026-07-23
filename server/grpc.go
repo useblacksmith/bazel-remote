@@ -37,16 +37,15 @@ const (
 const grpcHealthServiceName = "/grpc.health.v1.Health/Check"
 
 type grpcServer struct {
-	cache                  disk.Cache
-	accessLogger           cache.Logger
-	errorLogger            cache.Logger
-	depsCheck              bool
-	mangleACKeys           bool
-	maxCasBlobSizeBytes    int64
-	maxBatchTotalSizeBytes int64
-	readChunkSizeBytes     int64
-	runtimeMetrics         RuntimeMetrics
-	readLimiter            *readLimiter
+	cache               disk.Cache
+	accessLogger        cache.Logger
+	errorLogger         cache.Logger
+	depsCheck           bool
+	mangleACKeys        bool
+	maxCasBlobSizeBytes int64
+	readChunkSizeBytes  int64
+	runtimeMetrics      RuntimeMetrics
+	readLimiter         *readLimiter
 }
 
 var readOnlyMethods = map[string]struct{}{
@@ -135,7 +134,7 @@ func (s *grpcServer) GetCapabilities(ctx context.Context,
 					},
 				},
 			},
-			MaxBatchTotalSizeBytes:          s.maxBatchTotalSizeBytes,
+			MaxBatchTotalSizeBytes:          0, // "no limit"
 			SymlinkAbsolutePathStrategy:     pb.SymlinkAbsolutePathStrategy_ALLOWED,
 			SupportedCompressors:            []pb.Compressor_Value{pb.Compressor_ZSTD},
 			SupportedBatchUpdateCompressors: []pb.Compressor_Value{pb.Compressor_ZSTD},

@@ -79,26 +79,6 @@ func WithProxyMaxBlobSize(maxProxyBlobSize int64) Option {
 	}
 }
 
-// WithRuntimeMetrics installs an optional proxied-read metrics sink.
-func WithRuntimeMetrics(metrics RuntimeMetrics) Option {
-	return func(c *CacheConfig) error {
-		c.diskCache.runtimeMetrics = metrics
-		return nil
-	}
-}
-
-// WithMaxConcurrentProxyGets bounds simultaneous proxy downloads. Callers
-// that omit this option preserve the existing disk semaphore limit.
-func WithMaxConcurrentProxyGets(limit int64) Option {
-	return func(c *CacheConfig) error {
-		if limit <= 0 {
-			return fmt.Errorf("invalid MaxConcurrentProxyGets: %d", limit)
-		}
-		c.diskCache.proxyGetSem = newProxyGetLimiter(limit)
-		return nil
-	}
-}
-
 func WithAccessLogger(logger *log.Logger) Option {
 	return func(c *CacheConfig) error {
 		c.diskCache.accessLogger = logger

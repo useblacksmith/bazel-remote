@@ -16,8 +16,6 @@ type RuntimeMetrics interface {
 	ByteStreamReadBufferReserved(ctx context.Context, reservedBytes int64)
 	ByteStreamReadBufferReleased(ctx context.Context, reservedBytes int64)
 	ByteStreamReadAdmissionWait(ctx context.Context, stage string, duration time.Duration)
-	BatchReadStarted(ctx context.Context, declaredBytes int64)
-	BatchReadFinished(ctx context.Context, declaredBytes int64)
 }
 
 // GRPCServerOption configures optional server behavior for embedders without
@@ -64,18 +62,6 @@ func WithReadChunkSizeBytes(chunkSizeBytes int64) GRPCServerOption {
 		if chunkSizeBytes > 0 {
 			s.readChunkSizeBytes = chunkSizeBytes
 		}
-		return nil
-	}
-}
-
-// WithMaxBatchTotalSizeBytes advertises and enforces a BatchReadBlobs total
-// payload limit. Zero preserves the REAPI "no limit" value.
-func WithMaxBatchTotalSizeBytes(maxBytes int64) GRPCServerOption {
-	return func(s *grpcServer) error {
-		if maxBytes < 0 {
-			return fmt.Errorf("max batch total size must not be negative: %d", maxBytes)
-		}
-		s.maxBatchTotalSizeBytes = maxBytes
 		return nil
 	}
 }
