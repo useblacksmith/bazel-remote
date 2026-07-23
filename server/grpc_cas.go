@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"math"
-	"time"
 
 	"google.golang.org/genproto/googleapis/rpc/code"
 	"google.golang.org/genproto/googleapis/rpc/status"
@@ -277,22 +276,6 @@ func (s *grpcServer) BatchReadBlobs(ctx context.Context,
 	if s.runtimeMetrics != nil {
 		s.runtimeMetrics.BatchReadStarted(ctx, declaredBytes)
 		defer s.runtimeMetrics.BatchReadFinished(ctx, declaredBytes)
-	}
-	waitStarted := time.Now()
-	err := s.readLimiter.acquireBuffer(ctx, declaredBytes)
-	if s.runtimeMetrics != nil {
-		s.runtimeMetrics.BatchReadAdmissionWait(ctx, time.Since(waitStarted))
-	}
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, grpc_status.FromContextError(ctx.Err()).Err()
-		}
-		return nil, grpc_status.Error(codes.ResourceExhausted, err.Error())
-	}
-	defer s.readLimiter.releaseBuffer(declaredBytes)
-	if s.runtimeMetrics != nil {
-		s.runtimeMetrics.BatchReadBufferReserved(ctx, declaredBytes)
-		defer s.runtimeMetrics.BatchReadBufferReleased(ctx, declaredBytes)
 	}
 
 	resp := pb.BatchReadBlobsResponse{

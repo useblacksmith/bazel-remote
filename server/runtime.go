@@ -18,9 +18,6 @@ type RuntimeMetrics interface {
 	ByteStreamReadAdmissionWait(ctx context.Context, stage string, duration time.Duration)
 	BatchReadStarted(ctx context.Context, declaredBytes int64)
 	BatchReadFinished(ctx context.Context, declaredBytes int64)
-	BatchReadBufferReserved(ctx context.Context, reservedBytes int64)
-	BatchReadBufferReleased(ctx context.Context, reservedBytes int64)
-	BatchReadAdmissionWait(ctx context.Context, duration time.Duration)
 }
 
 // GRPCServerOption configures optional server behavior for embedders without
@@ -35,8 +32,9 @@ func WithRuntimeMetrics(metrics RuntimeMetrics) GRPCServerOption {
 	}
 }
 
-// WithReadLimits bounds active ByteStream handlers and aggregate response
-// buffer reservations. A zero value leaves the corresponding limit disabled.
+// WithReadLimits bounds active ByteStream handlers and aggregate ByteStream
+// response-buffer reservations. A zero value leaves the corresponding limit
+// disabled.
 func WithReadLimits(maxActiveReads, maxBufferBytes int64) GRPCServerOption {
 	return func(s *grpcServer) error {
 		if maxActiveReads < 0 {
