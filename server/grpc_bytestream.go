@@ -158,6 +158,11 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	// Size the buffer for the bytes remaining after ReadOffset, so ranged
 	// or tail reads don't over-reserve the source-buffer budget.
 	bufSize := size - req.ReadOffset
+	if limitedSend && bufSize > req.ReadLimit {
+		// The client asked for at most ReadLimit bytes, so don't reserve
+		// more than that from the source-buffer budget.
+		bufSize = req.ReadLimit
+	}
 	if bufSize > s.readChunkSizeBytes {
 		bufSize = s.readChunkSizeBytes
 	}

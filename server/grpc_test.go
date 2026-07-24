@@ -1204,6 +1204,80 @@ func TestGrpcByteStreamInvalidReadLimit(t *testing.T) {
 	}
 }
 
+type byteStreamBufferMetrics struct {
+	lastReserved atomic.Int64
+}
+
+func (m *byteStreamBufferMetrics) ByteStreamReadStarted(context.Context, int64)  {}
+func (m *byteStreamBufferMetrics) ByteStreamReadFinished(context.Context, int64) {}
+func (m *byteStreamBufferMetrics) ByteStreamReadBufferReserved(_ context.Context, reservedBytes int64) {
+	m.lastReserved.Store(reservedBytes)
+}
+func (m *byteStreamBufferMetrics) ByteStreamReadBufferReleased(context.Context, int64) {}
+func (m *byteStreamBufferMetrics) ByteStreamReadAdmissionWait(context.Context, string, time.Duration) {
+}
+
+func TestGrpcByteStreamReadLimitBoundsBufferReservation(t *testing.T) {
+	t.Parallel()
+
+	metrics := &byteStreamBufferMetrics{}
+	fixture := grpcTestSetupInternal(t, false, WithRuntimeMetrics(metrics))
+	defer func() { _ = os.Remove(fixture.tempdir) }()
+
+	testBlobSize := int64(1024)
+	testBlob, testBlobHash := testutils.RandomDataAndHash(testBlobSize)
+
+	bswc, err := fixture.bsClient.Write(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = bswc.Send(&bytestream.WriteRequest{
+		ResourceName: fmt.Sprintf("instance/uploads/%s/blobs/%s/%d",
+			uuid.New().String(), testBlobHash, len(testBlob)),
+		FinishWrite: true,
+		Data:        testBlob,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bswc.CloseAndRecv(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A ReadLimit smaller than the remaining bytes must bound the
+	// source-buffer reservation.
+	const readLimit = 100
+	bsrc, err := fixture.bsClient.Read(ctx, &bytestream.ReadRequest{
+		ResourceName: fmt.Sprintf("instance/blobs/%s/%d", testBlobHash, len(testBlob)),
+		ReadLimit:    readLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bsrResp, err := bsrc.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bsrResp.Data) > readLimit {
+		t.Fatalf("Received %d bytes, want at most the %d byte ReadLimit",
+			len(bsrResp.Data), readLimit)
+	}
+
+	// Drain the stream. bazel-remote returns OutOfRange when the blob
+	// holds more data than ReadLimit allows.
+	for err == nil {
+		_, err = bsrc.Recv()
+	}
+	if s, ok := status.FromError(err); err != io.EOF && (!ok || s.Code() != codes.OutOfRange) {
+		t.Fatal("Expected EOF or OutOfRange, got", err)
+	}
+
+	if got := metrics.lastReserved.Load(); got != readLimit {
+		t.Fatalf("Reserved buffer bytes = %d, want %d", got, readLimit)
+	}
+}
+
 func TestGrpcByteStreamSkippedWrite(t *testing.T) {
 	t.Parallel()
 

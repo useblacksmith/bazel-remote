@@ -51,6 +51,9 @@ func WithReadLimits(maxActiveReads, maxBufferBytes int64) GRPCServerOption {
 			return fmt.Errorf("max read buffer bytes must not be negative: %d", maxBufferBytes)
 		}
 		if maxActiveReads == 0 && maxBufferBytes == 0 {
+			// Zero values disable limits, including any installed by an
+			// earlier WithReadLimits call.
+			s.readLimiter = nil
 			return nil
 		}
 		s.readLimiter = newReadLimiter(maxActiveReads, maxBufferBytes)

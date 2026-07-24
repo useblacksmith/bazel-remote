@@ -55,6 +55,23 @@ func TestReadLimiterReportsDisabledLimits(t *testing.T) {
 	}
 }
 
+func TestReadLimitsZeroValuesClearEarlierLimits(t *testing.T) {
+	s := &grpcServer{}
+	if err := WithReadLimits(1, 10)(s); err != nil {
+		t.Fatal(err)
+	}
+	if s.readLimiter == nil {
+		t.Fatal("expected limiter to be installed")
+	}
+
+	if err := WithReadLimits(0, 0)(s); err != nil {
+		t.Fatal(err)
+	}
+	if s.readLimiter != nil {
+		t.Fatal("expected zero values to clear the previously installed limiter")
+	}
+}
+
 func TestReadLimitOptionsRejectNegativeValues(t *testing.T) {
 	s := &grpcServer{}
 	if err := WithReadLimits(-1, 0)(s); err == nil {
