@@ -151,9 +151,16 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		return status.Error(codes.Internal, msg)
 	}
 
-	bufSize := size
+	// Size the buffer for the bytes remaining after ReadOffset, so ranged
+	// or tail reads don't over-reserve the source-buffer budget.
+	bufSize := size - req.ReadOffset
 	if bufSize > s.readChunkSizeBytes {
 		bufSize = s.readChunkSizeBytes
+	}
+	if bufSize < 1 {
+		// Keep the buffer non-empty so the read loop below can observe
+		// io.EOF when ReadOffset == size.
+		bufSize = 1
 	}
 
 	waitStarted = time.Now()
