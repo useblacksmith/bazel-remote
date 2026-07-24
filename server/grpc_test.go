@@ -2592,17 +2592,17 @@ func TestMaxCasBlobSizeBytes(t *testing.T) {
 	}
 }
 
-func TestMaxBatchReadSizeBytes(t *testing.T) {
+func TestMaxBatchTotalSizeBytes(t *testing.T) {
 	t.Parallel()
 
-	const maxBatchReadSizeBytes = int64(4 * 1024 * 1024)
+	const maxBatchTotalSizeBytes = int64(4 * 1024 * 1024)
 	stubCache := &StubCache{}
 	fixture := grpcTestSetupWithCustomCache(
 		t,
 		false,
 		true,
 		stubCache,
-		WithMaxBatchReadSizeBytes(maxBatchReadSizeBytes),
+		WithMaxBatchTotalSizeBytes(maxBatchTotalSizeBytes),
 	)
 
 	capabilities, err := fixture.capabilitiesClient.GetCapabilities(
@@ -2612,8 +2612,8 @@ func TestMaxBatchReadSizeBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := capabilities.GetCacheCapabilities().GetMaxBatchTotalSizeBytes(); got != maxBatchReadSizeBytes {
-		t.Fatalf("MaxBatchTotalSizeBytes = %d, want %d", got, maxBatchReadSizeBytes)
+	if got := capabilities.GetCacheCapabilities().GetMaxBatchTotalSizeBytes(); got != maxBatchTotalSizeBytes {
+		t.Fatalf("MaxBatchTotalSizeBytes = %d, want %d", got, maxBatchTotalSizeBytes)
 	}
 
 	firstHash := sha256.Sum256([]byte("first"))
@@ -2622,11 +2622,11 @@ func TestMaxBatchReadSizeBytes(t *testing.T) {
 		Digests: []*pb.Digest{
 			{
 				Hash:      hex.EncodeToString(firstHash[:]),
-				SizeBytes: maxBatchReadSizeBytes / 2,
+				SizeBytes: maxBatchTotalSizeBytes / 2,
 			},
 			{
 				Hash:      hex.EncodeToString(secondHash[:]),
-				SizeBytes: maxBatchReadSizeBytes/2 + 1,
+				SizeBytes: maxBatchTotalSizeBytes/2 + 1,
 			},
 		},
 	})
@@ -2642,13 +2642,13 @@ func TestMaxBatchReadSizeBytes(t *testing.T) {
 			{
 				Digest: &pb.Digest{
 					Hash:      hex.EncodeToString(firstHash[:]),
-					SizeBytes: maxBatchReadSizeBytes / 2,
+					SizeBytes: maxBatchTotalSizeBytes / 2,
 				},
 			},
 			{
 				Digest: &pb.Digest{
 					Hash:      hex.EncodeToString(secondHash[:]),
-					SizeBytes: maxBatchReadSizeBytes/2 + 1,
+					SizeBytes: maxBatchTotalSizeBytes/2 + 1,
 				},
 			},
 		},
