@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2595,12 +2596,14 @@ func TestMaxBatchReadSizeBytes(t *testing.T) {
 	t.Parallel()
 
 	const maxBatchReadSizeBytes = int64(4 * 1024 * 1024)
-	fixture := grpcTestSetupInternal(
+	stubCache := &StubCache{}
+	fixture := grpcTestSetupWithCustomCache(
 		t,
 		false,
+		true,
+		stubCache,
 		WithMaxBatchReadSizeBytes(maxBatchReadSizeBytes),
 	)
-	defer func() { _ = os.Remove(fixture.tempdir) }()
 
 	capabilities, err := fixture.capabilitiesClient.GetCapabilities(
 		context.Background(),
@@ -2630,15 +2633,20 @@ func TestMaxBatchReadSizeBytes(t *testing.T) {
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("BatchReadBlobs error = %v, want InvalidArgument", err)
 	}
+	if got := stubCache.GetCalls.Load(); got != 0 {
+		t.Fatalf("oversized BatchReadBlobs opened %d cache readers, want 0", got)
+	}
 }
 
 type StubCache struct {
 	ProgrammedPutError     error
 	ProgrammedGetError     error
 	ProgrammedActionResult *pb.ActionResult
+	GetCalls               atomic.Int64
 }
 
 func (c *StubCache) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64) (io.ReadCloser, int64, error) {
+	c.GetCalls.Add(1)
 	return nil, -1, c.ProgrammedGetError
 }
 
@@ -2651,6 +2659,7 @@ func (c *StubCache) GetValidatedActionResult(ctx context.Context, hash string) (
 }
 
 func (c *StubCache) GetZstd(ctx context.Context, hash string, size int64, offset int64) (io.ReadCloser, int64, error) {
+	c.GetCalls.Add(1)
 	return nil, -1, c.ProgrammedGetError
 }
 
