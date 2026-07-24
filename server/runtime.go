@@ -75,6 +75,19 @@ func WithReadChunkSizeBytes(chunkSizeBytes int64) GRPCServerOption {
 	}
 }
 
+// WithMaxBatchReadSizeBytes limits the total declared blob bytes in one
+// BatchReadBlobs request and advertises that limit through CacheCapabilities.
+// Zero preserves bazel-remote's existing no-limit behavior.
+func WithMaxBatchReadSizeBytes(maxBatchReadSizeBytes int64) GRPCServerOption {
+	return func(s *grpcServer) error {
+		if maxBatchReadSizeBytes < 0 {
+			return fmt.Errorf("max batch read size must not be negative: %d", maxBatchReadSizeBytes)
+		}
+		s.maxBatchReadSizeBytes = maxBatchReadSizeBytes
+		return nil
+	}
+}
+
 type readLimiter struct {
 	activeReads    *semaphore.Weighted
 	bufferBytes    *semaphore.Weighted

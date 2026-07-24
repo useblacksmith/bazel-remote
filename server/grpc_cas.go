@@ -247,6 +247,29 @@ func (s *grpcServer) BatchReadBlobs(ctx context.Context,
 		return nil, errNilBatchReadBlobsRequest
 	}
 
+	errorPrefix := "GRPC CAS GET"
+	var totalSizeBytes int64
+	for _, digest := range in.Digests {
+		if digest == nil {
+			return nil, errNilDigest
+		}
+
+		if err := s.validateHash(digest.Hash, digest.SizeBytes, errorPrefix); err != nil {
+			return nil, err
+		}
+		if s.maxBatchReadSizeBytes > 0 {
+			if digest.SizeBytes < 0 ||
+				digest.SizeBytes > s.maxBatchReadSizeBytes-totalSizeBytes {
+				return nil, grpc_status.Errorf(
+					codes.InvalidArgument,
+					"BatchReadBlobs total declared size exceeds the maximum of %d bytes",
+					s.maxBatchReadSizeBytes,
+				)
+			}
+			totalSizeBytes += digest.SizeBytes
+		}
+	}
+
 	resp := pb.BatchReadBlobsResponse{
 		Responses: make([]*pb.BatchReadBlobsResponse_Response,
 			0, len(in.Digests)),
@@ -260,18 +283,9 @@ func (s *grpcServer) BatchReadBlobs(ctx context.Context,
 		}
 	}
 
-	errorPrefix := "GRPC CAS GET"
 	for _, digest := range in.Digests {
 		// TODO: consider fanning-out goroutines here.
 
-		if digest == nil {
-			return nil, errNilDigest
-		}
-
-		err := s.validateHash(digest.Hash, digest.SizeBytes, errorPrefix)
-		if err != nil {
-			return nil, err
-		}
 		resp.Responses = append(resp.Responses, s.getBlobResponse(ctx, digest, allowZstd))
 	}
 

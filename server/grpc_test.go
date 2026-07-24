@@ -2591,6 +2591,47 @@ func TestMaxCasBlobSizeBytes(t *testing.T) {
 	}
 }
 
+func TestMaxBatchReadSizeBytes(t *testing.T) {
+	t.Parallel()
+
+	const maxBatchReadSizeBytes = int64(4 * 1024 * 1024)
+	fixture := grpcTestSetupInternal(
+		t,
+		false,
+		WithMaxBatchReadSizeBytes(maxBatchReadSizeBytes),
+	)
+	defer func() { _ = os.Remove(fixture.tempdir) }()
+
+	capabilities, err := fixture.capabilitiesClient.GetCapabilities(
+		context.Background(),
+		&pb.GetCapabilitiesRequest{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := capabilities.GetCacheCapabilities().GetMaxBatchTotalSizeBytes(); got != maxBatchReadSizeBytes {
+		t.Fatalf("MaxBatchTotalSizeBytes = %d, want %d", got, maxBatchReadSizeBytes)
+	}
+
+	firstHash := sha256.Sum256([]byte("first"))
+	secondHash := sha256.Sum256([]byte("second"))
+	_, err = fixture.casClient.BatchReadBlobs(ctx, &pb.BatchReadBlobsRequest{
+		Digests: []*pb.Digest{
+			{
+				Hash:      hex.EncodeToString(firstHash[:]),
+				SizeBytes: maxBatchReadSizeBytes / 2,
+			},
+			{
+				Hash:      hex.EncodeToString(secondHash[:]),
+				SizeBytes: maxBatchReadSizeBytes/2 + 1,
+			},
+		},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("BatchReadBlobs error = %v, want InvalidArgument", err)
+	}
+}
+
 type StubCache struct {
 	ProgrammedPutError     error
 	ProgrammedGetError     error

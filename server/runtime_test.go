@@ -88,3 +88,24 @@ func TestReadChunkSizeOption(t *testing.T) {
 		t.Fatal("expected oversized read chunk size to fail")
 	}
 }
+
+func TestMaxBatchReadSizeOption(t *testing.T) {
+	s := &grpcServer{}
+	if err := WithMaxBatchReadSizeBytes(4 * 1024 * 1024)(s); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := s.maxBatchReadSizeBytes, int64(4*1024*1024); got != want {
+		t.Fatalf("max batch read size = %d, want %d", got, want)
+	}
+
+	if err := WithMaxBatchReadSizeBytes(0)(s); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.maxBatchReadSizeBytes; got != 0 {
+		t.Fatalf("zero did not disable the batch read size limit: %d", got)
+	}
+
+	if err := WithMaxBatchReadSizeBytes(-1)(s); err == nil {
+		t.Fatal("expected negative max batch read size to fail")
+	}
+}
