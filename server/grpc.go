@@ -95,8 +95,16 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 	}
 	for _, option := range options {
 		if err := option(s); err != nil {
+			// Close the listener so a failed start does not leave the
+			// address bound (srv.Serve would otherwise own this close).
+			_ = l.Close()
 			return err
 		}
+	}
+	if s.readLimiter != nil && s.readLimiter.maxBufferBytes > 0 && s.readLimiter.maxBufferBytes < s.readChunkSizeBytes {
+		_ = l.Close()
+		return fmt.Errorf("max read buffer bytes %d is smaller than the read chunk size %d",
+			s.readLimiter.maxBufferBytes, s.readChunkSizeBytes)
 	}
 	pb.RegisterActionCacheServer(srv, s)
 	pb.RegisterCapabilitiesServer(srv, s)

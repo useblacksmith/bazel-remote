@@ -110,13 +110,17 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 
 	waitStarted := time.Now()
 	readLimited, readLimitErr := s.readLimiter.acquireRead(ctx)
+	if readLimitErr == nil {
+		// Register the release before any metrics callback so a panicking
+		// RuntimeMetrics implementation cannot leak the active-read slot.
+		defer s.readLimiter.releaseRead()
+	}
 	if s.runtimeMetrics != nil && readLimited {
 		s.runtimeMetrics.ByteStreamReadAdmissionWait(ctx, ByteStreamReadAdmissionStageActiveReads, time.Since(waitStarted))
 	}
 	if readLimitErr != nil {
 		return status.FromContextError(readLimitErr).Err()
 	}
-	defer s.readLimiter.releaseRead()
 
 	var rc io.ReadCloser
 	var foundSize int64
@@ -165,6 +169,11 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 
 	waitStarted = time.Now()
 	bufferLimited, bufferLimitErr := s.readLimiter.acquireBuffer(ctx, bufSize)
+	if bufferLimitErr == nil {
+		// Register the release before any metrics callback so a panicking
+		// RuntimeMetrics implementation cannot leak the byte reservation.
+		defer s.readLimiter.releaseBuffer(bufSize)
+	}
 	if s.runtimeMetrics != nil && bufferLimited {
 		s.runtimeMetrics.ByteStreamReadAdmissionWait(ctx, ByteStreamReadAdmissionStageBufferBytes, time.Since(waitStarted))
 	}
@@ -174,7 +183,6 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		}
 		return status.Error(codes.ResourceExhausted, bufferLimitErr.Error())
 	}
-	defer s.readLimiter.releaseBuffer(bufSize)
 	if s.runtimeMetrics != nil {
 		s.runtimeMetrics.ByteStreamReadBufferReserved(ctx, bufSize)
 		defer s.runtimeMetrics.ByteStreamReadBufferReleased(ctx, bufSize)
