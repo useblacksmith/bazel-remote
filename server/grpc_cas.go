@@ -75,6 +75,27 @@ func (s *grpcServer) BatchUpdateBlobs(ctx context.Context,
 		return nil, errNilBatchUpdateBlobsRequest
 	}
 
+	if s.maxBatchReadSizeBytes > 0 {
+		var totalSizeBytes int64
+		for _, req := range in.Requests {
+			if req == nil {
+				return nil, errNilBatchUpdateBlobsRequest_Request
+			}
+			if req.Digest == nil {
+				return nil, errNilDigest
+			}
+			if req.Digest.SizeBytes < 0 ||
+				req.Digest.SizeBytes > s.maxBatchReadSizeBytes-totalSizeBytes {
+				return nil, grpc_status.Errorf(
+					codes.InvalidArgument,
+					"BatchUpdateBlobs total declared size exceeds the maximum of %d bytes",
+					s.maxBatchReadSizeBytes,
+				)
+			}
+			totalSizeBytes += req.Digest.SizeBytes
+		}
+	}
+
 	resp := pb.BatchUpdateBlobsResponse{
 		Responses: make([]*pb.BatchUpdateBlobsResponse_Response,
 			0, len(in.Requests)),

@@ -2636,6 +2636,29 @@ func TestMaxBatchReadSizeBytes(t *testing.T) {
 	if got := stubCache.GetCalls.Load(); got != 0 {
 		t.Fatalf("oversized BatchReadBlobs opened %d cache readers, want 0", got)
 	}
+
+	_, err = fixture.casClient.BatchUpdateBlobs(ctx, &pb.BatchUpdateBlobsRequest{
+		Requests: []*pb.BatchUpdateBlobsRequest_Request{
+			{
+				Digest: &pb.Digest{
+					Hash:      hex.EncodeToString(firstHash[:]),
+					SizeBytes: maxBatchReadSizeBytes / 2,
+				},
+			},
+			{
+				Digest: &pb.Digest{
+					Hash:      hex.EncodeToString(secondHash[:]),
+					SizeBytes: maxBatchReadSizeBytes/2 + 1,
+				},
+			},
+		},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("BatchUpdateBlobs error = %v, want InvalidArgument", err)
+	}
+	if got := stubCache.PutCalls.Load(); got != 0 {
+		t.Fatalf("oversized BatchUpdateBlobs performed %d cache writes, want 0", got)
+	}
 }
 
 type StubCache struct {
@@ -2643,6 +2666,7 @@ type StubCache struct {
 	ProgrammedGetError     error
 	ProgrammedActionResult *pb.ActionResult
 	GetCalls               atomic.Int64
+	PutCalls               atomic.Int64
 }
 
 func (c *StubCache) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64) (io.ReadCloser, int64, error) {
@@ -2664,6 +2688,7 @@ func (c *StubCache) GetZstd(ctx context.Context, hash string, size int64, offset
 }
 
 func (c *StubCache) Put(ctx context.Context, kind cache.EntryKind, hash string, size int64, r io.Reader) error {
+	c.PutCalls.Add(1)
 	return c.ProgrammedPutError
 }
 
