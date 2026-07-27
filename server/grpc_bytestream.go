@@ -197,7 +197,14 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 
 	var chunkResp bytestream.ReadResponse
 	for {
-		n, err := rc.Read(buf)
+		readBuf := buf
+		if limitedSend && sendLimitRemaining > 0 && sendLimitRemaining < int64(len(readBuf)) {
+			// The buffer can outlast the limit when ReadLimit spans more
+			// than one chunk. Shrink the final read so it cannot overshoot.
+			readBuf = buf[:sendLimitRemaining]
+		}
+
+		n, err := rc.Read(readBuf)
 
 		if n > 0 {
 			if limitedSend {

@@ -1287,6 +1287,56 @@ func TestGrpcByteStreamReadLimitBoundsBufferReservation(t *testing.T) {
 	}
 }
 
+func TestGrpcByteStreamReadLimitSpanningChunks(t *testing.T) {
+	t.Parallel()
+
+	const readChunkSize = 512
+	fixture := grpcTestSetupInternal(t, false, WithReadChunkSizeBytes(readChunkSize))
+	defer func() { _ = os.Remove(fixture.tempdir) }()
+
+	testBlob, testBlobHash := testutils.RandomDataAndHash(4096)
+	if err := fixture.diskCache.Put(
+		ctx,
+		cache.CAS,
+		testBlobHash,
+		int64(len(testBlob)),
+		bytes.NewReader(testBlob),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// A ReadLimit that spans more than one chunk without being a multiple
+	// of the chunk size must still complete successfully.
+	const readLimit = 2*readChunkSize + 100
+	bsrc, err := fixture.bsClient.Read(ctx, &bytestream.ReadRequest{
+		ResourceName: fmt.Sprintf("instance/blobs/%s/%d", testBlobHash, len(testBlob)),
+		ReadLimit:    readLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var received []byte
+	for {
+		bsrResp, err := bsrc.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		received = append(received, bsrResp.Data...)
+	}
+
+	if len(received) != readLimit {
+		t.Fatalf("Received %d bytes, want exactly the %d byte ReadLimit",
+			len(received), readLimit)
+	}
+	if !bytes.Equal(received, testBlob[:readLimit]) {
+		t.Fatal("Received data does not match the start of the blob")
+	}
+}
+
 type failingByteStreamReadServer struct {
 	bytestream.ByteStream_ReadServer
 	ctx     context.Context
