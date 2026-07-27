@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc/codes"
@@ -20,7 +21,7 @@ import (
 )
 
 const (
-	// The maximum chunk size to write back to the client in Send calls.
+	// The default maximum chunk size to write back to the client in Send calls.
 	// Inspired by Goma's FileBlob.FILE_CHUNK maxium size.
 	maxChunkSize = 2 * 1024 * 1024 // 2M
 )
@@ -64,7 +65,7 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		if err != nil {
 			msg := fmt.Sprintf("GRPC BYTESTREAM READ FAILED TO SEND RESPONSE: %s %v", hash, err)
 			s.accessLogger.Printf(msg)
-			return status.Error(codes.Unknown, msg)
+			return err
 		}
 		s.accessLogger.Printf("GRPC BYTESTREAM READ COMPLETED %s", req.ResourceName)
 		return nil
@@ -101,13 +102,33 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		return status.Error(codes.OutOfRange, msg)
 	}
 
+	ctx := resp.Context()
+	if s.runtimeMetrics != nil {
+		s.runtimeMetrics.ByteStreamReadStarted(ctx, size)
+		defer s.runtimeMetrics.ByteStreamReadFinished(ctx, size)
+	}
+
+	waitStarted := time.Now()
+	readLimited, readLimitErr := s.readLimiter.acquireRead(ctx)
+	if readLimitErr == nil {
+		// Register the release before any metrics callback so a panicking
+		// RuntimeMetrics implementation cannot leak the active-read slot.
+		defer s.readLimiter.releaseRead()
+	}
+	if s.runtimeMetrics != nil && readLimited {
+		s.runtimeMetrics.ByteStreamReadAdmissionWait(ctx, ByteStreamReadAdmissionStageActiveReads, time.Since(waitStarted))
+	}
+	if readLimitErr != nil {
+		return status.FromContextError(readLimitErr).Err()
+	}
+
 	var rc io.ReadCloser
 	var foundSize int64
 
 	if cmp == casblob.Zstandard {
-		rc, foundSize, err = s.cache.GetZstd(resp.Context(), hash, size, req.ReadOffset)
+		rc, foundSize, err = s.cache.GetZstd(ctx, hash, size, req.ReadOffset)
 	} else {
-		rc, foundSize, err = s.cache.Get(resp.Context(), cache.CAS, hash, size, req.ReadOffset)
+		rc, foundSize, err = s.cache.Get(ctx, cache.CAS, hash, size, req.ReadOffset)
 	}
 
 	if rc != nil {
@@ -134,16 +155,56 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		return status.Error(codes.Internal, msg)
 	}
 
-	bufSize := size
-	if bufSize > maxChunkSize {
-		bufSize = maxChunkSize
+	// Size the buffer for the bytes remaining after ReadOffset, so ranged
+	// or tail reads don't over-reserve the source-buffer budget.
+	bufSize := size - req.ReadOffset
+	if limitedSend && bufSize > req.ReadLimit {
+		// The client asked for at most ReadLimit bytes, so don't reserve
+		// more than that from the source-buffer budget.
+		bufSize = req.ReadLimit
+	}
+	if bufSize > s.readChunkSizeBytes {
+		bufSize = s.readChunkSizeBytes
+	}
+	if bufSize < 1 {
+		// Keep the buffer non-empty so the read loop below can observe
+		// io.EOF when ReadOffset == size.
+		bufSize = 1
+	}
+
+	waitStarted = time.Now()
+	bufferLimited, bufferLimitErr := s.readLimiter.acquireBuffer(ctx, bufSize)
+	if bufferLimitErr == nil {
+		// Register the release before any metrics callback so a panicking
+		// RuntimeMetrics implementation cannot leak the byte reservation.
+		defer s.readLimiter.releaseBuffer(bufSize)
+	}
+	if s.runtimeMetrics != nil && bufferLimited {
+		s.runtimeMetrics.ByteStreamReadAdmissionWait(ctx, ByteStreamReadAdmissionStageBufferBytes, time.Since(waitStarted))
+	}
+	if bufferLimitErr != nil {
+		if ctx.Err() != nil {
+			return status.FromContextError(ctx.Err()).Err()
+		}
+		return status.Error(codes.ResourceExhausted, bufferLimitErr.Error())
+	}
+	if s.runtimeMetrics != nil {
+		s.runtimeMetrics.ByteStreamReadBufferReserved(ctx, bufSize)
+		defer s.runtimeMetrics.ByteStreamReadBufferReleased(ctx, bufSize)
 	}
 
 	buf := make([]byte, bufSize)
 
 	var chunkResp bytestream.ReadResponse
 	for {
-		n, err := rc.Read(buf)
+		readBuf := buf
+		if limitedSend && sendLimitRemaining > 0 && sendLimitRemaining < int64(len(readBuf)) {
+			// The buffer can outlast the limit when ReadLimit spans more
+			// than one chunk. Shrink the final read so it cannot overshoot.
+			readBuf = buf[:sendLimitRemaining]
+		}
+
+		n, err := rc.Read(readBuf)
 
 		if n > 0 {
 			if limitedSend {
@@ -160,7 +221,12 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 			if sendErr != nil {
 				msg := fmt.Sprintf("GRPC BYTESTREAM READ FAILED TO SEND RESPONSE: %s %v", hash, sendErr)
 				s.accessLogger.Printf(msg)
-				return status.Error(codes.Unknown, msg)
+				return sendErr
+			}
+			if limitedSend && sendLimitRemaining == 0 {
+				s.accessLogger.Printf("GRPC BYTESTREAM READ COMPLETED %s",
+					req.ResourceName)
+				return nil
 			}
 		}
 

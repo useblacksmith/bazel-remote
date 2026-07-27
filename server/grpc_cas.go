@@ -75,6 +75,27 @@ func (s *grpcServer) BatchUpdateBlobs(ctx context.Context,
 		return nil, errNilBatchUpdateBlobsRequest
 	}
 
+	if s.maxBatchTotalSizeBytes > 0 {
+		var totalSizeBytes int64
+		for _, req := range in.Requests {
+			if req == nil {
+				return nil, errNilBatchUpdateBlobsRequest_Request
+			}
+			if req.Digest == nil {
+				return nil, errNilDigest
+			}
+			if req.Digest.SizeBytes < 0 ||
+				req.Digest.SizeBytes > s.maxBatchTotalSizeBytes-totalSizeBytes {
+				return nil, grpc_status.Errorf(
+					codes.InvalidArgument,
+					"BatchUpdateBlobs total declared size exceeds the maximum of %d bytes",
+					s.maxBatchTotalSizeBytes,
+				)
+			}
+			totalSizeBytes += req.Digest.SizeBytes
+		}
+	}
+
 	resp := pb.BatchUpdateBlobsResponse{
 		Responses: make([]*pb.BatchUpdateBlobsResponse_Response,
 			0, len(in.Requests)),
@@ -247,6 +268,29 @@ func (s *grpcServer) BatchReadBlobs(ctx context.Context,
 		return nil, errNilBatchReadBlobsRequest
 	}
 
+	errorPrefix := "GRPC CAS GET"
+	var totalSizeBytes int64
+	for _, digest := range in.Digests {
+		if digest == nil {
+			return nil, errNilDigest
+		}
+
+		if err := s.validateHash(digest.Hash, digest.SizeBytes, errorPrefix); err != nil {
+			return nil, err
+		}
+		if s.maxBatchTotalSizeBytes > 0 {
+			if digest.SizeBytes < 0 ||
+				digest.SizeBytes > s.maxBatchTotalSizeBytes-totalSizeBytes {
+				return nil, grpc_status.Errorf(
+					codes.InvalidArgument,
+					"BatchReadBlobs total declared size exceeds the maximum of %d bytes",
+					s.maxBatchTotalSizeBytes,
+				)
+			}
+			totalSizeBytes += digest.SizeBytes
+		}
+	}
+
 	resp := pb.BatchReadBlobsResponse{
 		Responses: make([]*pb.BatchReadBlobsResponse_Response,
 			0, len(in.Digests)),
@@ -260,18 +304,9 @@ func (s *grpcServer) BatchReadBlobs(ctx context.Context,
 		}
 	}
 
-	errorPrefix := "GRPC CAS GET"
 	for _, digest := range in.Digests {
 		// TODO: consider fanning-out goroutines here.
 
-		if digest == nil {
-			return nil, errNilDigest
-		}
-
-		err := s.validateHash(digest.Hash, digest.SizeBytes, errorPrefix)
-		if err != nil {
-			return nil, err
-		}
 		resp.Responses = append(resp.Responses, s.getBlobResponse(ctx, digest, allowZstd))
 	}
 

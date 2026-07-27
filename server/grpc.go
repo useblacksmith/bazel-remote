@@ -37,12 +37,16 @@ const (
 const grpcHealthServiceName = "/grpc.health.v1.Health/Check"
 
 type grpcServer struct {
-	cache               disk.Cache
-	accessLogger        cache.Logger
-	errorLogger         cache.Logger
-	depsCheck           bool
-	mangleACKeys        bool
-	maxCasBlobSizeBytes int64
+	cache                  disk.Cache
+	accessLogger           cache.Logger
+	errorLogger            cache.Logger
+	depsCheck              bool
+	mangleACKeys           bool
+	maxCasBlobSizeBytes    int64
+	maxBatchTotalSizeBytes int64
+	readChunkSizeBytes     int64
+	runtimeMetrics         RuntimeMetrics
+	readLimiter            *readLimiter
 }
 
 var readOnlyMethods = map[string]struct{}{
@@ -64,14 +68,14 @@ func ListenAndServeGRPC(
 	mangleACKeys bool,
 	enableRemoteAssetAPI bool,
 	maxCasBlobSizeBytes int64,
-	c disk.Cache, a cache.Logger, e cache.Logger) error {
+	c disk.Cache, a cache.Logger, e cache.Logger, options ...GRPCServerOption) error {
 
 	listener, err := net.Listen(network, addr)
 	if err != nil {
 		return err
 	}
 
-	return ServeGRPC(listener, srv, validateACDeps, mangleACKeys, enableRemoteAssetAPI, maxCasBlobSizeBytes, c, a, e)
+	return ServeGRPC(listener, srv, validateACDeps, mangleACKeys, enableRemoteAssetAPI, maxCasBlobSizeBytes, c, a, e, options...)
 }
 
 func ServeGRPC(l net.Listener, srv *grpc.Server,
@@ -79,7 +83,7 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 	mangleACKeys bool,
 	enableRemoteAssetAPI bool,
 	maxCasBlobSizeBytes int64,
-	c disk.Cache, a cache.Logger, e cache.Logger) error {
+	c disk.Cache, a cache.Logger, e cache.Logger, options ...GRPCServerOption) error {
 
 	s := &grpcServer{
 		cache:               c,
@@ -88,6 +92,20 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 		depsCheck:           validateACDepsCheck,
 		mangleACKeys:        mangleACKeys,
 		maxCasBlobSizeBytes: maxCasBlobSizeBytes,
+		readChunkSizeBytes:  maxChunkSize,
+	}
+	for _, option := range options {
+		if err := option(s); err != nil {
+			// Close the listener so a failed start does not leave the
+			// address bound (srv.Serve would otherwise own this close).
+			_ = l.Close()
+			return err
+		}
+	}
+	if s.readLimiter != nil && s.readLimiter.maxBufferBytes > 0 && s.readLimiter.maxBufferBytes < s.readChunkSizeBytes {
+		_ = l.Close()
+		return fmt.Errorf("max read buffer bytes %d is smaller than the read chunk size %d",
+			s.readLimiter.maxBufferBytes, s.readChunkSizeBytes)
 	}
 	pb.RegisterActionCacheServer(srv, s)
 	pb.RegisterCapabilitiesServer(srv, s)
@@ -125,7 +143,7 @@ func (s *grpcServer) GetCapabilities(ctx context.Context,
 					},
 				},
 			},
-			MaxBatchTotalSizeBytes:          0, // "no limit"
+			MaxBatchTotalSizeBytes:          s.maxBatchTotalSizeBytes,
 			SymlinkAbsolutePathStrategy:     pb.SymlinkAbsolutePathStrategy_ALLOWED,
 			SupportedCompressors:            []pb.Compressor_Value{pb.Compressor_ZSTD},
 			SupportedBatchUpdateCompressors: []pb.Compressor_Value{pb.Compressor_ZSTD},

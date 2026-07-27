@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,7 +78,7 @@ func grpcTestSetup(t *testing.T) (tc grpcTestFixtureWithTmpDirCache) {
 
 var testMaxCasBlobSizeBytes int64 = 123456789
 
-func grpcTestSetupInternal(t *testing.T, mangleACKeys bool) (tc grpcTestFixtureWithTmpDirCache) {
+func grpcTestSetupInternal(t *testing.T, mangleACKeys bool, options ...GRPCServerOption) (tc grpcTestFixtureWithTmpDirCache) {
 
 	dir, err := os.MkdirTemp("", "bazel-remote-grpc-tests-"+t.Name())
 	if err != nil {
@@ -93,7 +94,7 @@ func grpcTestSetupInternal(t *testing.T, mangleACKeys bool) (tc grpcTestFixtureW
 		os.Exit(1)
 	}
 	validateAC := true
-	baseFixture := grpcTestSetupWithCustomCache(t, mangleACKeys, validateAC, diskCache)
+	baseFixture := grpcTestSetupWithCustomCache(t, mangleACKeys, validateAC, diskCache, options...)
 	return grpcTestFixtureWithTmpDirCache{
 		grpcTestFixture: baseFixture,
 
@@ -102,7 +103,7 @@ func grpcTestSetupInternal(t *testing.T, mangleACKeys bool) (tc grpcTestFixtureW
 	}
 }
 
-func grpcTestSetupWithCustomCache(t *testing.T, mangleACKeys bool, validateAC bool, diskCache disk.Cache) (tc grpcTestFixture) {
+func grpcTestSetupWithCustomCache(t *testing.T, mangleACKeys bool, validateAC bool, diskCache disk.Cache, options ...GRPCServerOption) (tc grpcTestFixture) {
 
 	accessLogger := testutils.NewSilentLogger()
 	errorLogger := testutils.NewSilentLogger()
@@ -124,7 +125,7 @@ func grpcTestSetupWithCustomCache(t *testing.T, mangleACKeys bool, validateAC bo
 			mangleACKeys,
 			enableRemoteAssetAPI,
 			testMaxCasBlobSizeBytes,
-			diskCache, accessLogger, errorLogger)
+			diskCache, accessLogger, errorLogger, options...)
 		if err2 != nil {
 			fmt.Println(err2)
 			os.Exit(1)
@@ -801,7 +802,8 @@ func TestGrpcByteStreamEmptySha256(t *testing.T) {
 func TestGrpcByteStream(t *testing.T) {
 	t.Parallel()
 
-	fixture := grpcTestSetup(t)
+	const readChunkSize = 256 * 1024
+	fixture := grpcTestSetupInternal(t, false, WithReadChunkSizeBytes(readChunkSize))
 	defer func() { _ = os.Remove(fixture.tempdir) }()
 
 	// Must be large enough to test multiple iterations of the
@@ -905,6 +907,9 @@ func TestGrpcByteStream(t *testing.T) {
 		}
 		if bsrResp == nil {
 			t.Fatalf("Expected non-nil response")
+		}
+		if len(bsrResp.Data) > readChunkSize {
+			t.Fatalf("Read response size = %d, want at most %d", len(bsrResp.Data), readChunkSize)
 		}
 
 		downloadedBlob = append(downloadedBlob, bsrResp.Data...)
@@ -1196,6 +1201,192 @@ func TestGrpcByteStreamInvalidReadLimit(t *testing.T) {
 	}
 	if statusErr.Code() != codes.InvalidArgument {
 		t.Fatal("Expected InvalidArgument response, got", err)
+	}
+}
+
+type byteStreamBufferMetrics struct {
+	lastReserved atomic.Int64
+}
+
+func (m *byteStreamBufferMetrics) ByteStreamReadStarted(context.Context, int64)  {}
+func (m *byteStreamBufferMetrics) ByteStreamReadFinished(context.Context, int64) {}
+func (m *byteStreamBufferMetrics) ByteStreamReadBufferReserved(_ context.Context, reservedBytes int64) {
+	m.lastReserved.Store(reservedBytes)
+}
+func (m *byteStreamBufferMetrics) ByteStreamReadBufferReleased(context.Context, int64) {}
+func (m *byteStreamBufferMetrics) ByteStreamReadAdmissionWait(context.Context, string, time.Duration) {
+}
+
+func TestGrpcByteStreamReadLimitBoundsBufferReservation(t *testing.T) {
+	t.Parallel()
+
+	metrics := &byteStreamBufferMetrics{}
+	fixture := grpcTestSetupInternal(t, false, WithRuntimeMetrics(metrics))
+	defer func() { _ = os.Remove(fixture.tempdir) }()
+
+	testBlobSize := int64(1024)
+	testBlob, testBlobHash := testutils.RandomDataAndHash(testBlobSize)
+
+	bswc, err := fixture.bsClient.Write(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = bswc.Send(&bytestream.WriteRequest{
+		ResourceName: fmt.Sprintf("instance/uploads/%s/blobs/%s/%d",
+			uuid.New().String(), testBlobHash, len(testBlob)),
+		FinishWrite: true,
+		Data:        testBlob,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bswc.CloseAndRecv(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A ReadLimit smaller than the remaining bytes must bound the
+	// source-buffer reservation.
+	const readLimit = 100
+	bsrc, err := fixture.bsClient.Read(ctx, &bytestream.ReadRequest{
+		ResourceName: fmt.Sprintf("instance/blobs/%s/%d", testBlobHash, len(testBlob)),
+		ReadLimit:    readLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bsrResp, err := bsrc.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bsrResp.Data) > readLimit {
+		t.Fatalf("Received %d bytes, want at most the %d byte ReadLimit",
+			len(bsrResp.Data), readLimit)
+	}
+	receivedBytes := len(bsrResp.Data)
+
+	// Reaching ReadLimit completes the partial read successfully even
+	// though the underlying blob contains more data.
+	for {
+		bsrResp, err = bsrc.Recv()
+		if err != nil {
+			break
+		}
+		receivedBytes += len(bsrResp.Data)
+	}
+	if err != io.EOF {
+		t.Fatal("Expected EOF, got", err)
+	}
+	if receivedBytes != readLimit {
+		t.Fatalf("Received %d bytes, want exactly the %d byte ReadLimit",
+			receivedBytes, readLimit)
+	}
+
+	if got := metrics.lastReserved.Load(); got != readLimit {
+		t.Fatalf("Reserved buffer bytes = %d, want %d", got, readLimit)
+	}
+}
+
+func TestGrpcByteStreamReadLimitSpanningChunks(t *testing.T) {
+	t.Parallel()
+
+	const readChunkSize = 512
+	fixture := grpcTestSetupInternal(t, false, WithReadChunkSizeBytes(readChunkSize))
+	defer func() { _ = os.Remove(fixture.tempdir) }()
+
+	testBlob, testBlobHash := testutils.RandomDataAndHash(4096)
+	if err := fixture.diskCache.Put(
+		ctx,
+		cache.CAS,
+		testBlobHash,
+		int64(len(testBlob)),
+		bytes.NewReader(testBlob),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// A ReadLimit that spans more than one chunk without being a multiple
+	// of the chunk size must still complete successfully.
+	const readLimit = 2*readChunkSize + 100
+	bsrc, err := fixture.bsClient.Read(ctx, &bytestream.ReadRequest{
+		ResourceName: fmt.Sprintf("instance/blobs/%s/%d", testBlobHash, len(testBlob)),
+		ReadLimit:    readLimit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var received []byte
+	for {
+		bsrResp, err := bsrc.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		received = append(received, bsrResp.Data...)
+	}
+
+	if len(received) != readLimit {
+		t.Fatalf("Received %d bytes, want exactly the %d byte ReadLimit",
+			len(received), readLimit)
+	}
+	if !bytes.Equal(received, testBlob[:readLimit]) {
+		t.Fatal("Received data does not match the start of the blob")
+	}
+}
+
+type failingByteStreamReadServer struct {
+	bytestream.ByteStream_ReadServer
+	ctx     context.Context
+	sendErr error
+}
+
+func (s *failingByteStreamReadServer) Context() context.Context {
+	return s.ctx
+}
+
+func (s *failingByteStreamReadServer) Send(*bytestream.ReadResponse) error {
+	return s.sendErr
+}
+
+func TestGrpcByteStreamReadPreservesSendStatus(t *testing.T) {
+	t.Parallel()
+
+	fixture := grpcTestSetup(t)
+	defer func() { _ = os.Remove(fixture.tempdir) }()
+
+	testBlob, testBlobHash := testutils.RandomDataAndHash(1024)
+	if err := fixture.diskCache.Put(
+		ctx,
+		cache.CAS,
+		testBlobHash,
+		int64(len(testBlob)),
+		bytes.NewReader(testBlob),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	server := &grpcServer{
+		cache:              fixture.diskCache,
+		accessLogger:       testutils.NewSilentLogger(),
+		errorLogger:        testutils.NewSilentLogger(),
+		readChunkSizeBytes: maxChunkSize,
+	}
+	sendErr := status.Error(codes.Canceled, "stream canceled")
+
+	for _, resourceName := range []string{
+		fmt.Sprintf("instance/blobs/%s/%d", testBlobHash, len(testBlob)),
+		fmt.Sprintf("instance/compressed-blobs/zstd/%s/0", emptySha256),
+	} {
+		err := server.Read(
+			&bytestream.ReadRequest{ResourceName: resourceName},
+			&failingByteStreamReadServer{ctx: ctx, sendErr: sendErr},
+		)
+		if status.Code(err) != codes.Canceled {
+			t.Fatalf("Read(%q) status = %s, want Canceled", resourceName, status.Code(err))
+		}
 	}
 }
 
@@ -2587,13 +2778,85 @@ func TestMaxCasBlobSizeBytes(t *testing.T) {
 	}
 }
 
+func TestMaxBatchTotalSizeBytes(t *testing.T) {
+	t.Parallel()
+
+	const maxBatchTotalSizeBytes = int64(4 * 1024 * 1024)
+	stubCache := &StubCache{}
+	fixture := grpcTestSetupWithCustomCache(
+		t,
+		false,
+		true,
+		stubCache,
+		WithMaxBatchTotalSizeBytes(maxBatchTotalSizeBytes),
+	)
+
+	capabilities, err := fixture.capabilitiesClient.GetCapabilities(
+		context.Background(),
+		&pb.GetCapabilitiesRequest{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := capabilities.GetCacheCapabilities().GetMaxBatchTotalSizeBytes(); got != maxBatchTotalSizeBytes {
+		t.Fatalf("MaxBatchTotalSizeBytes = %d, want %d", got, maxBatchTotalSizeBytes)
+	}
+
+	firstHash := sha256.Sum256([]byte("first"))
+	secondHash := sha256.Sum256([]byte("second"))
+	_, err = fixture.casClient.BatchReadBlobs(ctx, &pb.BatchReadBlobsRequest{
+		Digests: []*pb.Digest{
+			{
+				Hash:      hex.EncodeToString(firstHash[:]),
+				SizeBytes: maxBatchTotalSizeBytes / 2,
+			},
+			{
+				Hash:      hex.EncodeToString(secondHash[:]),
+				SizeBytes: maxBatchTotalSizeBytes/2 + 1,
+			},
+		},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("BatchReadBlobs error = %v, want InvalidArgument", err)
+	}
+	if got := stubCache.GetCalls.Load(); got != 0 {
+		t.Fatalf("oversized BatchReadBlobs opened %d cache readers, want 0", got)
+	}
+
+	_, err = fixture.casClient.BatchUpdateBlobs(ctx, &pb.BatchUpdateBlobsRequest{
+		Requests: []*pb.BatchUpdateBlobsRequest_Request{
+			{
+				Digest: &pb.Digest{
+					Hash:      hex.EncodeToString(firstHash[:]),
+					SizeBytes: maxBatchTotalSizeBytes / 2,
+				},
+			},
+			{
+				Digest: &pb.Digest{
+					Hash:      hex.EncodeToString(secondHash[:]),
+					SizeBytes: maxBatchTotalSizeBytes/2 + 1,
+				},
+			},
+		},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("BatchUpdateBlobs error = %v, want InvalidArgument", err)
+	}
+	if got := stubCache.PutCalls.Load(); got != 0 {
+		t.Fatalf("oversized BatchUpdateBlobs performed %d cache writes, want 0", got)
+	}
+}
+
 type StubCache struct {
 	ProgrammedPutError     error
 	ProgrammedGetError     error
 	ProgrammedActionResult *pb.ActionResult
+	GetCalls               atomic.Int64
+	PutCalls               atomic.Int64
 }
 
 func (c *StubCache) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64) (io.ReadCloser, int64, error) {
+	c.GetCalls.Add(1)
 	return nil, -1, c.ProgrammedGetError
 }
 
@@ -2606,10 +2869,12 @@ func (c *StubCache) GetValidatedActionResult(ctx context.Context, hash string) (
 }
 
 func (c *StubCache) GetZstd(ctx context.Context, hash string, size int64, offset int64) (io.ReadCloser, int64, error) {
+	c.GetCalls.Add(1)
 	return nil, -1, c.ProgrammedGetError
 }
 
 func (c *StubCache) Put(ctx context.Context, kind cache.EntryKind, hash string, size int64, r io.Reader) error {
+	c.PutCalls.Add(1)
 	return c.ProgrammedPutError
 }
 
