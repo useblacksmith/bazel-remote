@@ -393,6 +393,15 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 	streamInterceptors := []grpc.StreamServerInterceptor{}
 	unaryInterceptors := []grpc.UnaryServerInterceptor{}
 
+	// L1 mode: trust upstream bazel-remote instances to forward per-tenant
+	// storage prefixes as request metadata. Env-gated for now (experiment);
+	// promote to a proper config flag before production use.
+	if os.Getenv("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER") == "1" {
+		log.Println("Trusting forwarded storage-prefix gRPC metadata (BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER=1)")
+		streamInterceptors = append(streamInterceptors, server.GRPCStoragePrefixStreamServerInterceptor())
+		unaryInterceptors = append(unaryInterceptors, server.GRPCStoragePrefixUnaryServerInterceptor())
+	}
+
 	if c.EnableEndpointMetrics {
 		streamInterceptors = append(streamInterceptors, grpc_prometheus.StreamServerInterceptor)
 		unaryInterceptors = append(unaryInterceptors, grpc_prometheus.UnaryServerInterceptor)

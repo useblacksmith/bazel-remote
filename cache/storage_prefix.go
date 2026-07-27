@@ -1,6 +1,35 @@
 package cache
 
-import "context"
+import (
+	"context"
+	"strings"
+)
+
+// StoragePrefixGRPCMetadataKey is the gRPC metadata key a trusted upstream
+// bazel-remote (e.g. the FA host's embedded instance running a grpc proxy
+// backend) uses to forward the request-scoped storage prefix to a downstream
+// L1 bazel-remote node. The downstream node only honors it when explicitly
+// configured to trust its callers (private network / authenticated peers).
+const StoragePrefixGRPCMetadataKey = "x-blacksmith-storage-prefix"
+
+// ValidStoragePrefix reports whether prefix is safe to use as a physical
+// object-key prefix received from a remote caller. It rejects anything that
+// could escape the intended keyspace (absolute paths, dot-dot segments,
+// backslashes) or is unreasonably large.
+func ValidStoragePrefix(prefix string) bool {
+	if prefix == "" || len(prefix) > 512 {
+		return false
+	}
+	if strings.HasPrefix(prefix, "/") || strings.Contains(prefix, "\\") {
+		return false
+	}
+	for _, segment := range strings.Split(strings.TrimSuffix(prefix, "/"), "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
 
 type storagePrefixContextKey struct{}
 type requireStoragePrefixContextKey struct{}

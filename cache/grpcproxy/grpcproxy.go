@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
@@ -102,8 +103,34 @@ func logResponse(logger cache.Logger, method string, msg string, kind cache.Entr
 	logger.Printf("GRPC PROXY %s %s %s: %s", strings.ToUpper(method), strings.ToUpper(kind.String()), hash, msg)
 }
 
+// withOutgoingStoragePrefix forwards the request-scoped storage prefix (when
+// one is attached to ctx) to the downstream bazel-remote as gRPC metadata, so
+// the downstream node can preserve tenant isolation on its local disk and its
+// own storage backend.
+func withOutgoingStoragePrefix(ctx context.Context) context.Context {
+	if prefix, ok := cache.StoragePrefixFromContext(ctx); ok {
+		return metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
+	}
+	return ctx
+}
+
+// uploadContext rebuilds an outgoing context for an asynchronous upload from
+// the prefix captured at enqueue time (the original request context is long
+// gone by the time upload workers run).
+func uploadContext(item backendproxy.UploadReq) context.Context {
+	ctx := context.Background()
+	if item.RequestScopedStoragePrefix && item.StoragePrefix != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, item.StoragePrefix)
+	}
+	return ctx
+}
+
 func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 	defer func() { _ = item.Rc.Close() }()
+
+	if item.RequireStoragePrefix && !item.RequestScopedStoragePrefix {
+		logResponse(r.errorLogger, "Upload", "missing request-scoped storage prefix", item.Kind, item.Hash)
+	}
 
 	switch item.Kind {
 	case cache.RAW:
@@ -141,13 +168,13 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 			ActionDigest: digest,
 			ActionResult: ar,
 		}
-		_, err = r.clients.ac.UpdateActionResult(context.Background(), req)
+		_, err = r.clients.ac.UpdateActionResult(uploadContext(item), req)
 		if err != nil {
 			logResponse(r.errorLogger, "Update", err.Error(), item.Kind, item.Hash)
 		}
 		return
 	case cache.CAS:
-		stream, err := r.clients.bs.Write(context.Background())
+		stream, err := r.clients.bs.Write(uploadContext(item))
 		if err != nil {
 			logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
 			return
@@ -213,12 +240,19 @@ func (r *remoteGrpcProxyCache) Put(ctx context.Context, kind cache.EntryKind, ha
 		return
 	}
 
+	// Capture the request-scoped storage prefix at enqueue time; uploads are
+	// asynchronous and the request context is gone when workers run.
+	prefix, requestScoped := cache.StoragePrefixFromContext(ctx)
+
 	item := backendproxy.UploadReq{
-		Hash:        hash,
-		LogicalSize: logicalSize,
-		SizeOnDisk:  sizeOnDisk,
-		Kind:        kind,
-		Rc:          rc,
+		Hash:                       hash,
+		LogicalSize:                logicalSize,
+		SizeOnDisk:                 sizeOnDisk,
+		Kind:                       kind,
+		Rc:                         rc,
+		StoragePrefix:              prefix,
+		RequestScopedStoragePrefix: requestScoped,
+		RequireStoragePrefix:       cache.StoragePrefixRequiredFromContext(ctx),
 	}
 
 	select {
@@ -258,6 +292,7 @@ func (r *remoteGrpcProxyCache) fetchBlobDigest(ctx context.Context, hash string)
 }
 
 func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64) (io.ReadCloser, int64, error) {
+	ctx = withOutgoingStoragePrefix(ctx)
 	switch kind {
 	case cache.RAW:
 		// RAW cache entries are a special case of AC, used when --disable_http_ac_validation
@@ -322,6 +357,7 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 }
 
 func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64) {
+	ctx = withOutgoingStoragePrefix(ctx)
 	switch kind {
 	case cache.RAW:
 		// RAW cache entries are a special case of AC, used when --disable_http_ac_validation
