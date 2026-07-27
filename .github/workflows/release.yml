@@ -95,13 +95,17 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
           persist-credentials: false
+      - name: setup Bazel
+        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
+        with:
+          bazelisk-version: 1.29.0
       - name: build ${{ matrix.arch }}
         run: |
           set -eu
           target="//:bazel-remote-linux-${{ matrix.arch }}"
           output="$(pwd)/bazel-remote-${{ env.VERSION }}-linux-${{ matrix.artifact_arch }}"
-          bazelisk build "$target"
-          bazelisk run --run_under "cp -f " "$target" "$output"
+          bazel build "$target"
+          bazel run --run_under "cp -f " "$target" "$output"
       - name: upload linux ${{ matrix.arch }} binary
         id: upload-release-assets-linux
         uses: xresloader/upload-to-github-release@7c5757a90c0bcf0c0e1741da8f2abd7b85e675d0 # v1
@@ -135,13 +139,17 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
           persist-credentials: false
+      - name: setup Bazel
+        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
+        with:
+          bazelisk-version: 1.29.0
       - name: build ${{ matrix.arch }}
         run: |
           set -eu
           target="//:bazel-remote-darwin-${{ matrix.arch }}"
           output="$(pwd)/bazel-remote-${{ env.VERSION }}-darwin-${{ matrix.arch }}"
-          bazelisk build "$target"
-          bazelisk run --run_under "cp -f " "$target" "$output"
+          bazel build "$target"
+          bazel run --run_under "cp -f " "$target" "$output"
       - name: upload darwin ${{ matrix.arch }} binary
         id: upload-release-assets-darwin
         uses: xresloader/upload-to-github-release@7c5757a90c0bcf0c0e1741da8f2abd7b85e675d0 # v1
