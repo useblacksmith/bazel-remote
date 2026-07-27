@@ -1263,18 +1263,80 @@ func TestGrpcByteStreamReadLimitBoundsBufferReservation(t *testing.T) {
 		t.Fatalf("Received %d bytes, want at most the %d byte ReadLimit",
 			len(bsrResp.Data), readLimit)
 	}
+	receivedBytes := len(bsrResp.Data)
 
-	// Drain the stream. bazel-remote returns OutOfRange when the blob
-	// holds more data than ReadLimit allows.
-	for err == nil {
-		_, err = bsrc.Recv()
+	// Reaching ReadLimit completes the partial read successfully even
+	// though the underlying blob contains more data.
+	for {
+		bsrResp, err = bsrc.Recv()
+		if err != nil {
+			break
+		}
+		receivedBytes += len(bsrResp.Data)
 	}
-	if s, ok := status.FromError(err); err != io.EOF && (!ok || s.Code() != codes.OutOfRange) {
-		t.Fatal("Expected EOF or OutOfRange, got", err)
+	if err != io.EOF {
+		t.Fatal("Expected EOF, got", err)
+	}
+	if receivedBytes != readLimit {
+		t.Fatalf("Received %d bytes, want exactly the %d byte ReadLimit",
+			receivedBytes, readLimit)
 	}
 
 	if got := metrics.lastReserved.Load(); got != readLimit {
 		t.Fatalf("Reserved buffer bytes = %d, want %d", got, readLimit)
+	}
+}
+
+type failingByteStreamReadServer struct {
+	bytestream.ByteStream_ReadServer
+	ctx     context.Context
+	sendErr error
+}
+
+func (s *failingByteStreamReadServer) Context() context.Context {
+	return s.ctx
+}
+
+func (s *failingByteStreamReadServer) Send(*bytestream.ReadResponse) error {
+	return s.sendErr
+}
+
+func TestGrpcByteStreamReadPreservesSendStatus(t *testing.T) {
+	t.Parallel()
+
+	fixture := grpcTestSetup(t)
+	defer func() { _ = os.Remove(fixture.tempdir) }()
+
+	testBlob, testBlobHash := testutils.RandomDataAndHash(1024)
+	if err := fixture.diskCache.Put(
+		ctx,
+		cache.CAS,
+		testBlobHash,
+		int64(len(testBlob)),
+		bytes.NewReader(testBlob),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	server := &grpcServer{
+		cache:              fixture.diskCache,
+		accessLogger:       testutils.NewSilentLogger(),
+		errorLogger:        testutils.NewSilentLogger(),
+		readChunkSizeBytes: maxChunkSize,
+	}
+	sendErr := status.Error(codes.Canceled, "stream canceled")
+
+	for _, resourceName := range []string{
+		fmt.Sprintf("instance/blobs/%s/%d", testBlobHash, len(testBlob)),
+		fmt.Sprintf("instance/compressed-blobs/zstd/%s/0", emptySha256),
+	} {
+		err := server.Read(
+			&bytestream.ReadRequest{ResourceName: resourceName},
+			&failingByteStreamReadServer{ctx: ctx, sendErr: sendErr},
+		)
+		if status.Code(err) != codes.Canceled {
+			t.Fatalf("Read(%q) status = %s, want Canceled", resourceName, status.Code(err))
+		}
 	}
 }
 

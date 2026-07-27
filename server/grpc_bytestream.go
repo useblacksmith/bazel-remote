@@ -65,7 +65,7 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		if err != nil {
 			msg := fmt.Sprintf("GRPC BYTESTREAM READ FAILED TO SEND RESPONSE: %s %v", hash, err)
 			s.accessLogger.Printf(msg)
-			return status.Error(codes.Unknown, msg)
+			return err
 		}
 		s.accessLogger.Printf("GRPC BYTESTREAM READ COMPLETED %s", req.ResourceName)
 		return nil
@@ -214,7 +214,12 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 			if sendErr != nil {
 				msg := fmt.Sprintf("GRPC BYTESTREAM READ FAILED TO SEND RESPONSE: %s %v", hash, sendErr)
 				s.accessLogger.Printf(msg)
-				return status.Error(codes.Unknown, msg)
+				return sendErr
+			}
+			if limitedSend && sendLimitRemaining == 0 {
+				s.accessLogger.Printf("GRPC BYTESTREAM READ COMPLETED %s",
+					req.ResourceName)
+				return nil
 			}
 		}
 
