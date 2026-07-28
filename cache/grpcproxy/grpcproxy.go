@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -28,7 +31,46 @@ const (
 	// The maximum chunk size to write back to the client in Send calls.
 	// Inspired by Goma's FileBlob.FILE_CHUNK maxium size.
 	maxChunkSize = 2 * 1024 * 1024 // 2M
+
+	// uploadTimeout bounds a single asynchronous backend upload. Uploads
+	// previously ran on context.Background() with no deadline, so a hung
+	// backend connection could pin an upload worker forever. The bound is
+	// generous (large CAS blobs can be slow on a busy link); it exists to
+	// reclaim workers, not to police latency.
+	uploadTimeout = 10 * time.Minute
 )
+
+var transportMisses = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_transport_miss_total",
+	Help: "Proxy backend requests degraded to cache misses by transport-level failures (fail-open).",
+}, []string{"method"})
+
+// errBlobNotFound is fetchBlobDigest's not-found sentinel; callers treat it
+// as a cache miss, never a request-failing error.
+var errBlobNotFound = errors.New("blob not found")
+
+// isTransportFailure reports whether err is a transport-level failure
+// reaching the proxy backend (unreachable node, refused/reset connection,
+// missed deadline) rather than an application-level response. The fail-open
+// contract maps these to cache misses on the read path: the disk layer wraps
+// any error returned from a proxy Get as INTERNAL and surfaces it to the
+// build, and an unreachable L1 must never fail a build.
+func isTransportFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	s, ok := status.FromError(err)
+	if !ok {
+		// Non-gRPC errors from the client stack (dial, net, context) are
+		// transport-class by construction.
+		return true
+	}
+	switch s.Code() {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+		return true
+	}
+	return false
+}
 
 type GrpcClients struct {
 	asset asset.FetchClient
@@ -116,13 +158,15 @@ func withOutgoingStoragePrefix(ctx context.Context) context.Context {
 
 // uploadContext rebuilds an outgoing context for an asynchronous upload from
 // the prefix captured at enqueue time (the original request context is long
-// gone by the time upload workers run).
-func uploadContext(item backendproxy.UploadReq) context.Context {
-	ctx := context.Background()
+// gone by the time upload workers run). The context carries a deadline so a
+// hung backend cannot pin an upload worker indefinitely; callers must call
+// the returned cancel func.
+func uploadContext(item backendproxy.UploadReq) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	if item.RequestScopedStoragePrefix && item.StoragePrefix != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, item.StoragePrefix)
 	}
-	return ctx
+	return ctx, cancel
 }
 
 func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
@@ -168,13 +212,17 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 			ActionDigest: digest,
 			ActionResult: ar,
 		}
-		_, err = r.clients.ac.UpdateActionResult(uploadContext(item), req)
+		ctx, cancel := uploadContext(item)
+		defer cancel()
+		_, err = r.clients.ac.UpdateActionResult(ctx, req)
 		if err != nil {
 			logResponse(r.errorLogger, "Update", err.Error(), item.Kind, item.Hash)
 		}
 		return
 	case cache.CAS:
-		stream, err := r.clients.bs.Write(uploadContext(item))
+		ctx, cancel := uploadContext(item)
+		defer cancel()
+		stream, err := r.clients.bs.Write(ctx)
 		if err != nil {
 			logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
 			return
@@ -283,7 +331,7 @@ func (r *remoteGrpcProxyCache) fetchBlobDigest(ctx context.Context, hash string)
 	}
 
 	if res.Status.GetCode() == int32(codes.NotFound) {
-		return nil, errors.New("not found")
+		return nil, errBlobNotFound
 	}
 	if res.Status.GetCode() != int32(codes.OK) {
 		return nil, errors.New(res.Status.Message)
@@ -314,6 +362,10 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 
 		if err != nil {
 			logResponse(r.errorLogger, "Get", err.Error(), kind, hash)
+			if isTransportFailure(err) {
+				transportMisses.WithLabelValues("ac_get").Inc()
+				return nil, -1, nil
+			}
 			return nil, -1, err
 		}
 		data, err := proto.Marshal(res)
@@ -331,6 +383,13 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 			digest, err := r.fetchBlobDigest(ctx, hash)
 			if err != nil {
 				logResponse(r.errorLogger, "Fetch", err.Error(), kind, hash)
+				if errors.Is(err, errBlobNotFound) {
+					return nil, -1, nil
+				}
+				if isTransportFailure(err) {
+					transportMisses.WithLabelValues("cas_fetch").Inc()
+					return nil, -1, nil
+				}
 				return nil, -1, err
 			}
 			size = digest.SizeBytes
@@ -346,6 +405,10 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 		stream, err := r.clients.bs.Read(ctx, &req)
 		if err != nil {
 			logResponse(r.errorLogger, "Read", err.Error(), kind, hash)
+			if isTransportFailure(err) {
+				transportMisses.WithLabelValues("cas_read").Inc()
+				return nil, -1, nil
+			}
 			return nil, -1, err
 		}
 		logResponse(r.errorLogger, "Read", "Completed", kind, hash)
@@ -368,7 +431,9 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 		// is to get the object and discard the result
 		// We don't expect this to ever be called anyways since it is not part of the grpc protocol
 		rc, size, err := r.Get(ctx, kind, hash, size)
-		_ = rc.Close()
+		if rc != nil {
+			_ = rc.Close()
+		}
 		if err != nil || size < 0 {
 			return false, -1
 		}
