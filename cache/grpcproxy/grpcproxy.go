@@ -119,8 +119,8 @@ func NewGrpcClients(cc *grpc.ClientConn) *GrpcClients {
 	}
 }
 
-func (c *GrpcClients) CheckCapabilities(zstd bool) error {
-	resp, err := c.cap.GetCapabilities(context.Background(), &pb.GetCapabilitiesRequest{})
+func (c *GrpcClients) CheckCapabilities(ctx context.Context, zstd bool) error {
+	resp, err := c.cap.GetCapabilities(ctx, &pb.GetCapabilitiesRequest{})
 	if err != nil {
 		return err
 	}

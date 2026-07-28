@@ -100,7 +100,7 @@ func (c *Config) setProxy() error {
 			return err
 		}
 		clients := grpcproxy.NewGrpcClients(conn)
-		err = clients.CheckCapabilities(c.StorageMode == "zstd")
+		err = clients.CheckCapabilities(context.Background(), c.StorageMode == "zstd")
 		if err != nil {
 			return err
 		}
