@@ -132,6 +132,28 @@ func (c *Config) setProxy() error {
 	}
 
 	if c.S3CloudStorage != nil {
+		// Multi-backend mode: an allowlisted selector → backend map, one
+		// s3proxy backend (own minio client, transport, upload queue) per
+		// entry, routed per-request from the validated gRPC metadata
+		// selector on the context.
+		if len(c.S3CloudStorage.Backends) > 0 {
+			specs, err := c.S3CloudStorage.backendSpecs()
+			if err != nil {
+				return err
+			}
+			proxy, err := s3proxy.NewMulti(
+				specs,
+				c.S3CloudStorage.UpdateTimestamps,
+				c.S3CloudStorage.ConnRecycleInterval,
+				c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
+				s3proxy.PrometheusMetrics())
+			if err != nil {
+				return err
+			}
+			c.ProxyBackend = proxy
+			return nil
+		}
+
 		creds, err := c.S3CloudStorage.GetCredentials()
 		if err != nil {
 			return err
@@ -154,6 +176,7 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.UpdateTimestamps,
 			c.S3CloudStorage.Region,
 			c.S3CloudStorage.MaxIdleConns,
+			c.S3CloudStorage.ConnRecycleInterval,
 			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
 			s3proxy.PrometheusMetrics())
 		return nil

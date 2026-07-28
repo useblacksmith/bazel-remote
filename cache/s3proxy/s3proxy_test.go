@@ -12,6 +12,7 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 type recordingObserver struct {
@@ -304,6 +305,170 @@ func TestClassifyUploadOutcome(t *testing.T) {
 					tc.err, status, reason, tc.expectedStatus, tc.expectedReason)
 			}
 		})
+	}
+}
+
+const (
+	backendKeyA = "http://minio-a.example.com:9000"
+	backendKeyB = "https://minio-b.example.com:9000"
+)
+
+// twoBackendMulti builds a multiS3Cache over two hand-constructed backends
+// with observable upload queues, avoiding any real minio client.
+func twoBackendMulti(t *testing.T) (*multiS3Cache, chan backendproxy.UploadReq, chan backendproxy.UploadReq) {
+	t.Helper()
+	queueA := make(chan backendproxy.UploadReq, 1)
+	queueB := make(chan backendproxy.UploadReq, 1)
+	backendA := &s3Cache{key: backendKeyA, prefix: "prefix-a", uploadQueue: queueA}
+	backendB := &s3Cache{key: backendKeyB, prefix: "prefix-b", uploadQueue: queueB}
+	m := &multiS3Cache{
+		backends: map[string]*s3Cache{
+			backendKeyA: backendA,
+			backendKeyB: backendB,
+		},
+		def: backendA,
+	}
+	return m, queueA, queueB
+}
+
+func TestMultiBackendPutRoutesToSelectedBackend(t *testing.T) {
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	m, queueA, queueB := twoBackendMulti(t)
+
+	// Selector B routes the async upload to backend B's queue.
+	ctxB := cache.WithS3Backend(context.Background(), backendKeyB)
+	m.Put(ctxB, cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
+	select {
+	case item := <-queueB:
+		_ = item.Rc.Close()
+	default:
+		t.Fatal("expected upload in backend B's queue")
+	}
+	select {
+	case <-queueA:
+		t.Fatal("upload leaked into backend A's queue")
+	default:
+	}
+
+	// Selector A routes to backend A's queue.
+	ctxA := cache.WithS3Backend(context.Background(), backendKeyA)
+	m.Put(ctxA, cache.AC, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
+	select {
+	case item := <-queueA:
+		_ = item.Rc.Close()
+	default:
+		t.Fatal("expected upload in backend A's queue")
+	}
+}
+
+func TestMultiBackendMissingSelectorRoutesToDefault(t *testing.T) {
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	m, queueA, queueB := twoBackendMulti(t)
+
+	m.Put(context.Background(), cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
+	select {
+	case item := <-queueA:
+		_ = item.Rc.Close()
+	default:
+		t.Fatal("expected upload in the default backend's queue")
+	}
+	select {
+	case <-queueB:
+		t.Fatal("upload leaked into the non-default backend's queue")
+	default:
+	}
+}
+
+// closeRecorder observes that the router closed the payload reader when it
+// refused the operation.
+type closeRecorder struct {
+	io.Reader
+	closed bool
+}
+
+func (c *closeRecorder) Close() error {
+	c.closed = true
+	return nil
+}
+
+func TestMultiBackendUnknownSelectorRefusesOperations(t *testing.T) {
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	var errBuf bytes.Buffer
+	m, queueA, queueB := twoBackendMulti(t)
+	m.errorLogger = stdlog.New(&errBuf, "", 0)
+
+	ctx := cache.WithS3Backend(context.Background(), "http://rogue.example.com:9000")
+
+	rc := &closeRecorder{Reader: strings.NewReader("blob")}
+	m.Put(ctx, cache.CAS, hash, 4, 4, rc)
+	if !rc.closed {
+		t.Fatal("expected refused Put to close the reader")
+	}
+	select {
+	case <-queueA:
+		t.Fatal("refused Put reached backend A")
+	case <-queueB:
+		t.Fatal("refused Put reached backend B")
+	default:
+	}
+
+	if _, _, err := m.Get(ctx, cache.CAS, hash, 4); err != errUnknownBackend {
+		t.Fatalf("Get err = %v, want errUnknownBackend", err)
+	}
+
+	exists, size := m.Contains(ctx, cache.CAS, hash, 4)
+	if exists || size != -1 {
+		t.Fatalf("Contains = (%v, %d), want (false, -1)", exists, size)
+	}
+
+	if !strings.Contains(errBuf.String(), "unknown backend selector") {
+		t.Fatalf("expected refusal to be logged, got %q", errBuf.String())
+	}
+}
+
+func TestNewMultiValidation(t *testing.T) {
+	creds := credentials.NewStaticV4("ak", "sk", "")
+	spec := func(key string, def bool) BackendSpec {
+		return BackendSpec{
+			Key:         key,
+			Endpoint:    "minio.example.com:9000",
+			Bucket:      "bucket",
+			Credentials: creds,
+			DisableSSL:  true,
+			Default:     def,
+		}
+	}
+
+	if _, err := NewMulti(nil, false, -1, "uncompressed", nil, nil, 0, 0, nil); err == nil {
+		t.Fatal("expected error for empty backend list")
+	}
+
+	if _, err := NewMulti([]BackendSpec{spec(backendKeyA, false)},
+		false, -1, "uncompressed", nil, nil, 0, 0, nil); err == nil ||
+		!strings.Contains(err.Error(), "no S3 backend marked as default") {
+		t.Fatal("expected error when no backend is default")
+	}
+
+	if _, err := NewMulti([]BackendSpec{spec(backendKeyA, true), spec(backendKeyA, false)},
+		false, -1, "uncompressed", nil, nil, 0, 0, nil); err == nil ||
+		!strings.Contains(err.Error(), "duplicate S3 backend key") {
+		t.Fatal("expected error for duplicate backend keys")
+	}
+
+	proxy, err := NewMulti([]BackendSpec{spec(backendKeyA, true), spec(backendKeyB, false)},
+		false, -1, "uncompressed", nil, nil, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m, ok := proxy.(*multiS3Cache)
+	if !ok {
+		t.Fatalf("unexpected proxy type %T", proxy)
+	}
+	if m.def == nil || m.def.key != backendKeyA {
+		t.Fatalf("unexpected default backend %+v", m.def)
+	}
+	if len(m.backends) != 2 {
+		t.Fatalf("expected 2 backends, got %d", len(m.backends))
 	}
 }
 

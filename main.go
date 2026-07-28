@@ -409,6 +409,19 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 		unaryInterceptors = append(unaryInterceptors, server.GRPCStoragePrefixUnaryServerInterceptor(authSecret))
 	}
 
+	// Multi-backend S3 mode: every cache RPC must carry exactly one
+	// allowlisted backend selector (the tenant's pinned backing-store
+	// endpoint, forwarded by the trusted upstream) or it is rejected
+	// fail-closed — same trust model as the storage prefix above. Health and
+	// capabilities RPCs are exempt. Only installed when a backends map is
+	// configured; single-backend deployments ignore the metadata.
+	if c.S3CloudStorage != nil && len(c.S3CloudStorage.Backends) > 0 {
+		allowed := c.S3CloudStorage.AllowedBackends()
+		log.Printf("Routing S3 operations by forwarded backend-selector gRPC metadata, fail-closed (%d allowlisted backends)", len(allowed))
+		streamInterceptors = append(streamInterceptors, server.GRPCS3BackendStreamServerInterceptor(allowed))
+		unaryInterceptors = append(unaryInterceptors, server.GRPCS3BackendUnaryServerInterceptor(allowed))
+	}
+
 	if c.EnableEndpointMetrics {
 		streamInterceptors = append(streamInterceptors, grpc_prometheus.StreamServerInterceptor)
 		unaryInterceptors = append(unaryInterceptors, grpc_prometheus.UnaryServerInterceptor)

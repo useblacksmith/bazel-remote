@@ -442,6 +442,24 @@ func validateConfig(c *Config) error {
 			return fmt.Errorf("s3.signature_type must be one of: \"v2\", \"v4\", \"v4streaming\", \"anonymous\" or empty/unspecified, found: \"%s\"",
 				c.S3CloudStorage.SignatureType)
 		}
+
+		if len(c.S3CloudStorage.Backends) > 0 {
+			defaults := 0
+			for key, backend := range c.S3CloudStorage.Backends {
+				if key == "" {
+					return errors.New("s3.backends keys must be non-empty backend selectors")
+				}
+				if backend.Default {
+					defaults++
+				}
+				if _, err := c.S3CloudStorage.mergedBackendConfig(key); err != nil {
+					return err
+				}
+			}
+			if defaults != 1 {
+				return fmt.Errorf("s3.backends must designate exactly one entry with 'default: true', found %d", defaults)
+			}
+		}
 	}
 
 	if c.AzBlobConfig != nil {
@@ -573,6 +591,7 @@ func get(ctx *cli.Context) (*Config, error) {
 			AWSProfile:               ctx.String("s3.aws_profile"),
 			AWSSharedCredentialsFile: ctx.String("s3.aws_shared_credentials_file"),
 			MaxIdleConns:             ctx.Int("s3.max_idle_conns"),
+			ConnRecycleInterval:      ctx.Duration("s3.conn_recycle_interval"),
 		}
 	}
 

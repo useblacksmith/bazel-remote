@@ -18,7 +18,14 @@ type UploadReq struct {
 	StoragePrefix              string
 	RequestScopedStoragePrefix bool
 	RequireStoragePrefix       bool
-	MetricsLabels              cache.MetricsLabels
+	// S3Backend captures the request-scoped backend selector (the tenant's
+	// pinned backing-store endpoint) at enqueue time, for the same reason as
+	// StoragePrefix above: grpcproxy upload workers re-attach it as outgoing
+	// metadata so the downstream L1 routes the write-through to the right
+	// backend. (The s3proxy needs no such field — its multi-backend router
+	// dispatches to the selected backend's own queue at enqueue time.)
+	S3Backend     string
+	MetricsLabels cache.MetricsLabels
 }
 
 type Uploader interface {

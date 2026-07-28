@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"log"
+	"net/url"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache/s3proxy"
 
@@ -28,6 +30,176 @@ type S3CloudStorageConfig struct {
 	AWSSharedCredentialsFile string `yaml:"aws_shared_credentials_file"`
 	BucketLookupType         string `yaml:"bucket_lookup_type"`
 	MaxIdleConns             int    `yaml:"max_idle_conns"`
+
+	// ConnRecycleInterval periodically closes the backend transport's idle
+	// connections so new dials re-resolve DNS. MinIO clusters have no load
+	// balancer — the endpoint is a DNS name round-robinning bare node IPs —
+	// so a long-lived proxy that never re-dials pins its traffic to whichever
+	// nodes it happened to connect to first. Zero/unset means the default
+	// (see s3proxy.DefaultConnRecycleInterval); negative disables recycling.
+	// In YAML this is a duration string ("90s", "5m"); see UnmarshalYAML.
+	ConnRecycleInterval time.Duration `yaml:"-"`
+
+	// Backends optionally declares a map of allowlisted S3 backends for
+	// multi-shard deployments (an L1 node in front of several MinIO
+	// clusters). Keys are the tenant-facing endpoint selectors — the exact
+	// `bazelre_cache_endpoint` values the trusted upstream forwards as
+	// cache.S3BackendGRPCMetadataKey gRPC metadata, e.g.
+	// "http://staging-minio.uswest.blacksmith.sh:9000" — matched as opaque
+	// strings, no URL normalization. Exactly one entry must set
+	// `default: true`; it serves requests that carry no selector (HTTP API
+	// paths, RAW entries). When this map is empty the proxy behaves exactly
+	// as before: one backend from the fields above, selector metadata
+	// ignored.
+	Backends map[string]S3BackendConfig `yaml:"backends,omitempty"`
+}
+
+// UnmarshalYAML decodes S3CloudStorageConfig with conn_recycle_interval
+// accepted as a duration string ("90s", "5m", "-1s" to disable) — yaml.v3
+// cannot decode time.Duration natively.
+func (s3c *S3CloudStorageConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type Aux S3CloudStorageConfig
+	var aux struct {
+		Aux                 `yaml:",inline"`
+		ConnRecycleInterval string `yaml:"conn_recycle_interval"`
+	}
+
+	if err := unmarshal(&aux); err != nil {
+		return err
+	}
+	*s3c = S3CloudStorageConfig(aux.Aux)
+	if aux.ConnRecycleInterval != "" {
+		d, err := time.ParseDuration(aux.ConnRecycleInterval)
+		if err != nil {
+			return fmt.Errorf("invalid s3_proxy conn_recycle_interval %q: %w", aux.ConnRecycleInterval, err)
+		}
+		s3c.ConnRecycleInterval = d
+	}
+	return nil
+}
+
+// S3BackendConfig describes one entry of the allowlisted backends map. Every
+// field is optional and inherits from the surrounding S3CloudStorageConfig
+// when unset; an unset endpoint is derived from the map key's URL (host:port,
+// with disable_ssl implied by an http scheme), which covers the common case
+// where the tenant-facing selector is also the address this node dials. Set
+// `endpoint` explicitly when the dial address differs (e.g. the L1 reaches
+// MinIO over a private VLAN address while tenants are pinned to the public
+// DNS name).
+type S3BackendConfig struct {
+	Endpoint        string `yaml:"endpoint"`
+	Bucket          string `yaml:"bucket"`
+	Prefix          string `yaml:"prefix"`
+	AccessKeyID     string `yaml:"access_key_id"`
+	SecretAccessKey string `yaml:"secret_access_key"`
+	DisableSSL      *bool  `yaml:"disable_ssl"`
+	Region          string `yaml:"region"`
+	MaxIdleConns    int    `yaml:"max_idle_conns"`
+	Default         bool   `yaml:"default"`
+}
+
+// AllowedBackends returns the set of valid backend selectors, for the
+// fail-closed gRPC interceptor.
+func (s3c *S3CloudStorageConfig) AllowedBackends() map[string]bool {
+	allowed := make(map[string]bool, len(s3c.Backends))
+	for key := range s3c.Backends {
+		allowed[key] = true
+	}
+	return allowed
+}
+
+// mergedBackendConfig resolves one backends-map entry into a complete
+// single-backend config, inheriting unset fields from the top-level config.
+func (s3c *S3CloudStorageConfig) mergedBackendConfig(key string) (S3CloudStorageConfig, error) {
+	backend := s3c.Backends[key]
+
+	merged := *s3c
+	merged.Backends = nil
+
+	if backend.Endpoint != "" {
+		merged.Endpoint = backend.Endpoint
+		if backend.DisableSSL != nil {
+			merged.DisableSSL = *backend.DisableSSL
+		}
+	} else {
+		// Derive the dial address from the selector key itself.
+		u, err := url.Parse(key)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return merged, fmt.Errorf("s3.backends key %q is not an http(s) URL and the entry sets no 'endpoint'", key)
+		}
+		merged.Endpoint = u.Host
+		if backend.DisableSSL != nil {
+			merged.DisableSSL = *backend.DisableSSL
+		} else {
+			merged.DisableSSL = u.Scheme == "http"
+		}
+	}
+
+	if backend.Bucket != "" {
+		merged.Bucket = backend.Bucket
+	}
+	if backend.Prefix != "" {
+		merged.Prefix = backend.Prefix
+	}
+	if backend.Region != "" {
+		merged.Region = backend.Region
+	}
+	if backend.MaxIdleConns != 0 {
+		merged.MaxIdleConns = backend.MaxIdleConns
+	}
+	if backend.AccessKeyID != "" || backend.SecretAccessKey != "" {
+		merged.AuthMethod = s3proxy.AuthMethodAccessKey
+		merged.AccessKeyID = backend.AccessKeyID
+		merged.SecretAccessKey = backend.SecretAccessKey
+		merged.SessionToken = ""
+	}
+
+	if merged.Endpoint == "" {
+		return merged, fmt.Errorf("s3.backends entry %q has no endpoint", key)
+	}
+	if merged.Bucket == "" {
+		return merged, fmt.Errorf("s3.backends entry %q has no bucket", key)
+	}
+
+	return merged, nil
+}
+
+// backendSpecs resolves the backends map into s3proxy backend specs
+// (credentials included). Only valid to call when len(Backends) > 0 and
+// validateConfig has passed.
+func (s3c *S3CloudStorageConfig) backendSpecs() ([]s3proxy.BackendSpec, error) {
+	specs := make([]s3proxy.BackendSpec, 0, len(s3c.Backends))
+	for key, backend := range s3c.Backends {
+		merged, err := s3c.mergedBackendConfig(key)
+		if err != nil {
+			return nil, err
+		}
+		creds, err := merged.GetCredentials()
+		if err != nil {
+			return nil, fmt.Errorf("s3.backends entry %q: %w", key, err)
+		}
+		lookupTypeStr := merged.BucketLookupType
+		if lookupTypeStr == "" {
+			lookupTypeStr = "auto"
+		}
+		lookupType, err := parseBucketLookupType(lookupTypeStr)
+		if err != nil {
+			return nil, fmt.Errorf("s3.backends entry %q: %w", key, err)
+		}
+		specs = append(specs, s3proxy.BackendSpec{
+			Key:              key,
+			Endpoint:         merged.Endpoint,
+			Bucket:           merged.Bucket,
+			BucketLookupType: lookupType,
+			Prefix:           merged.Prefix,
+			Credentials:      creds,
+			DisableSSL:       merged.DisableSSL,
+			Region:           merged.Region,
+			MaxIdleConns:     merged.MaxIdleConns,
+			Default:          backend.Default,
+		})
+	}
+	return specs, nil
 }
 
 func (s3c S3CloudStorageConfig) GetCredentials() (*credentials.Credentials, error) {

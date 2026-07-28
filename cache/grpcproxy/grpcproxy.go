@@ -273,6 +273,23 @@ func withOutgoingStoragePrefix(ctx context.Context) context.Context {
 	return metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
 }
 
+// withOutgoingS3Backend forwards the request-scoped backend selector (the
+// tenant's pinned backing-store endpoint, when one is attached to ctx) to the
+// downstream bazel-remote as gRPC metadata, so a multi-backend L1 routes the
+// operation to the right storage cluster. Idempotent for the same reason as
+// withOutgoingStoragePrefix: the downstream rejects duplicate values
+// fail-closed.
+func withOutgoingS3Backend(ctx context.Context) context.Context {
+	selector, ok := cache.S3BackendFromContext(ctx)
+	if !ok {
+		return ctx
+	}
+	if md, ok := metadata.FromOutgoingContext(ctx); ok && len(md.Get(cache.S3BackendGRPCMetadataKey)) > 0 {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, cache.S3BackendGRPCMetadataKey, selector)
+}
+
 // uploadContext rebuilds an outgoing context for an asynchronous upload from
 // the prefix captured at enqueue time (the original request context is long
 // gone by the time upload workers run). The context carries a deadline so a
@@ -282,6 +299,9 @@ func uploadContext(item backendproxy.UploadReq) (context.Context, context.Cancel
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	if item.RequestScopedStoragePrefix && item.StoragePrefix != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, item.StoragePrefix)
+	}
+	if item.S3Backend != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BackendGRPCMetadataKey, item.S3Backend)
 	}
 	return ctx, cancel
 }
@@ -423,10 +443,11 @@ func (r *remoteGrpcProxyCache) Put(ctx context.Context, kind cache.EntryKind, ha
 		return
 	}
 
-	// Capture the request-scoped storage prefix and metrics labels at enqueue
-	// time; uploads are asynchronous and the request context is gone when
-	// workers run.
+	// Capture the request-scoped storage prefix, backend selector and metrics
+	// labels at enqueue time; uploads are asynchronous and the request
+	// context is gone when workers run.
 	prefix, requestScoped := cache.StoragePrefixFromContext(ctx)
+	s3Backend, _ := cache.S3BackendFromContext(ctx)
 	labels, _ := cache.MetricsLabelsFromContext(ctx)
 
 	item := backendproxy.UploadReq{
@@ -438,6 +459,7 @@ func (r *remoteGrpcProxyCache) Put(ctx context.Context, kind cache.EntryKind, ha
 		StoragePrefix:              prefix,
 		RequestScopedStoragePrefix: requestScoped,
 		RequireStoragePrefix:       cache.StoragePrefixRequiredFromContext(ctx),
+		S3Backend:                  s3Backend,
 		MetricsLabels:              labels,
 	}
 
@@ -481,6 +503,7 @@ func (r *remoteGrpcProxyCache) fetchBlobDigest(ctx context.Context, hash string)
 
 func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64) (io.ReadCloser, int64, error) {
 	ctx = withOutgoingStoragePrefix(ctx)
+	ctx = withOutgoingS3Backend(ctx)
 	switch kind {
 	case cache.RAW:
 		// RAW cache entries are a special case of AC, used when --disable_http_ac_validation
@@ -558,6 +581,7 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 
 func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64) {
 	ctx = withOutgoingStoragePrefix(ctx)
+	ctx = withOutgoingS3Backend(ctx)
 	switch kind {
 	case cache.RAW:
 		// RAW cache entries are a special case of AC, used when --disable_http_ac_validation

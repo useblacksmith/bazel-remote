@@ -417,6 +417,13 @@ func GetCliFlags() []cli.Flag {
 			DefaultText: "1024",
 			EnvVars:     []string{"BAZEL_REMOTE_S3_MAX_IDLE_CONNS"},
 		},
+		&cli.DurationFlag{
+			Name:        "s3.conn_recycle_interval",
+			Usage:       "How often to close the S3 proxy backend's idle connections so new dials re-resolve DNS (LB-less MinIO endpoints round-robin bare node IPs; without recycling, a long-lived proxy pins traffic to the nodes it dialed first). Set to a negative duration to disable recycling.",
+			Value:       0,
+			DefaultText: "5m",
+			EnvVars:     []string{"BAZEL_REMOTE_S3_CONN_RECYCLE_INTERVAL"},
+		},
 		&cli.StringFlag{
 			Name:    "azblob.tenant_id",
 			Value:   "",
