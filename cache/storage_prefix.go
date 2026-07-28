@@ -12,6 +12,12 @@ import (
 // configured to trust its callers (private network / authenticated peers).
 const StoragePrefixGRPCMetadataKey = "x-blacksmith-storage-prefix"
 
+// AuthSecretGRPCMetadataKey carries the shared secret that authenticates a
+// trusted upstream (FA host) to an L1 bazel-remote node. It is a static
+// host-level credential (ansible/1Password-distributed); VLAN exposure and
+// iptables allowlists remain the outer defense layers.
+const AuthSecretGRPCMetadataKey = "x-blacksmith-cache-auth"
+
 // ValidStoragePrefix reports whether prefix is safe to use as a physical
 // object-key prefix received from a remote caller. It rejects anything that
 // could escape the intended keyspace (absolute paths, dot-dot segments,

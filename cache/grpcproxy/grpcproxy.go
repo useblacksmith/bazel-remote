@@ -45,6 +45,11 @@ var transportMisses = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Proxy backend requests degraded to cache misses by transport-level failures (fail-open).",
 }, []string{"method"})
 
+var uploadsDropped = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_upload_dropped_total",
+	Help: "Backend uploads dropped before forwarding (queue overflow, missing tenant prefix).",
+}, []string{"reason"})
+
 // errBlobNotFound is fetchBlobDigest's not-found sentinel; callers treat it
 // as a cache miss, never a request-failing error.
 var errBlobNotFound = errors.New("blob not found")
@@ -148,12 +153,19 @@ func logResponse(logger cache.Logger, method string, msg string, kind cache.Entr
 // withOutgoingStoragePrefix forwards the request-scoped storage prefix (when
 // one is attached to ctx) to the downstream bazel-remote as gRPC metadata, so
 // the downstream node can preserve tenant isolation on its local disk and its
-// own storage backend.
+// own storage backend. Attachment is idempotent: the downstream rejects
+// duplicate prefix values as a fail-closed isolation guard, so a call path
+// that layers this twice (e.g. Contains(AC) delegating to Get) must not
+// produce two copies of the header.
 func withOutgoingStoragePrefix(ctx context.Context) context.Context {
-	if prefix, ok := cache.StoragePrefixFromContext(ctx); ok {
-		return metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
+	prefix, ok := cache.StoragePrefixFromContext(ctx)
+	if !ok {
+		return ctx
 	}
-	return ctx
+	if md, ok := metadata.FromOutgoingContext(ctx); ok && len(md.Get(cache.StoragePrefixGRPCMetadataKey)) > 0 {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
 }
 
 // uploadContext rebuilds an outgoing context for an asynchronous upload from
@@ -172,8 +184,15 @@ func uploadContext(item backendproxy.UploadReq) (context.Context, context.Cancel
 func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 	defer func() { _ = item.Rc.Close() }()
 
+	// A required-but-missing prefix means the tenant attribution was lost
+	// between the auth interceptor and this queue. Forwarding the upload
+	// unscoped would let the downstream land it in a shared or wrong
+	// keyspace, so drop it instead: the cost is one lost warmup, never a
+	// cross-tenant write.
 	if item.RequireStoragePrefix && !item.RequestScopedStoragePrefix {
-		logResponse(r.errorLogger, "Upload", "missing request-scoped storage prefix", item.Kind, item.Hash)
+		logResponse(r.errorLogger, "Upload", "missing request-scoped storage prefix; dropping upload", item.Kind, item.Hash)
+		uploadsDropped.WithLabelValues("missing_prefix").Inc()
+		return
 	}
 
 	switch item.Kind {

@@ -394,12 +394,19 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 	unaryInterceptors := []grpc.UnaryServerInterceptor{}
 
 	// L1 mode: trust upstream bazel-remote instances to forward per-tenant
-	// storage prefixes as request metadata. Env-gated for now (experiment);
+	// storage prefixes as request metadata. Trust-on is fail-closed: every
+	// cache RPC must carry exactly one valid prefix (and the shared secret,
+	// when BAZEL_REMOTE_L1_AUTH_SECRET is set) or it is rejected at the
+	// boundary; health and capabilities RPCs are exempt. Env-gated for now;
 	// promote to a proper config flag before production use.
 	if os.Getenv("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER") == "1" {
-		log.Println("Trusting forwarded storage-prefix gRPC metadata (BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER=1)")
-		streamInterceptors = append(streamInterceptors, server.GRPCStoragePrefixStreamServerInterceptor())
-		unaryInterceptors = append(unaryInterceptors, server.GRPCStoragePrefixUnaryServerInterceptor())
+		authSecret := os.Getenv("BAZEL_REMOTE_L1_AUTH_SECRET")
+		if authSecret == "" {
+			log.Println("WARNING: storage-prefix trust enabled without BAZEL_REMOTE_L1_AUTH_SECRET; relying on network-level access control only")
+		}
+		log.Println("Trusting forwarded storage-prefix gRPC metadata, fail-closed (BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER=1)")
+		streamInterceptors = append(streamInterceptors, server.GRPCStoragePrefixStreamServerInterceptor(authSecret))
+		unaryInterceptors = append(unaryInterceptors, server.GRPCStoragePrefixUnaryServerInterceptor(authSecret))
 	}
 
 	if c.EnableEndpointMetrics {
