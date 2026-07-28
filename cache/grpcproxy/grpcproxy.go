@@ -45,6 +45,11 @@ var transportMisses = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Proxy backend requests degraded to cache misses by transport-level failures (fail-open).",
 }, []string{"method"})
 
+var authMisses = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_auth_miss_total",
+	Help: "Proxy backend requests rejected as unauthenticated/permission-denied, degraded to cache misses. Nonzero means the backend auth secret is misconfigured — alertable.",
+}, []string{"method"})
+
 var uploadsDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bazel_remote_grpcproxy_upload_dropped_total",
 	Help: "Backend uploads dropped before forwarding (queue overflow, missing tenant prefix).",
@@ -87,6 +92,31 @@ func isTransportFailure(err error) bool {
 	}
 	switch s.Code() {
 	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+		return true
+	}
+	return false
+}
+
+// isAuthFailure reports whether err is the backend rejecting this client's
+// credentials. Defense in depth for the read path: auth misconfiguration
+// discovered mid-flight degrades to cache-off (misses) with a distinct,
+// alertable counter — never failed builds. The startup probe is the loud
+// path for catching this at boot.
+func isAuthFailure(err error) bool {
+	s, ok := status.FromError(err)
+	return ok && (s.Code() == codes.Unauthenticated || s.Code() == codes.PermissionDenied)
+}
+
+// missForBackendError applies the fail-open read contract to a backend
+// error: auth rejections and transport failures are counted on their
+// distinct meters and degraded to misses; anything else stays an error.
+func missForBackendError(err error, method string) bool {
+	if isAuthFailure(err) {
+		authMisses.WithLabelValues(method).Inc()
+		return true
+	}
+	if isTransportFailure(err) {
+		transportMisses.WithLabelValues(method).Inc()
 		return true
 	}
 	return false
@@ -176,6 +206,18 @@ func New(clients *GrpcClients, storageMode string,
 	proxy.uploadQueue = backendproxy.StartUploaders(proxy, numUploaders, maxQueuedUploads)
 
 	return proxy
+}
+
+// StopUploaders terminates the upload worker pool by closing the queue.
+// Only safe when no further Put calls can occur — intended for an embedder
+// tearing down a backend that never served traffic (e.g. startup failure
+// after construction); a Put after StopUploaders panics on the closed
+// channel.
+func (r *remoteGrpcProxyCache) StopUploaders() {
+	if r.uploadQueue != nil {
+		close(r.uploadQueue)
+		r.uploadQueue = nil
+	}
 }
 
 // observeUpload reports one terminal backend-upload outcome. Failure statuses
@@ -460,8 +502,7 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 
 		if err != nil {
 			logResponse(r.errorLogger, "Get", err.Error(), kind, hash)
-			if isTransportFailure(err) {
-				transportMisses.WithLabelValues("ac_get").Inc()
+			if missForBackendError(err, "ac_get") {
 				return nil, -1, nil
 			}
 			return nil, -1, err
@@ -484,8 +525,7 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 				if errors.Is(err, errBlobNotFound) {
 					return nil, -1, nil
 				}
-				if isTransportFailure(err) {
-					transportMisses.WithLabelValues("cas_fetch").Inc()
+				if missForBackendError(err, "cas_fetch") {
 					return nil, -1, nil
 				}
 				return nil, -1, err
@@ -503,8 +543,7 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 		stream, err := r.clients.bs.Read(ctx, &req)
 		if err != nil {
 			logResponse(r.errorLogger, "Read", err.Error(), kind, hash)
-			if isTransportFailure(err) {
-				transportMisses.WithLabelValues("cas_read").Inc()
+			if missForBackendError(err, "cas_read") {
 				return nil, -1, nil
 			}
 			return nil, -1, err
@@ -558,6 +597,8 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 		res, err := r.clients.cas.FindMissingBlobs(ctx, req)
 		if err != nil {
 			logResponse(r.errorLogger, "Contains", err.Error(), kind, hash)
+			// Result is already a miss; classify for the distinct meters.
+			_ = missForBackendError(err, "cas_contains")
 			return false, -1
 		}
 		for range res.MissingBlobDigests {
