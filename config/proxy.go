@@ -141,6 +141,9 @@ func (c *Config) setProxy() error {
 		if err != nil {
 			return err
 		}
+		// Standalone deployments (e.g. an L1 node) have no embedder-provided
+		// metrics sink; export the prefix-safety signal via this package's
+		// own Prometheus counters so it is never dark.
 		c.ProxyBackend = s3proxy.New(
 			c.S3CloudStorage.Endpoint,
 			c.S3CloudStorage.Bucket,
@@ -152,7 +155,7 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.Region,
 			c.S3CloudStorage.MaxIdleConns,
 			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
-			nil)
+			s3proxy.PrometheusMetrics())
 		return nil
 	}
 

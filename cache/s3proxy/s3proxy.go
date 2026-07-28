@@ -62,7 +62,32 @@ var (
 		Name: "bazel_remote_s3_cache_misses",
 		Help: "The total number of s3 backend cache misses",
 	})
+	uploadQueueDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "bazel_remote_s3_upload_queue_dropped_total",
+		Help: "Backend uploads dropped because the S3 upload queue was full.",
+	})
+	uploadQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "bazel_remote_s3_upload_queue_depth",
+		Help: "Queued backend uploads awaiting an S3 upload worker.",
+	})
+	prefixMissing = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "bazel_remote_s3_prefix_missing_total",
+		Help: "Requests that required a request-scoped storage prefix but carried none (configured fallback prefix used).",
+	}, []string{"operation"})
 )
+
+// PrometheusMetrics returns a Metrics implementation backed by this package's
+// Prometheus counters. Standalone deployments (e.g. an L1 node) use it so the
+// prefix-safety signal exports without an embedder-provided sink.
+func PrometheusMetrics() Metrics {
+	return promMetricsSink{}
+}
+
+type promMetricsSink struct{}
+
+func (promMetricsSink) IncPrefixMissing(operation string) {
+	prefixMissing.WithLabelValues(operation).Inc()
+}
 
 // Used in place of minio's verbose "NoSuchKey" error.
 var errNotFound = errors.New("NOT FOUND")
@@ -258,6 +283,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 
 	status, reason := classifyUploadOutcome(err)
 	c.observeUpload(context.Background(), item, status, reason)
+	uploadQueueDepth.Set(float64(len(c.uploadQueue)))
 
 	_ = item.Rc.Close()
 }
@@ -306,8 +332,10 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		RequireStoragePrefix:       requirePrefix,
 		MetricsLabels:              labels,
 	}:
+		uploadQueueDepth.Set(float64(len(c.uploadQueue)))
 	default:
 		c.errorLogger.Printf("too many uploads queued\n")
+		uploadQueueDropped.Inc()
 		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
 			Method: "backend_upload",
 			Status: "dropped",
