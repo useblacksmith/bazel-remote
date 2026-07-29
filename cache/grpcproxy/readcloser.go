@@ -38,14 +38,17 @@ func (s *StreamReadCloser[M]) Read(p []byte) (int, error) {
 	if n == len(p) {
 		return n, nil
 	}
+	// The io.Reader contract requires n >= 0: stdlib consumers trust it
+	// (io.ReadAll slices its buffer by the returned n and panics on -1).
+	// On a mid-stream error, report the bytes already copied into p from
+	// the buffer along with the error, never a negative count.
 	msg, err := s.Stream.Recv()
 	if err == io.EOF {
-		err := s.Stream.CloseSend()
-		if err != nil {
-			return -1, err
+		if closeErr := s.Stream.CloseSend(); closeErr != nil {
+			return n, closeErr
 		}
 	} else if err != nil {
-		return -1, err
+		return n, err
 	}
 	s.buf = msg.GetData()
 	n += s.readFromBuf(p[n:])
