@@ -216,6 +216,9 @@ func (p *sourceBufferPool) put(b []byte) {
 		return
 	}
 	b = b[:0]
-	// Pointer indirection keeps the slice header off the heap (SA6002).
+	// Pointer indirection is the shape staticcheck SA6002 asks for. One
+	// small slice-header allocation still escapes per put (get discards the
+	// pointer, so the header is not itself recycled); that cost is noise
+	// next to the chunk-sized array being reused.
 	p.pool.Put(&b)
 }

@@ -159,27 +159,32 @@ func TestSourceBufferPoolRecyclesBuffers(t *testing.T) {
 	t.Fatal("expected a pooled backing array to be recycled within 256 rounds")
 }
 
+// TestSourceBufferPoolDropsForeignBuffers loops because a regression that
+// admits foreign arrays would be masked on some rounds under the race
+// detector, where sync.Pool.Put drops items at random; a correct
+// implementation passes every round deterministically (nothing is ever
+// admitted, so every get mints a fresh array regardless of P count).
 func TestSourceBufferPoolDropsForeignBuffers(t *testing.T) {
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	pool := newSourceBufferPool(16)
 
-	// An array that doesn't match the pool capacity must not be admitted:
-	// the next get must mint a fresh full-capacity array, not recycle the
-	// foreign one.
-	foreign := make([]byte, 8)
-	foreign[0] = 0x42
-	pool.put(foreign)
-	got := pool.get(8)
-	if cap(got) != 16 {
-		t.Fatalf("got cap=%d, want a fresh full-capacity array (16)", cap(got))
-	}
-	if got[0] == 0x42 {
-		t.Fatal("foreign buffer was admitted to the pool")
+	for round := 0; round < 64; round++ {
+		// An array that doesn't match the pool capacity must not be
+		// admitted: the next get must mint a fresh full-capacity array, not
+		// recycle the foreign one.
+		foreign := make([]byte, 8)
+		foreign[0] = 0x42
+		pool.put(foreign)
+		got := pool.get(8)
+		if cap(got) != 16 {
+			t.Fatalf("round %d: got cap=%d, want a fresh full-capacity array (16)", round, cap(got))
+		}
+		if got[0] == 0x42 {
+			t.Fatalf("round %d: foreign buffer was admitted to the pool", round)
+		}
 	}
 }
 
 func TestSourceBufferPoolNilAndOversizedFallBackToAllocation(t *testing.T) {
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	var pool *sourceBufferPool
 	buf := pool.get(8)
 	if len(buf) != 8 {
@@ -188,14 +193,16 @@ func TestSourceBufferPoolNilAndOversizedFallBackToAllocation(t *testing.T) {
 	pool.put(buf)
 
 	pool = newSourceBufferPool(4)
-	oversized := pool.get(8)
-	if len(oversized) != 8 {
-		t.Fatalf("oversized get returned len=%d, want 8", len(oversized))
-	}
-	oversized[0] = 0x42
-	pool.put(oversized)
-	if recycled := pool.get(4); recycled[0] == 0x42 {
-		t.Fatal("oversized buffer must not be admitted to the pool")
+	for round := 0; round < 64; round++ {
+		oversized := pool.get(8)
+		if len(oversized) != 8 {
+			t.Fatalf("oversized get returned len=%d, want 8", len(oversized))
+		}
+		oversized[0] = 0x42
+		pool.put(oversized)
+		if recycled := pool.get(4); recycled[0] == 0x42 {
+			t.Fatalf("round %d: oversized buffer must not be admitted to the pool", round)
+		}
 	}
 }
 
