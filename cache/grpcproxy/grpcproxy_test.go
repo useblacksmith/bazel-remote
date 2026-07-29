@@ -72,7 +72,7 @@ func newProxy(t *testing.T, dir string, storageMode string) *testProxy {
 		t.Fatal(err)
 	}
 	clients := NewGrpcClients(cc)
-	err = clients.CheckCapabilities(storageMode == "zstd")
+	err = clients.CheckCapabilities(context.Background(), storageMode == "zstd")
 	if err != nil {
 		t.Fatal(err)
 	}
