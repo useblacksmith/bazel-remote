@@ -96,9 +96,20 @@ reported as `forwarded` (never `created`):
 
 - `backend_upload`: `forwarded`, `error`, or `dropped`
 
-FA owns the mapping of `forwarded` rows to `created` (reason `l1_forwarded`)
-for storage accounting, sound because miss determination falls through the L1
-to MinIO (design decision log entry 8).
+gRPC proxy `backend_upload` outcomes also carry the entry kind on
+`OperationOutcome.Kind` (`"ac"`, `"cas"`, or `"raw"`, per
+`EntryKind.String()`; empty on outcomes that do not concern a specific entry
+kind). Observers need the kind because forwarded CAS and AC writes have
+different storage semantics: CAS uploads are deduplicated by FindMissingBlobs
+before they are queued, while AC updates unconditionally rewrite the same
+action digest on every build.
+
+FA owns the mapping of forwarded CAS rows to `created` (reason
+`l1_forwarded`) for storage accounting, sound because CAS miss determination
+falls through the L1 to MinIO (design decision log entry 8). Forwarded AC
+(and RAW) rows are deliberately not mapped: they would inflate the footprint
+without bound, since the backing store's create-if-absent keeps only the
+first write of a given action digest.
 
 Client transfer bytes are intentionally not inferred inside bazel-remote; FA
 observes gRPC request/response payloads and emits `client_upload` and
