@@ -306,21 +306,26 @@ func withOutgoingStoragePrefix(ctx context.Context) context.Context {
 	return metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
 }
 
-// withOutgoingS3Backend forwards the request-scoped backend selector (the
-// tenant's pinned backing-store endpoint, when one is attached to ctx) to the
-// downstream bazel-remote as gRPC metadata, so a multi-backend L1 routes the
-// operation to the right storage cluster. Idempotent for the same reason as
-// withOutgoingStoragePrefix: the downstream rejects duplicate values
-// fail-closed.
+// withOutgoingS3Backend forwards the request-scoped (endpoint, bucket)
+// selection (when one is attached to ctx) to the downstream bazel-remote as
+// gRPC metadata, so a multi-backend L1 routes the operation to the right
+// storage cluster and bucket. The bucket key is attached only when the
+// selection carries one (a context minted before the bucket contract may
+// not). Idempotent per key for the same reason as withOutgoingStoragePrefix:
+// the downstream rejects duplicate values fail-closed.
 func withOutgoingS3Backend(ctx context.Context) context.Context {
-	selector, ok := cache.S3BackendFromContext(ctx)
+	selection, ok := cache.S3BackendFromContext(ctx)
 	if !ok {
 		return ctx
 	}
-	if md, ok := metadata.FromOutgoingContext(ctx); ok && len(md.Get(cache.S3BackendGRPCMetadataKey)) > 0 {
-		return ctx
+	md, _ := metadata.FromOutgoingContext(ctx)
+	if len(md.Get(cache.S3BackendGRPCMetadataKey)) == 0 {
+		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BackendGRPCMetadataKey, selection.Endpoint)
 	}
-	return metadata.AppendToOutgoingContext(ctx, cache.S3BackendGRPCMetadataKey, selector)
+	if selection.Bucket != "" && len(md.Get(cache.S3BucketGRPCMetadataKey)) == 0 {
+		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BucketGRPCMetadataKey, selection.Bucket)
+	}
+	return ctx
 }
 
 // uploadContext rebuilds an outgoing context for an asynchronous upload from
@@ -333,8 +338,11 @@ func uploadContext(item backendproxy.UploadReq) (context.Context, context.Cancel
 	if item.RequestScopedStoragePrefix && item.StoragePrefix != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, item.StoragePrefix)
 	}
-	if item.S3Backend != "" {
-		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BackendGRPCMetadataKey, item.S3Backend)
+	if item.S3Backend.Endpoint != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BackendGRPCMetadataKey, item.S3Backend.Endpoint)
+	}
+	if item.S3Backend.Bucket != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BucketGRPCMetadataKey, item.S3Backend.Bucket)
 	}
 	return ctx, cancel
 }
@@ -476,9 +484,9 @@ func (r *remoteGrpcProxyCache) Put(ctx context.Context, kind cache.EntryKind, ha
 		return
 	}
 
-	// Capture the request-scoped storage prefix, backend selector and metrics
-	// labels at enqueue time; uploads are asynchronous and the request
-	// context is gone when workers run.
+	// Capture the request-scoped storage prefix, backend selection and
+	// metrics labels at enqueue time; uploads are asynchronous and the
+	// request context is gone when workers run.
 	prefix, requestScoped := cache.StoragePrefixFromContext(ctx)
 	s3Backend, _ := cache.S3BackendFromContext(ctx)
 	labels, _ := cache.MetricsLabelsFromContext(ctx)

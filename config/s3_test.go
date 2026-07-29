@@ -26,6 +26,7 @@ s3_proxy:
       endpoint: 10.4.6.99:9000
       disable_ssl: true
       bucket: bucket-b
+      extra_buckets: [bucket-b-pre-rename]
       access_key_id: B_ACCESS_KEY
       secret_access_key: B_SECRET_KEY
 `
@@ -47,10 +48,28 @@ func TestS3BackendsMapConfig(t *testing.T) {
 		t.Fatalf("ConnRecycleInterval = %v, want 1m", s3.ConnRecycleInterval)
 	}
 
-	allowed := s3.AllowedBackends()
-	for _, key := range []string{"http://minio-a.example.com:9000", "https://minio-b.example.com:9000"} {
-		if !allowed[key] {
+	// The allowlist pairs each selector with its bucket set: the entry's
+	// (possibly inherited) default bucket plus any extra_buckets.
+	allowed, err := s3.AllowedBackends()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBuckets := map[string][]string{
+		"http://minio-a.example.com:9000":  {"shared-bucket"},
+		"https://minio-b.example.com:9000": {"bucket-b", "bucket-b-pre-rename"},
+	}
+	for key, buckets := range wantBuckets {
+		got, ok := allowed[key]
+		if !ok {
 			t.Fatalf("expected %q in allowed backends %v", key, allowed)
+		}
+		if len(got) != len(buckets) {
+			t.Fatalf("backend %q allowed buckets = %v, want %v", key, got, buckets)
+		}
+		for _, bucket := range buckets {
+			if !got[bucket] {
+				t.Fatalf("backend %q allowed buckets = %v, missing %q", key, got, bucket)
+			}
 		}
 	}
 
@@ -217,6 +236,39 @@ s3_proxy:
       default: true
 `,
 			wantErr: "is not an http(s) URL",
+		},
+		{
+			name: "extra bucket duplicating the default bucket",
+			backends: `    http://minio-a.example.com:9000:
+      default: true
+      bucket: bucket-a
+      extra_buckets: [bucket-a]
+`,
+			wantErr: "lists bucket \"bucket-a\" more than once",
+		},
+		{
+			name: "extra bucket duplicating the inherited default bucket",
+			backends: `    http://minio-a.example.com:9000:
+      default: true
+      extra_buckets: [shared-bucket]
+`,
+			wantErr: "lists bucket \"shared-bucket\" more than once",
+		},
+		{
+			name: "duplicate within extra_buckets",
+			backends: `    http://minio-a.example.com:9000:
+      default: true
+      extra_buckets: [bucket-x, bucket-x]
+`,
+			wantErr: "lists bucket \"bucket-x\" more than once",
+		},
+		{
+			name: "empty extra_buckets value",
+			backends: `    http://minio-a.example.com:9000:
+      default: true
+      extra_buckets: [""]
+`,
+			wantErr: "empty extra_buckets value",
 		},
 	}
 

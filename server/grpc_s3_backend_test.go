@@ -16,10 +16,30 @@ import (
 const (
 	backendA = "http://minio-a.example.com:9000"
 	backendB = "https://minio-b.example.com:9000"
+
+	bucketA       = "bazel-cache-a"
+	bucketALegacy = "bazel-cache-a-pre-rename"
+	bucketB       = "bazel-cache-b"
 )
 
-func allowedBackends() map[string]bool {
-	return map[string]bool{backendA: true, backendB: true}
+// allowedBackends mirrors a two-entry backends map: backend A allows its
+// default bucket plus a pre-rename legacy bucket, backend B allows only its
+// default. The asymmetry lets tests prove the PAIR is validated, not the
+// halves independently.
+func allowedBackends() map[string]map[string]bool {
+	return map[string]map[string]bool{
+		backendA: {bucketA: true, bucketALegacy: true},
+		backendB: {bucketB: true},
+	}
+}
+
+// pairMD builds incoming metadata carrying a complete (endpoint, bucket)
+// pair, the well-formed shape the trusted upstream forwards.
+func pairMD(endpoint, bucket string) metadata.MD {
+	return metadata.Pairs(
+		cache.S3BackendGRPCMetadataKey, endpoint,
+		cache.S3BucketGRPCMetadataKey, bucket,
+	)
 }
 
 // requireTrustRejection asserts that err is an InvalidArgument rejection
@@ -67,13 +87,14 @@ func TestS3BackendFromIncomingContext(t *testing.T) {
 		md := metadata.Pairs(
 			cache.S3BackendGRPCMetadataKey, backendA,
 			cache.S3BackendGRPCMetadataKey, backendB,
+			cache.S3BucketGRPCMetadataKey, bucketA,
 		)
 		_, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
 		requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "duplicate")
 	})
 
 	t.Run("unknown selector is rejected", func(t *testing.T) {
-		md := metadata.Pairs(cache.S3BackendGRPCMetadataKey, "http://rogue.example.com:9000")
+		md := pairMD("http://rogue.example.com:9000", bucketA)
 		_, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
 		requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "unknown")
 	})
@@ -86,21 +107,84 @@ func TestS3BackendFromIncomingContext(t *testing.T) {
 			"minio-a.example.com:9000",         // missing scheme
 			"HTTP://minio-a.example.com:9000",  // case difference
 		} {
-			md := metadata.Pairs(cache.S3BackendGRPCMetadataKey, nearMiss)
+			md := pairMD(nearMiss, bucketA)
 			_, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
 			requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "unknown")
 		}
 	})
 
-	t.Run("allowlisted selector is lifted onto context", func(t *testing.T) {
-		md := metadata.Pairs(cache.S3BackendGRPCMetadataKey, backendB)
+	t.Run("missing bucket is rejected (fail-closed)", func(t *testing.T) {
+		md := metadata.Pairs(cache.S3BackendGRPCMetadataKey, backendA)
+		_, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
+		requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "bucket_missing")
+	})
+
+	t.Run("duplicate bucket values are rejected", func(t *testing.T) {
+		md := metadata.Pairs(
+			cache.S3BackendGRPCMetadataKey, backendA,
+			cache.S3BucketGRPCMetadataKey, bucketA,
+			cache.S3BucketGRPCMetadataKey, bucketALegacy,
+		)
+		_, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
+		requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "bucket_duplicate")
+	})
+
+	t.Run("unknown bucket is rejected", func(t *testing.T) {
+		md := pairMD(backendA, "rogue-bucket")
+		_, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
+		requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "bucket_unknown")
+	})
+
+	t.Run("the pair is validated: right endpoint, other endpoint's bucket is rejected", func(t *testing.T) {
+		// bucketB is allowlisted — but only for backend B. Accepting it on
+		// backend A would let a stale pair read another shard's bucket.
+		md := pairMD(backendA, bucketB)
+		_, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
+		requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "bucket_unknown")
+	})
+
+	t.Run("byte-verbatim bucket match: near-miss buckets are rejected", func(t *testing.T) {
+		for _, nearMiss := range []string{
+			"BAZEL-CACHE-A",  // case difference
+			" bazel-cache-a", // stray whitespace
+			"bazel-cache-a/", // trailing slash
+		} {
+			md := pairMD(backendA, nearMiss)
+			_, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
+			requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "bucket_unknown")
+		}
+	})
+
+	t.Run("endpoint violations are reported before bucket violations", func(t *testing.T) {
+		// An unknown endpoint with a missing bucket must surface the
+		// endpoint cause: the endpoint is the routing key, and during a
+		// rollout the endpoint-level causes are the primary skew signal.
+		md := metadata.Pairs(cache.S3BackendGRPCMetadataKey, "http://rogue.example.com:9000")
+		_, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
+		requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "unknown")
+	})
+
+	t.Run("allowlisted pair is lifted onto context", func(t *testing.T) {
+		md := pairMD(backendB, bucketB)
 		ctx, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		selector, ok := cache.S3BackendFromContext(ctx)
-		if !ok || selector != backendB {
-			t.Fatalf("unexpected selector %q ok=%v", selector, ok)
+		selection, ok := cache.S3BackendFromContext(ctx)
+		if !ok || selection.Endpoint != backendB || selection.Bucket != bucketB {
+			t.Fatalf("unexpected selection %+v ok=%v", selection, ok)
+		}
+	})
+
+	t.Run("extra (pre-rename) bucket of the matched entry is accepted", func(t *testing.T) {
+		md := pairMD(backendA, bucketALegacy)
+		ctx, err := s3BackendFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), allowedBackends())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		selection, ok := cache.S3BackendFromContext(ctx)
+		if !ok || selection.Endpoint != backendA || selection.Bucket != bucketALegacy {
+			t.Fatalf("unexpected selection %+v ok=%v", selection, ok)
 		}
 	})
 }
@@ -169,7 +253,7 @@ func TestS3BackendStreamInterceptor(t *testing.T) {
 	})
 
 	t.Run("unknown selector is rejected fail-closed before the handler", func(t *testing.T) {
-		md := metadata.Pairs(cache.S3BackendGRPCMetadataKey, "http://rogue.example.com:9000")
+		md := pairMD("http://rogue.example.com:9000", bucketA)
 		handled := false
 		err := interceptor(nil,
 			&fakeServerStream{ctx: metadata.NewIncomingContext(context.Background(), md)},
@@ -184,8 +268,24 @@ func TestS3BackendStreamInterceptor(t *testing.T) {
 		requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "unknown")
 	})
 
-	t.Run("accepted stream's Context carries the selector", func(t *testing.T) {
-		md := metadata.Pairs(cache.S3BackendGRPCMetadataKey, backendA)
+	t.Run("wrong bucket is rejected fail-closed before the handler", func(t *testing.T) {
+		md := pairMD(backendA, bucketB)
+		handled := false
+		err := interceptor(nil,
+			&fakeServerStream{ctx: metadata.NewIncomingContext(context.Background(), md)},
+			byteStreamRead,
+			func(srv interface{}, ss grpc.ServerStream) error {
+				handled = true
+				return nil
+			})
+		if handled {
+			t.Fatal("handler ran despite wrong bucket")
+		}
+		requireTrustRejection(t, err, cache.RejectionReasonS3BackendSelector, "bucket_unknown")
+	})
+
+	t.Run("accepted stream's Context carries the pair", func(t *testing.T) {
+		md := pairMD(backendA, bucketA)
 		var handlerStream grpc.ServerStream
 		err := interceptor(nil,
 			&fakeServerStream{ctx: metadata.NewIncomingContext(context.Background(), md)},
@@ -197,9 +297,9 @@ func TestS3BackendStreamInterceptor(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		selector, ok := cache.S3BackendFromContext(handlerStream.Context())
-		if !ok || selector != backendA {
-			t.Fatalf("wrapped stream Context selector = %q ok=%v, want %q", selector, ok, backendA)
+		selection, ok := cache.S3BackendFromContext(handlerStream.Context())
+		if !ok || selection.Endpoint != backendA || selection.Bucket != bucketA {
+			t.Fatalf("wrapped stream Context selection = %+v ok=%v, want (%s, %s)", selection, ok, backendA, bucketA)
 		}
 	})
 

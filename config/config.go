@@ -477,6 +477,9 @@ func validateConfig(c *Config) error {
 				if _, err := c.S3CloudStorage.mergedBackendConfig(key); err != nil {
 					return err
 				}
+				if _, err := c.S3CloudStorage.allowedBucketsForBackend(key); err != nil {
+					return err
+				}
 			}
 			if defaults != 1 {
 				return fmt.Errorf("s3.backends must designate exactly one entry with 'default: true', found %d", defaults)

@@ -14,6 +14,8 @@ import (
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
+	"github.com/johannesboyne/gofakes3"
+	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -346,7 +348,7 @@ func TestMultiBackendPutRoutesToSelectedBackend(t *testing.T) {
 	m, queueA, queueB := twoBackendMulti(t)
 
 	// Selector B routes the async upload to backend B's queue.
-	ctxB := cache.WithS3Backend(context.Background(), backendKeyB)
+	ctxB := cache.WithS3Backend(context.Background(), cache.S3BackendSelection{Endpoint: backendKeyB})
 	m.Put(ctxB, cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
 	select {
 	case item := <-queueB:
@@ -361,7 +363,7 @@ func TestMultiBackendPutRoutesToSelectedBackend(t *testing.T) {
 	}
 
 	// Selector A routes to backend A's queue.
-	ctxA := cache.WithS3Backend(context.Background(), backendKeyA)
+	ctxA := cache.WithS3Backend(context.Background(), cache.S3BackendSelection{Endpoint: backendKeyA})
 	m.Put(ctxA, cache.AC, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
 	select {
 	case item := <-queueA:
@@ -396,7 +398,7 @@ func TestMultiBackendMissingSelectorRoutesToDefault(t *testing.T) {
 
 	// A selector-carrying request does not touch the fallback meter.
 	before = testutil.ToFloat64(defaultBackendFallback.WithLabelValues("UPLOAD"))
-	m.Put(cache.WithS3Backend(context.Background(), backendKeyB), cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
+	m.Put(cache.WithS3Backend(context.Background(), cache.S3BackendSelection{Endpoint: backendKeyB}), cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
 	if item := <-queueB; item.Rc != nil {
 		_ = item.Rc.Close()
 	}
@@ -483,7 +485,7 @@ func TestMultiBackendUnknownSelectorRefusesOperations(t *testing.T) {
 	m, queueA, queueB := twoBackendMulti(t)
 	m.errorLogger = stdlog.New(&errBuf, "", 0)
 
-	ctx := cache.WithS3Backend(context.Background(), "http://rogue.example.com:9000")
+	ctx := cache.WithS3Backend(context.Background(), cache.S3BackendSelection{Endpoint: "http://rogue.example.com:9000"})
 
 	rc := &closeRecorder{Reader: strings.NewReader("blob")}
 	m.Put(ctx, cache.CAS, hash, 4, 4, rc)
@@ -559,6 +561,151 @@ func TestNewMultiValidation(t *testing.T) {
 	}
 	if len(m.backends) != 2 {
 		t.Fatalf("expected 2 backends, got %d", len(m.backends))
+	}
+}
+
+func TestBucketForContext(t *testing.T) {
+	c := &s3Cache{bucket: "default-bucket"}
+
+	// Selector-less traffic (HTTP side door, single-backend deployments)
+	// targets the configured default bucket.
+	if got := c.bucketForContext(context.Background()); got != "default-bucket" {
+		t.Fatalf("bucketForContext(bare) = %q, want default-bucket", got)
+	}
+
+	// A validated selection's bucket wins: the bucket is per request even
+	// though the minio client is per endpoint.
+	ctx := cache.WithS3Backend(context.Background(),
+		cache.S3BackendSelection{Endpoint: backendKeyA, Bucket: "tenant-bucket"})
+	if got := c.bucketForContext(ctx); got != "tenant-bucket" {
+		t.Fatalf("bucketForContext(selection) = %q, want tenant-bucket", got)
+	}
+
+	// An endpoint-only selection (upstream predating the bucket contract)
+	// falls back to the default bucket.
+	ctx = cache.WithS3Backend(context.Background(), cache.S3BackendSelection{Endpoint: backendKeyA})
+	if got := c.bucketForContext(ctx); got != "default-bucket" {
+		t.Fatalf("bucketForContext(endpoint-only) = %q, want default-bucket", got)
+	}
+}
+
+// fakeS3Backend builds an s3Cache over an in-memory S3 server (the same
+// gofakes3 used by the system test's fakes3 binary) hosting the given
+// buckets behind ONE endpoint — the seam for proving that the bucket is a
+// per-request routing input while the client and endpoint stay shared.
+func fakeS3Backend(t *testing.T, buckets ...string) *s3Cache {
+	t.Helper()
+	backend := s3mem.New()
+	for _, bucket := range buckets {
+		if err := backend.CreateBucket(bucket); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ts := httptest.NewServer(gofakes3.New(backend).Server())
+	t.Cleanup(ts.Close)
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := minio.NewCore(u.Host, &minio.Options{
+		Creds:        credentials.NewStaticV4("KEY", "SECRET", ""),
+		Secure:       false,
+		BucketLookup: minio.BucketLookupPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return &s3Cache{
+		key:          backendKeyA,
+		mcore:        core,
+		bucket:       "default-bucket",
+		objectKey:    objectKeyV1,
+		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
+	}
+}
+
+// TestPerRequestBucketRouting pins the v2 routing semantics: one endpoint,
+// one minio client — but the bucket comes from the request. Uploads captured
+// with different buckets on the same backend must land in their own buckets,
+// reads must only see their own bucket's objects, and selector-less traffic
+// must use the default bucket.
+func TestPerRequestBucketRouting(t *testing.T) {
+	hashTenant := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	hashDefault := "1234560123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	c := fakeS3Backend(t, "default-bucket", "tenant-bucket-1", "tenant-bucket-2")
+
+	ctxBucket1 := cache.WithS3Backend(context.Background(),
+		cache.S3BackendSelection{Endpoint: backendKeyA, Bucket: "tenant-bucket-1"})
+	ctxBucket2 := cache.WithS3Backend(context.Background(),
+		cache.S3BackendSelection{Endpoint: backendKeyA, Bucket: "tenant-bucket-2"})
+
+	// An upload captured with bucket 1 lands in bucket 1 and only there:
+	// visible via a bucket-1 selection, a miss via bucket 2 and the default.
+	c.UploadFile(backendproxy.UploadReq{
+		Hash:       hashTenant,
+		Kind:       cache.CAS,
+		SizeOnDisk: 4,
+		Rc:         io.NopCloser(strings.NewReader("blob")),
+		S3Backend:  cache.S3BackendSelection{Endpoint: backendKeyA, Bucket: "tenant-bucket-1"},
+	})
+	rc, _, err := c.Get(ctxBucket1, cache.CAS, hashTenant, -1)
+	if err != nil || rc == nil {
+		t.Fatalf("Get from bucket 1 = (%v, %v), want hit", rc, err)
+	}
+	data, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil || string(data) != "blob" {
+		t.Fatalf("Get from bucket 1 read (%q, %v), want \"blob\"", data, err)
+	}
+	if rc, _, err := c.Get(ctxBucket2, cache.CAS, hashTenant, -1); err != nil || rc != nil {
+		t.Fatalf("Get from bucket 2 = (%v, %v), want plain miss: same endpoint, different bucket", rc, err)
+	}
+	if rc, _, err := c.Get(context.Background(), cache.CAS, hashTenant, -1); err != nil || rc != nil {
+		t.Fatalf("selector-less Get = (%v, %v), want plain miss (default bucket)", rc, err)
+	}
+
+	// Contains follows the same per-request resolution.
+	if exists, _ := c.Contains(ctxBucket1, cache.CAS, hashTenant, -1); !exists {
+		t.Fatal("Contains via bucket 1 = false, want true")
+	}
+	if exists, _ := c.Contains(ctxBucket2, cache.CAS, hashTenant, -1); exists {
+		t.Fatal("Contains via bucket 2 = true, want false: same endpoint, different bucket")
+	}
+
+	// A selector-less capture (no request-scoped bucket) lands in the
+	// default bucket, invisible to the tenant buckets.
+	c.UploadFile(backendproxy.UploadReq{
+		Hash:       hashDefault,
+		Kind:       cache.CAS,
+		SizeOnDisk: 4,
+		Rc:         io.NopCloser(strings.NewReader("dflt")),
+	})
+	if exists, _ := c.Contains(context.Background(), cache.CAS, hashDefault, -1); !exists {
+		t.Fatal("selector-less Contains for default-bucket object = false, want true")
+	}
+	if exists, _ := c.Contains(ctxBucket1, cache.CAS, hashDefault, -1); exists {
+		t.Fatal("default-bucket object visible via tenant bucket 1")
+	}
+}
+
+func TestPutCapturesS3BackendSelectionForAsyncUpload(t *testing.T) {
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	uploadQueue := make(chan backendproxy.UploadReq, 1)
+	c := &s3Cache{
+		bucket:      "default-bucket",
+		uploadQueue: uploadQueue,
+	}
+
+	selection := cache.S3BackendSelection{Endpoint: backendKeyA, Bucket: "tenant-bucket-1"}
+	c.Put(cache.WithS3Backend(context.Background(), selection), cache.CAS, hash, 4, 4,
+		io.NopCloser(strings.NewReader("blob")))
+
+	item := <-uploadQueue
+	defer func() { _ = item.Rc.Close() }()
+	if item.S3Backend != selection {
+		t.Fatalf("queued upload S3Backend = %+v, want %+v", item.S3Backend, selection)
 	}
 }
 

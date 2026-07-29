@@ -16,12 +16,14 @@ import (
 )
 
 // Multi-backend dispatch: an L1 node fronting several MinIO clusters routes
-// each operation to the backend matching the request-scoped selector (the
-// tenant's pinned backing-store endpoint, lifted from validated gRPC
-// metadata by the server interceptor). Each backend is a full s3Cache — own
-// minio client, transport, and upload queue — so dispatch happens once, at
-// the top, and write-through queue membership is the captured routing
-// decision.
+// each operation to the backend matching the request-scoped selection's
+// endpoint (the tenant's pinned backing-store endpoint, lifted from validated
+// gRPC metadata by the server interceptor). Each backend is a full s3Cache —
+// own minio client, transport, and upload queue — so dispatch happens once,
+// at the top, and write-through queue membership is the captured routing
+// decision. The selection's bucket is NOT a dispatch input: connections are
+// per endpoint, the bucket is applied per request inside the chosen backend
+// (see s3Cache.bucketForContext).
 
 var (
 	// backendUnknown is belt-and-braces coverage for interceptor/config
@@ -57,8 +59,12 @@ type BackendSpec struct {
 	// Key is the tenant-facing selector this backend is registered under
 	// (the allowlisted endpoint URL forwarded as gRPC metadata). It is also
 	// the "backend" metrics label.
-	Key              string
-	Endpoint         string
+	Key      string
+	Endpoint string
+	// Bucket is the backend's default bucket, used for requests that carry
+	// no request-scoped bucket. Requests carrying a validated selection use
+	// its bucket instead; the interceptor has already checked it against the
+	// entry's allowed set, so the spec does not need the extra buckets here.
 	Bucket           string
 	BucketLookupType minio.BucketLookupType
 	Prefix           string
@@ -134,16 +140,16 @@ type multiS3Cache struct {
 // this is a belt-and-braces guard against interceptor/config drift, and
 // must never fall back to a guessed backend.
 func (m *multiS3Cache) backendFor(ctx context.Context, operation string) *s3Cache {
-	selector, ok := cache.S3BackendFromContext(ctx)
+	selection, ok := cache.S3BackendFromContext(ctx)
 	if !ok {
 		defaultBackendFallback.WithLabelValues(operation).Inc()
 		return m.def
 	}
-	backend, ok := m.backends[selector]
+	backend, ok := m.backends[selection.Endpoint]
 	if !ok {
 		backendUnknown.WithLabelValues(operation).Inc()
 		if m.errorLogger != nil {
-			m.errorLogger.Printf("S3 %s unknown backend selector %q; refusing operation", operation, selector)
+			m.errorLogger.Printf("S3 %s unknown backend selector %q; refusing operation", operation, selection.Endpoint)
 		}
 		return nil
 	}

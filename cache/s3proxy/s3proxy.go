@@ -36,9 +36,15 @@ type s3Cache struct {
 	// key identifies this backend in a multi-backend deployment: the
 	// tenant-facing selector from the backends map (also the "backend"
 	// metrics label). Single-backend deployments use the endpoint.
-	key              string
-	mcore            *minio.Core
-	prefix           string
+	key    string
+	mcore  *minio.Core
+	prefix string
+	// bucket is this backend's default bucket: the target for requests that
+	// carry no request-scoped bucket (selector-less HTTP side-door traffic,
+	// single-backend deployments). Requests whose context carries a
+	// validated (endpoint, bucket) selection use that bucket instead — the
+	// minio client and upload queue are per endpoint, but the bucket is per
+	// request (see cache.S3BucketGRPCMetadataKey).
 	bucket           string
 	uploadQueue      chan<- backendproxy.UploadReq
 	accessLogger     cache.Logger
@@ -291,6 +297,17 @@ func (c *s3Cache) objectKeyForContext(ctx context.Context, hash string, kind cac
 	return c.objectKeyForPrefix(prefix, hash, kind)
 }
 
+// bucketForContext resolves the bucket for a request: the validated
+// request-scoped bucket when the trust interceptor attached one, otherwise
+// this backend's configured default bucket (selector-less traffic, and
+// upstreams that predate the bucket half of the wire contract).
+func (c *s3Cache) bucketForContext(ctx context.Context) string {
+	if selection, ok := cache.S3BackendFromContext(ctx); ok && selection.Bucket != "" {
+		return selection.Bucket
+	}
+	return c.bucket
+}
+
 func (c *s3Cache) logMissingRequiredStoragePrefix(operation string, kind cache.EntryKind, hash string) {
 	if c.metrics != nil {
 		c.metrics.IncPrefixMissing(operation)
@@ -334,6 +351,14 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	}
 	objectKey := c.objectKeyForPrefix(prefix, item.Hash, item.Kind)
 
+	// The bucket captured at enqueue time, like the storage prefix above:
+	// uploads are asynchronous, so the routing decision must travel with the
+	// item. An empty capture (selector-less traffic) means the default bucket.
+	bucket := item.S3Backend.Bucket
+	if bucket == "" {
+		bucket = c.bucket
+	}
+
 	opts := minio.PutObjectOptions{
 		UserMetadata: map[string]string{
 			"Content-Type": "application/octet-stream",
@@ -352,7 +377,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 
 	_, err := c.mcore.PutObject(
 		ctx,
-		c.bucket,        // bucketName
+		bucket,          // bucketName
 		objectKey,       // objectName
 		item.Rc,         // reader
 		item.SizeOnDisk, // objectSize
@@ -361,7 +386,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 		opts,            // metadata
 	)
 
-	logResponse(c.accessLogger, "UPLOAD", c.bucket, objectKey, err)
+	logResponse(c.accessLogger, "UPLOAD", bucket, objectKey, err)
 
 	status, reason := classifyUploadOutcome(err)
 	c.observeUpload(context.Background(), item, status, reason)
@@ -401,6 +426,12 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 	}
 	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
 	labels, _ := cache.MetricsLabelsFromContext(ctx)
+	// Capture the (endpoint, bucket) selection at enqueue time for the same
+	// reason as the storage prefix: the request context is gone when upload
+	// workers run, and the bucket is per request. (The endpoint half is
+	// already settled — this backend's queue IS the endpoint routing
+	// decision — but the pair travels together.)
+	selection, _ := cache.S3BackendFromContext(ctx)
 
 	select {
 	case c.uploadQueue <- backendproxy.UploadReq{
@@ -412,6 +443,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		StoragePrefix:              prefix,
 		RequestScopedStoragePrefix: requestScopedPrefix,
 		RequireStoragePrefix:       requirePrefix,
+		S3Backend:                  selection,
 		MetricsLabels:              labels,
 	}:
 		uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
@@ -452,29 +484,30 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 		c.logMissingRequiredStoragePrefix("DOWNLOAD", kind, hash)
 	}
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
+	bucket := c.bucketForContext(ctx)
 
 	rc, info, _, err := c.mcore.GetObject(
 		ctx,
-		c.bucket,                 // bucketName
+		bucket,                   // bucketName
 		objectKey,                // objectName
 		minio.GetObjectOptions{}, // opts
 	)
 	if err != nil {
 		cacheMisses.WithLabelValues(c.key).Inc()
 		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
-			logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, errNotFound)
+			logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, errNotFound)
 			return nil, -1, nil
 		}
-		logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, err)
+		logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, err)
 		return nil, -1, err
 	}
 	cacheHits.WithLabelValues(c.key).Inc()
 
 	if c.updateTimestamps {
-		c.UpdateModificationTimestamp(ctx, c.bucket, objectKey)
+		c.UpdateModificationTimestamp(ctx, bucket, objectKey)
 	}
 
-	logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, nil)
+	logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, nil)
 
 	if kind == cache.CAS && c.v2mode {
 		return casblob.ExtractLogicalSize(rc)
@@ -491,10 +524,11 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 		c.logMissingRequiredStoragePrefix("CONTAINS", kind, hash)
 	}
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
+	bucket := c.bucketForContext(ctx)
 
 	s, err := c.mcore.StatObject(
 		ctx,
-		c.bucket,                  // bucketName
+		bucket,                    // bucketName
 		objectKey,                 // objectName
 		minio.StatObjectOptions{}, // opts
 	)
@@ -517,7 +551,7 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 		}
 	}
 
-	logResponse(c.accessLogger, "CONTAINS", c.bucket, objectKey, err)
+	logResponse(c.accessLogger, "CONTAINS", bucket, objectKey, err)
 
 	return exists, size
 }
