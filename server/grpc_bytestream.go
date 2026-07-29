@@ -432,6 +432,13 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 
 	var resp bytestream.WriteResponse
 	pr, pw := io.Pipe()
+	// Tear down the pipe on every handler exit path. Without this, an early
+	// cache.Put failure whose reader does not close the underlying pipe -
+	// e.g. malformed zstd input, where the pooled decoder's Close only resets
+	// the decoder - leaves the receive goroutine blocked in pw.Write forever,
+	// leaking the goroutine and the payload buffer it holds. Closing the
+	// reader unblocks any pending or future pw.Write with io.ErrClosedPipe.
+	defer func() { _ = pr.Close() }()
 
 	putResult := make(chan error, 1)
 	recvResult := make(chan error, 1)

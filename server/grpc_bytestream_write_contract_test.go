@@ -1,14 +1,18 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	stdlog "log"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
@@ -103,6 +107,17 @@ func (s *contractWriteServer) Recv() (*bytestream.WriteRequest, error) {
 }
 
 func (s *contractWriteServer) SendAndClose(resp *bytestream.WriteResponse) error {
+	// The response must only be sent after the recv loop terminated, i.e.
+	// after every returned payload byte was consumed. No race tolerance here:
+	// cache.Put has fully returned (through putResult) before the handler
+	// responds, so the counter is final. Embedders recycle the last payload
+	// buffer on this signal; an early-response refactor must fail this test.
+	if consumed := s.cache.consumed.Load(); consumed != s.returned {
+		s.t.Errorf(
+			"response sent before the final payload was consumed: returned %d bytes, consumed %d",
+			s.returned, consumed,
+		)
+	}
 	s.response = resp
 	return nil
 }
@@ -159,5 +174,65 @@ func TestWriteRecvLoopConsumesPayloadBeforeNextRecv(t *testing.T) {
 	}
 	if consumed := trackingCache.consumed.Load(); consumed != int64(len(content)) {
 		t.Fatalf("consumed %d bytes, want %d", consumed, len(content))
+	}
+}
+
+// malformedZstdWriteServer streams an endless sequence of chunks that are not
+// valid zstd frames under a compressed-blobs resource name.
+type malformedZstdWriteServer struct {
+	grpc.ServerStream
+	sentFirst bool
+}
+
+func (s *malformedZstdWriteServer) Context() context.Context { return context.Background() }
+
+func (s *malformedZstdWriteServer) Recv() (*bytestream.WriteRequest, error) {
+	req := &bytestream.WriteRequest{
+		Data: bytes.Repeat([]byte{0x5A}, 64*1024),
+	}
+	if !s.sentFirst {
+		s.sentFirst = true
+		req.ResourceName = "uploads/uuid/compressed-blobs/zstd/" +
+			strings.Repeat("a", 64) + "/1048576"
+	}
+	return req, nil
+}
+
+func (s *malformedZstdWriteServer) SendAndClose(*bytestream.WriteResponse) error { return nil }
+
+// TestWriteMalformedZstdDoesNotLeakRecvGoroutine: when cache.Put fails early
+// on undecodable zstd input, the pooled decoder's Close only resets the
+// decoder - it does not close the underlying pipe reader - so without the
+// handler's deferred pr.Close() the receive goroutine stays blocked in
+// pw.Write forever, pinning its payload chunk.
+func TestWriteMalformedZstdDoesNotLeakRecvGoroutine(t *testing.T) {
+	trackingCache := &consumptionTrackingCache{}
+	discard := stdlog.New(io.Discard, "", 0)
+	s := &grpcServer{
+		cache:               trackingCache,
+		accessLogger:        discard,
+		errorLogger:         discard,
+		maxCasBlobSizeBytes: 1 << 40,
+		readChunkSizeBytes:  maxChunkSize,
+	}
+
+	// Warm the zstd decoder pool first: pooled decoders keep background
+	// goroutines alive, which would otherwise skew the baseline below.
+	if err := s.Write(&malformedZstdWriteServer{}); err == nil {
+		t.Fatal("expected malformed zstd write to fail")
+	}
+
+	baseline := runtime.NumGoroutine()
+	if err := s.Write(&malformedZstdWriteServer{}); err == nil {
+		t.Fatal("expected malformed zstd write to fail")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > baseline {
+		if time.Now().After(deadline) {
+			t.Fatalf("receive goroutine leaked: %d goroutines, baseline %d",
+				runtime.NumGoroutine(), baseline)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
