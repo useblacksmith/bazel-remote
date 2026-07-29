@@ -15,6 +15,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -76,6 +77,14 @@ func (c *azBlobCache) Get(ctx context.Context, kind cache.EntryKind, hash string
 	resp, err := client.DownloadStream(ctx, nil)
 	if err != nil {
 		cacheMisses.Inc()
+		// Same error contract as the s3proxy/grpcproxy backends: a missing
+		// blob is a cache miss (nil error), never a request-failing error —
+		// disk.go wraps any returned error as INTERNAL and surfaces it to
+		// the build client.
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			logResponse(c.accessLogger, "DOWNLOAD", c.storageAccount, c.container, key, errNotFound)
+			return nil, -1, nil
+		}
 		logResponse(c.accessLogger, "DOWNLOAD", c.storageAccount, c.container, key, err)
 		return nil, -1, err
 	}
@@ -121,6 +130,16 @@ func (c *azBlobCache) Contains(ctx context.Context, kind cache.EntryKind, hash s
 	} else if kind != cache.CAS || !c.v2mode {
 		if props.ContentLength != nil {
 			size = *props.ContentLength
+		}
+	}
+
+	if exists {
+		// Surface the stored object size for LRU closure capture without
+		// changing the value returned to the validator (same hook as
+		// s3proxy.Contains); for CAS/v2 this is the only place the on-disk
+		// size is available. A nil sink (the common case) is a no-op.
+		if sink, ok := cache.LeafSizeSinkFromContext(ctx); ok && props.ContentLength != nil && *props.ContentLength >= 0 {
+			sink.RecordLeafSize(hash, *props.ContentLength, true)
 		}
 	}
 

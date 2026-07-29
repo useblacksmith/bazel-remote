@@ -818,7 +818,12 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	sizeOnDisk, err = io.Copy(tf, r)
 	_ = tf.Close()
 	if err != nil {
-		return nil, -1, internalErr(err)
+		// The proxy stream died mid-fill. Nothing has been sent to the client
+		// yet (the fill lands in a temp file first, discarded by the deferred
+		// cleanup), so degrade to a cache miss instead of failing the request:
+		// a backend that disappears mid-read must cost a rebuild, not a build.
+		log.Printf("Proxy fill for %s %s failed mid-stream, treating as miss: %v", kind, hash, err)
+		return nil, -1, nil
 	}
 
 	rcf, err := os.Open(blobFile)

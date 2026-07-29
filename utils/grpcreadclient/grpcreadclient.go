@@ -599,9 +599,9 @@ func checkBytestreamWrite(bsClient bytestream.ByteStreamClient, shouldWork bool)
 
 func checkHealth(healthClient grpc_health_v1.HealthClient) error {
 
-	const grpcHealthServiceName = "/grpc.health.v1.Health/Check"
-
-	req := grpc_health_v1.HealthCheckRequest{Service: grpcHealthServiceName}
+	// Check the overall-server health surface (the empty service name),
+	// which is what bazel-remote marks SERVING.
+	req := grpc_health_v1.HealthCheckRequest{Service: ""}
 	resp, err := healthClient.Check(context.Background(), &req)
 	if err != nil {
 		return fmt.Errorf("failed to check health status: %w", err)
