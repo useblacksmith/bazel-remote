@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"path"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
@@ -32,8 +33,18 @@ type Metrics interface {
 }
 
 type s3Cache struct {
-	mcore            *minio.Core
-	prefix           string
+	// key identifies this backend in a multi-backend deployment: the
+	// tenant-facing selector from the backends map (also the "backend"
+	// metrics label). Single-backend deployments use the endpoint.
+	key    string
+	mcore  *minio.Core
+	prefix string
+	// bucket is this backend's default bucket: the target for requests that
+	// carry no request-scoped bucket (selector-less HTTP side-door traffic,
+	// single-backend deployments). Requests whose context carries a
+	// validated (endpoint, bucket) selection use that bucket instead — the
+	// minio client and upload queue are per endpoint, but the bucket is per
+	// request (see cache.S3BucketGRPCMetadataKey).
 	bucket           string
 	uploadQueue      chan<- backendproxy.UploadReq
 	accessLogger     cache.Logger
@@ -54,18 +65,156 @@ func WithOperationObserver(observer cache.OperationObserver) Option {
 }
 
 var (
-	cacheHits = promauto.NewCounter(prometheus.CounterOpts{
+	cacheHits = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_cache_hits",
 		Help: "The total number of s3 backend cache hits",
-	})
-	cacheMisses = promauto.NewCounter(prometheus.CounterOpts{
+	}, []string{"backend"})
+	cacheMisses = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_cache_misses",
 		Help: "The total number of s3 backend cache misses",
-	})
+	}, []string{"backend"})
+	uploadQueueDropped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "bazel_remote_s3_upload_queue_dropped_total",
+		Help: "Backend uploads dropped because the S3 upload queue was full.",
+	}, []string{"backend"})
+	uploadQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "bazel_remote_s3_upload_queue_depth",
+		Help: "Queued backend uploads awaiting an S3 upload worker.",
+	}, []string{"backend"})
+	prefixMissing = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "bazel_remote_s3_prefix_missing_total",
+		Help: "Requests that required a request-scoped storage prefix but carried none (configured fallback prefix used).",
+	}, []string{"operation"})
 )
+
+// PrometheusMetrics returns a Metrics implementation backed by this package's
+// Prometheus counters. Standalone deployments (e.g. an L1 node) use it so the
+// prefix-safety signal exports without an embedder-provided sink.
+func PrometheusMetrics() Metrics {
+	return promMetricsSink{}
+}
+
+type promMetricsSink struct{}
+
+func (promMetricsSink) IncPrefixMissing(operation string) {
+	prefixMissing.WithLabelValues(operation).Inc()
+}
 
 // Used in place of minio's verbose "NoSuchKey" error.
 var errNotFound = errors.New("NOT FOUND")
+
+// Connection hygiene defaults. MinIO clusters have no load balancer: the
+// endpoint is a DNS name round-robinning bare node IPs, so load spread
+// depends on connections being (re-)dialed often enough to sample fresh DNS
+// answers. Go's http.Transport resolves DNS only at dial time and reuses a
+// pooled connection indefinitely while it keeps getting picked up within
+// IdleConnTimeout, so a long-lived consolidating proxy (an L1 node absorbing
+// thousands of host pools) can pin its traffic to whichever nodes it happened
+// to dial first. Two measures restore deliberate spread:
+//
+//   - a modest idle-conn cap (32 per host key, 64 total per backend — the
+//     execution plan's 16–64 band, and double minio-go's own 16 to absorb
+//     request bursts without churn; previously the unset flag clobbered the
+//     transport to Go's per-host fallback of 2),
+//   - periodic CloseIdleConnections() (config default: every 5 minutes,
+//     resolved at config load; non-positive disables), which closes whatever
+//     is momentarily idle so subsequent requests re-dial and re-resolve,
+//     rotating across MinIO nodes within a few intervals. Dials are cheap
+//     here (plaintext, one LAN RTT), so the recycle interval errs toward
+//     responsiveness; the per-MinIO-node balance dashboard is the acceptance
+//     gauge.
+const (
+	defaultMaxIdleConns        = 64
+	defaultMaxIdleConnsPerHost = 32
+)
+
+// uploadTimeout bounds a single backend PutObject, mirroring grpcproxy's
+// uploadTimeout: a hung MinIO connection must not pin one of this backend's
+// upload workers forever. The bound is generous (large CAS blobs can be slow
+// on a busy link); it exists to reclaim workers, not to police latency. A
+// var only so tests can shrink it.
+var uploadTimeout = 10 * time.Minute
+
+func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval time.Duration,
+	storageMode string, accessLogger cache.Logger, errorLogger cache.Logger,
+	numUploaders, maxQueuedUploads int, metrics Metrics, options ...Option) (*s3Cache, error) {
+
+	if spec.Credentials == nil {
+		return nil, fmt.Errorf("failed to determine s3proxy credentials for backend %q", spec.Key)
+	}
+
+	secure := !spec.DisableSSL
+	tr, err := minio.DefaultTransport(secure)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create default minio transport: %w", err)
+	}
+
+	if spec.MaxIdleConns > 0 {
+		tr.MaxIdleConns = spec.MaxIdleConns
+		tr.MaxIdleConnsPerHost = spec.MaxIdleConns
+	} else {
+		tr.MaxIdleConns = defaultMaxIdleConns
+		tr.MaxIdleConnsPerHost = defaultMaxIdleConnsPerHost
+	}
+
+	// connRecycleInterval arrives fully resolved from config load (the
+	// default is applied there); non-positive disables recycling.
+	if connRecycleInterval > 0 {
+		go func() {
+			for range time.Tick(connRecycleInterval) {
+				tr.CloseIdleConnections()
+			}
+		}()
+	}
+
+	minioOpts := &minio.Options{
+		Creds:        spec.Credentials,
+		BucketLookup: spec.BucketLookupType,
+
+		Region:    spec.Region,
+		Secure:    secure,
+		Transport: tr,
+	}
+	minioCore, err := minio.NewCore(spec.Endpoint, minioOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	if storageMode != "zstd" && storageMode != "uncompressed" {
+		return nil, fmt.Errorf("unsupported storage mode for the s3proxy backend: %q, must be one of \"zstd\" or \"uncompressed\"",
+			storageMode)
+	}
+
+	key := spec.Key
+	if key == "" {
+		key = spec.Endpoint
+	}
+
+	c := &s3Cache{
+		key:              key,
+		mcore:            minioCore,
+		prefix:           spec.Prefix,
+		bucket:           spec.Bucket,
+		accessLogger:     accessLogger,
+		errorLogger:      errorLogger,
+		metrics:          metrics,
+		v2mode:           storageMode == "zstd",
+		updateTimestamps: updateTimestamps,
+	}
+	for _, opt := range options {
+		opt(c)
+	}
+
+	if c.v2mode {
+		c.objectKey = objectKeyV2
+	} else {
+		c.objectKey = objectKeyV1
+	}
+
+	c.uploadQueue = backendproxy.StartUploaders(c, numUploaders, maxQueuedUploads)
+
+	return c, nil
+}
 
 // New returns a new instance of the S3-API based cache
 func New(
@@ -79,6 +228,7 @@ func New(
 	UpdateTimestamps bool,
 	Region string,
 	MaxIdleConns int,
+	ConnRecycleInterval time.Duration,
 
 	storageMode string, accessLogger cache.Logger,
 	errorLogger cache.Logger, numUploaders, maxQueuedUploads int,
@@ -86,62 +236,20 @@ func New(
 
 	fmt.Println("Using S3 backend.")
 
-	var minioCore *minio.Core
-	var err error
-
-	if Credentials == nil {
-		log.Fatalf("Failed to determine s3proxy credentials")
-	}
-
-	secure := !DisableSSL
-	tr, err := minio.DefaultTransport(secure)
-	if err != nil {
-		log.Fatalf("Failed to create default minio transport: %v", err)
-	}
-
-	tr.MaxIdleConns = MaxIdleConns
-	tr.MaxIdleConnsPerHost = MaxIdleConns
-
-	// Initialize minio client with credentials
-	minioOpts := &minio.Options{
-		Creds:        Credentials,
-		BucketLookup: BucketLookupType,
-
-		Region:    Region,
-		Secure:    secure,
-		Transport: tr,
-	}
-	minioCore, err = minio.NewCore(Endpoint, minioOpts)
+	c, err := newBackend(BackendSpec{
+		Endpoint:         Endpoint,
+		Bucket:           Bucket,
+		BucketLookupType: BucketLookupType,
+		Prefix:           Prefix,
+		Credentials:      Credentials,
+		DisableSSL:       DisableSSL,
+		Region:           Region,
+		MaxIdleConns:     MaxIdleConns,
+	}, UpdateTimestamps, ConnRecycleInterval, storageMode, accessLogger, errorLogger,
+		numUploaders, maxQueuedUploads, metrics, options...)
 	if err != nil {
 		log.Fatalln(err)
 	}
-
-	if storageMode != "zstd" && storageMode != "uncompressed" {
-		log.Fatalf("Unsupported storage mode for the s3proxy backend: %q, must be one of \"zstd\" or \"uncompressed\"",
-			storageMode)
-	}
-
-	c := &s3Cache{
-		mcore:            minioCore,
-		prefix:           Prefix,
-		bucket:           Bucket,
-		accessLogger:     accessLogger,
-		errorLogger:      errorLogger,
-		metrics:          metrics,
-		v2mode:           storageMode == "zstd",
-		updateTimestamps: UpdateTimestamps,
-	}
-	for _, opt := range options {
-		opt(c)
-	}
-
-	if c.v2mode {
-		c.objectKey = objectKeyV2
-	} else {
-		c.objectKey = objectKeyV1
-	}
-
-	c.uploadQueue = backendproxy.StartUploaders(c, numUploaders, maxQueuedUploads)
 
 	return c
 }
@@ -189,6 +297,17 @@ func (c *s3Cache) objectKeyForContext(ctx context.Context, hash string, kind cac
 	return c.objectKeyForPrefix(prefix, hash, kind)
 }
 
+// bucketForContext resolves the bucket for a request: the validated
+// request-scoped bucket when the trust interceptor attached one, otherwise
+// this backend's configured default bucket (selector-less traffic, and
+// upstreams that predate the bucket half of the wire contract).
+func (c *s3Cache) bucketForContext(ctx context.Context) string {
+	if selection, ok := cache.S3BackendFromContext(ctx); ok && selection.Bucket != "" {
+		return selection.Bucket
+	}
+	return c.bucket
+}
+
 func (c *s3Cache) logMissingRequiredStoragePrefix(operation string, kind cache.EntryKind, hash string) {
 	if c.metrics != nil {
 		c.metrics.IncPrefixMissing(operation)
@@ -232,6 +351,14 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	}
 	objectKey := c.objectKeyForPrefix(prefix, item.Hash, item.Kind)
 
+	// The bucket captured at enqueue time, like the storage prefix above:
+	// uploads are asynchronous, so the routing decision must travel with the
+	// item. An empty capture (selector-less traffic) means the default bucket.
+	bucket := item.S3Backend.Bucket
+	if bucket == "" {
+		bucket = c.bucket
+	}
+
 	opts := minio.PutObjectOptions{
 		UserMetadata: map[string]string{
 			"Content-Type": "application/octet-stream",
@@ -243,9 +370,14 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	// already_exists instead of created.
 	opts.SetMatchETagExcept("*")
 
+	// Uploads run on background workers with no request deadline; the
+	// timeout reclaims a worker pinned by a hung MinIO connection.
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancel()
+
 	_, err := c.mcore.PutObject(
-		context.Background(),
-		c.bucket,        // bucketName
+		ctx,
+		bucket,          // bucketName
 		objectKey,       // objectName
 		item.Rc,         // reader
 		item.SizeOnDisk, // objectSize
@@ -254,10 +386,11 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 		opts,            // metadata
 	)
 
-	logResponse(c.accessLogger, "UPLOAD", c.bucket, objectKey, err)
+	logResponse(c.accessLogger, "UPLOAD", bucket, objectKey, err)
 
 	status, reason := classifyUploadOutcome(err)
 	c.observeUpload(context.Background(), item, status, reason)
+	uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
 
 	_ = item.Rc.Close()
 }
@@ -293,6 +426,12 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 	}
 	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
 	labels, _ := cache.MetricsLabelsFromContext(ctx)
+	// Capture the (endpoint, bucket) selection at enqueue time for the same
+	// reason as the storage prefix: the request context is gone when upload
+	// workers run, and the bucket is per request. (The endpoint half is
+	// already settled — this backend's queue IS the endpoint routing
+	// decision — but the pair travels together.)
+	selection, _ := cache.S3BackendFromContext(ctx)
 
 	select {
 	case c.uploadQueue <- backendproxy.UploadReq{
@@ -304,10 +443,13 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		StoragePrefix:              prefix,
 		RequestScopedStoragePrefix: requestScopedPrefix,
 		RequireStoragePrefix:       requirePrefix,
+		S3Backend:                  selection,
 		MetricsLabels:              labels,
 	}:
+		uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
 	default:
-		c.errorLogger.Printf("too many uploads queued\n")
+		c.errorLogger.Printf("too many uploads queued for S3 backend %s\n", c.key)
+		uploadQueueDropped.WithLabelValues(c.key).Inc()
 		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
 			Method: "backend_upload",
 			Status: "dropped",
@@ -342,30 +484,30 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 		c.logMissingRequiredStoragePrefix("DOWNLOAD", kind, hash)
 	}
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
+	bucket := c.bucketForContext(ctx)
 
 	rc, info, _, err := c.mcore.GetObject(
 		ctx,
-		c.bucket,                 // bucketName
+		bucket,                   // bucketName
 		objectKey,                // objectName
 		minio.GetObjectOptions{}, // opts
 	)
 	if err != nil {
+		cacheMisses.WithLabelValues(c.key).Inc()
 		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
-			cacheMisses.Inc()
-			logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, errNotFound)
+			logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, errNotFound)
 			return nil, -1, nil
 		}
-		cacheMisses.Inc()
-		logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, err)
+		logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, err)
 		return nil, -1, err
 	}
-	cacheHits.Inc()
+	cacheHits.WithLabelValues(c.key).Inc()
 
 	if c.updateTimestamps {
-		c.UpdateModificationTimestamp(ctx, c.bucket, objectKey)
+		c.UpdateModificationTimestamp(ctx, bucket, objectKey)
 	}
 
-	logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, nil)
+	logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, nil)
 
 	if kind == cache.CAS && c.v2mode {
 		return casblob.ExtractLogicalSize(rc)
@@ -382,10 +524,11 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 		c.logMissingRequiredStoragePrefix("CONTAINS", kind, hash)
 	}
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
+	bucket := c.bucketForContext(ctx)
 
 	s, err := c.mcore.StatObject(
 		ctx,
-		c.bucket,                  // bucketName
+		bucket,                    // bucketName
 		objectKey,                 // objectName
 		minio.StatObjectOptions{}, // opts
 	)
@@ -408,7 +551,7 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 		}
 	}
 
-	logResponse(c.accessLogger, "CONTAINS", c.bucket, objectKey, err)
+	logResponse(c.accessLogger, "CONTAINS", bucket, objectKey, err)
 
 	return exists, size
 }

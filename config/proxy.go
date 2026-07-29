@@ -132,6 +132,31 @@ func (c *Config) setProxy() error {
 	}
 
 	if c.S3CloudStorage != nil {
+		// Multi-backend mode: an allowlisted selector → backend map, one
+		// s3proxy backend (own minio client, transport, upload queue) per
+		// entry, routed per-request from the validated gRPC metadata
+		// selector on the context.
+		if len(c.S3CloudStorage.Backends) > 0 {
+			specs, err := c.S3CloudStorage.backendSpecs()
+			if err != nil {
+				return err
+			}
+			// Upload pools are per backend; resolve the (lower) multi-backend
+			// defaults unless explicitly overridden at the top level.
+			numUploaders, maxQueuedUploads := c.perBackendUploadLimits()
+			proxy, err := s3proxy.NewMulti(
+				specs,
+				c.S3CloudStorage.UpdateTimestamps,
+				c.S3CloudStorage.ConnRecycleInterval,
+				c.StorageMode, c.AccessLogger, c.ErrorLogger, numUploaders, maxQueuedUploads,
+				s3proxy.PrometheusMetrics())
+			if err != nil {
+				return err
+			}
+			c.ProxyBackend = proxy
+			return nil
+		}
+
 		creds, err := c.S3CloudStorage.GetCredentials()
 		if err != nil {
 			return err
@@ -141,6 +166,9 @@ func (c *Config) setProxy() error {
 		if err != nil {
 			return err
 		}
+		// Standalone deployments (e.g. an L1 node) have no embedder-provided
+		// metrics sink; export the prefix-safety signal via this package's
+		// own Prometheus counters so it is never dark.
 		c.ProxyBackend = s3proxy.New(
 			c.S3CloudStorage.Endpoint,
 			c.S3CloudStorage.Bucket,
@@ -151,8 +179,9 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.UpdateTimestamps,
 			c.S3CloudStorage.Region,
 			c.S3CloudStorage.MaxIdleConns,
+			c.S3CloudStorage.ConnRecycleInterval,
 			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
-			nil)
+			s3proxy.PrometheusMetrics())
 		return nil
 	}
 
