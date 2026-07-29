@@ -421,6 +421,17 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 	streamInterceptors := []grpc.StreamServerInterceptor{}
 	unaryInterceptors := []grpc.UnaryServerInterceptor{}
 
+	// grpc_prometheus must be the outermost (first appended) interceptor so
+	// that RPCs rejected by the trust/selector/auth interceptors below still
+	// appear in grpc_server_handled_total with their status code. The
+	// dedicated rejection counters remain the primary alerting signal; this
+	// keeps the generic RPC series in agreement with them.
+	if c.EnableEndpointMetrics {
+		streamInterceptors = append(streamInterceptors, grpc_prometheus.StreamServerInterceptor)
+		unaryInterceptors = append(unaryInterceptors, grpc_prometheus.UnaryServerInterceptor)
+		grpc_prometheus.EnableHandlingTimeHistogram(grpc_prometheus.WithHistogramBuckets(c.MetricsDurationBuckets))
+	}
+
 	// L1 mode: trust upstream bazel-remote instances to forward per-tenant
 	// storage prefixes as request metadata. Trust-on is fail-closed: every
 	// cache RPC must carry exactly one valid prefix (and the shared secret,
@@ -448,12 +459,6 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 		log.Printf("Routing S3 operations by forwarded backend-selector gRPC metadata, fail-closed (%d allowlisted backends)", len(allowed))
 		streamInterceptors = append(streamInterceptors, server.GRPCS3BackendStreamServerInterceptor(allowed))
 		unaryInterceptors = append(unaryInterceptors, server.GRPCS3BackendUnaryServerInterceptor(allowed))
-	}
-
-	if c.EnableEndpointMetrics {
-		streamInterceptors = append(streamInterceptors, grpc_prometheus.StreamServerInterceptor)
-		unaryInterceptors = append(unaryInterceptors, grpc_prometheus.UnaryServerInterceptor)
-		grpc_prometheus.EnableHandlingTimeHistogram(grpc_prometheus.WithHistogramBuckets(c.MetricsDurationBuckets))
 	}
 
 	if c.TLSConfig != nil {
