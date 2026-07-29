@@ -453,12 +453,14 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 	// without another Recv. The handler sends its response only after this
 	// goroutine has posted to recvResult/putResult and stopped touching req.
 	//
-	// Embedders depend on this ordering to recycle the backing arrays of
-	// decoded WriteRequest payloads (see the FA agent's write-request buffer
-	// controller and TestWriteRecvLoopConsumesPayloadBeforeNextRecv). If a
-	// rebase introduces pipelining, buffering of req.Data across iterations,
-	// or an early response, that reuse becomes silent cross-stream cache
-	// corruption - re-verify the embedder contract before changing this loop.
+	// The s.writePayloadConsumed callback below is the explicit ownership
+	// hand-off for embedders that decode WriteRequest payloads into reusable
+	// buffers (see WithWritePayloadConsumed and the FA agent's write-request
+	// buffer controller). If this loop is ever restructured, the callback
+	// must move with the true consumption point; firing it while req.Data is
+	// still referenced becomes silent cross-stream cache corruption. Pinned
+	// by TestWriteRecvLoopConsumesPayloadBeforeNextRecv and
+	// TestWritePayloadConsumedFiresAfterConsumption.
 	go func() {
 		firstIteration := true
 		var resourceName string
@@ -567,6 +569,12 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 				return
 			}
 			resp.CommittedSize += int64(n)
+			if s.writePayloadConsumed != nil {
+				// pw.Write returned, so the pipe reader has copied all of
+				// req.Data out: ownership of the payload's backing array
+				// returns to the embedder.
+				s.writePayloadConsumed(req)
+			}
 
 			if cmp == casblob.Identity && resp.CommittedSize > size {
 				msg := fmt.Sprintf("Client sent more than %d data! %d", size, resp.CommittedSize)

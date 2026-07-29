@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/semaphore"
+	"google.golang.org/genproto/googleapis/bytestream"
 )
 
 const (
@@ -74,6 +75,32 @@ func WithReadChunkSizeBytes(chunkSizeBytes int64) GRPCServerOption {
 		if chunkSizeBytes > 0 {
 			s.readChunkSizeBytes = chunkSizeBytes
 		}
+		return nil
+	}
+}
+
+// WithWritePayloadConsumed registers a callback the ByteStream Write handler
+// invokes exactly once per received message, after that message's Data has
+// been fully consumed (the pipe write to the cache reader returned). It is
+// the explicit ownership-transfer point for embedders that decode
+// WriteRequest payloads into reusable buffers: once the callback fires, the
+// server holds no reference to req.Data and the embedder may recycle its
+// backing array.
+//
+// The callback runs on the Write receive goroutine, so implementations must
+// be fast and must not block. Messages whose payload is never consumed
+// (errors, skipped writes because the blob already exists, stream teardown)
+// do not trigger the callback; embedders must treat those payloads as
+// possibly still referenced.
+//
+// MAINTAINERS: if the Write receive loop is ever restructured (pipelining,
+// buffering payloads across iterations), this callback must move with the
+// point where the payload is truly consumed. Firing it early turns embedder
+// buffer reuse into silent cross-stream cache corruption. See
+// TestWritePayloadConsumedFiresAfterConsumption.
+func WithWritePayloadConsumed(fn func(*bytestream.WriteRequest)) GRPCServerOption {
+	return func(s *grpcServer) error {
+		s.writePayloadConsumed = fn
 		return nil
 	}
 }

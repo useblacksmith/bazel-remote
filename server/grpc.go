@@ -48,6 +48,9 @@ type grpcServer struct {
 	runtimeMetrics         RuntimeMetrics
 	readLimiter            *readLimiter
 	sourceBuffers          *sourceBufferPool
+	// writePayloadConsumed, when set, is invoked once per fully-consumed
+	// ByteStream WriteRequest; see WithWritePayloadConsumed.
+	writePayloadConsumed func(*bytestream.WriteRequest)
 }
 
 var readOnlyMethods = map[string]struct{}{

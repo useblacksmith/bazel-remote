@@ -122,13 +122,9 @@ func (s *contractWriteServer) SendAndClose(resp *bytestream.WriteResponse) error
 	return nil
 }
 
-// TestWriteRecvLoopConsumesPayloadBeforeNextRecv pins the consumption
-// contract embedders rely on to recycle decoded WriteRequest payload buffers:
-// by the time the Write receive loop asks for message N+1, message N's Data
-// has been fully consumed (pw.Write returned after the pipe reader copied the
-// bytes out). If this test starts failing after a rebase, payload-buffer
-// reuse in embedders becomes cache corruption - do not weaken it.
-func TestWriteRecvLoopConsumesPayloadBeforeNextRecv(t *testing.T) {
+// buildContractWriteRequests returns a 4-chunk upload of deterministic
+// content, plus the full content for committed-size assertions.
+func buildContractWriteRequests() ([]*bytestream.WriteRequest, []byte) {
 	const chunkSize = 256 * 1024
 	const chunks = 4
 
@@ -151,6 +147,17 @@ func TestWriteRecvLoopConsumesPayloadBeforeNextRecv(t *testing.T) {
 		}
 		requests = append(requests, req)
 	}
+	return requests, content
+}
+
+// TestWriteRecvLoopConsumesPayloadBeforeNextRecv pins the consumption
+// contract embedders rely on to recycle decoded WriteRequest payload buffers:
+// by the time the Write receive loop asks for message N+1, message N's Data
+// has been fully consumed (pw.Write returned after the pipe reader copied the
+// bytes out). If this test starts failing after a rebase, payload-buffer
+// reuse in embedders becomes cache corruption - do not weaken it.
+func TestWriteRecvLoopConsumesPayloadBeforeNextRecv(t *testing.T) {
+	requests, content := buildContractWriteRequests()
 
 	trackingCache := &consumptionTrackingCache{}
 	discard := stdlog.New(io.Discard, "", 0)
@@ -174,6 +181,68 @@ func TestWriteRecvLoopConsumesPayloadBeforeNextRecv(t *testing.T) {
 	}
 	if consumed := trackingCache.consumed.Load(); consumed != int64(len(content)) {
 		t.Fatalf("consumed %d bytes, want %d", consumed, len(content))
+	}
+}
+
+// TestWritePayloadConsumedFiresAfterConsumption pins the
+// WithWritePayloadConsumed contract: the callback fires exactly once per
+// received message, in order, with that message's request, and only after
+// the message's payload bytes were consumed by the cache reader. Embedders
+// recycle payload backing arrays on this signal; firing it early becomes
+// silent cross-stream cache corruption - do not weaken this test.
+func TestWritePayloadConsumedFiresAfterConsumption(t *testing.T) {
+	requests, content := buildContractWriteRequests()
+
+	trackingCache := &consumptionTrackingCache{}
+	type hookObservation struct {
+		req      *bytestream.WriteRequest
+		consumed int64
+	}
+	var hookCalls []hookObservation
+	discard := stdlog.New(io.Discard, "", 0)
+	s := &grpcServer{
+		cache:               trackingCache,
+		accessLogger:        discard,
+		errorLogger:         discard,
+		maxCasBlobSizeBytes: 1 << 40,
+		readChunkSizeBytes:  maxChunkSize,
+		// Runs on the receive goroutine, strictly between pw.Write(msg N)
+		// and Recv(msg N+1), so no synchronization is needed here.
+		writePayloadConsumed: func(req *bytestream.WriteRequest) {
+			hookCalls = append(hookCalls, hookObservation{
+				req:      req,
+				consumed: trackingCache.consumed.Load(),
+			})
+		},
+	}
+
+	srv := &contractWriteServer{t: t, cache: trackingCache, requests: requests}
+	if err := s.Write(srv); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if srv.response == nil {
+		t.Fatal("Write did not send a response")
+	}
+
+	if len(hookCalls) != len(requests) {
+		t.Fatalf("hook fired %d times, want once per message (%d)", len(hookCalls), len(requests))
+	}
+	var cumulative int64
+	for i, call := range hookCalls {
+		cumulative += int64(len(requests[i].Data))
+		if call.req != requests[i] {
+			t.Fatalf("hook call %d received the wrong request", i)
+		}
+		// Same one-read-buffer tolerance as the Recv-ordering assertion: the
+		// pipe unblocks the writer inside the reader's final Read, before the
+		// consumption counter updates.
+		if call.consumed < cumulative-consumptionReadBufferBytes {
+			t.Fatalf("hook call %d fired before its payload was consumed: consumed %d, want >= %d",
+				i, call.consumed, cumulative)
+		}
+	}
+	if got := srv.response.GetCommittedSize(); got != int64(len(content)) {
+		t.Fatalf("committed %d bytes, want %d", got, len(content))
 	}
 }
 
