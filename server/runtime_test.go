@@ -139,16 +139,24 @@ func TestSourceBufferPoolRecyclesBuffers(t *testing.T) {
 	if len(first) != 8 || cap(first) != 16 {
 		t.Fatalf("got len=%d cap=%d, want len=8 cap=16", len(first), cap(first))
 	}
-	first[0] = 0x42
-	pool.put(first)
 
-	second := pool.get(4)
-	if len(second) != 4 {
-		t.Fatalf("got len=%d, want 4", len(second))
+	// Under the race detector sync.Pool.Put randomly drops items (by design,
+	// to flush out invalid-reuse bugs), so a single put/get round can miss.
+	// Recycling within a bounded number of rounds is still guaranteed.
+	for round := 0; round < 256; round++ {
+		buf := pool.get(8)
+		buf[0] = 0x42
+		pool.put(buf)
+		second := pool.get(4)
+		if len(second) != 4 {
+			t.Fatalf("got len=%d, want 4", len(second))
+		}
+		if second[0] == 0x42 {
+			return
+		}
+		pool.put(second)
 	}
-	if second[0] != 0x42 {
-		t.Fatal("expected the pooled backing array to be recycled")
-	}
+	t.Fatal("expected a pooled backing array to be recycled within 256 rounds")
 }
 
 func TestSourceBufferPoolDropsForeignBuffers(t *testing.T) {
