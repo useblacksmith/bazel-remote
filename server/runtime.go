@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/semaphore"
+	"google.golang.org/genproto/googleapis/bytestream"
 )
 
 const (
@@ -78,6 +80,32 @@ func WithReadChunkSizeBytes(chunkSizeBytes int64) GRPCServerOption {
 	}
 }
 
+// WithWritePayloadConsumed registers a callback the ByteStream Write handler
+// invokes exactly once per received message, after that message's Data has
+// been fully consumed (the pipe write to the cache reader returned). It is
+// the explicit ownership-transfer point for embedders that decode
+// WriteRequest payloads into reusable buffers: once the callback fires, the
+// server holds no reference to req.Data and the embedder may recycle its
+// backing array.
+//
+// The callback runs on the Write receive goroutine, so implementations must
+// be fast and must not block. Messages whose payload is never consumed
+// (errors, skipped writes because the blob already exists, stream teardown)
+// do not trigger the callback; embedders must treat those payloads as
+// possibly still referenced.
+//
+// MAINTAINERS: if the Write receive loop is ever restructured (pipelining,
+// buffering payloads across iterations), this callback must move with the
+// point where the payload is truly consumed. Firing it early turns embedder
+// buffer reuse into silent cross-stream cache corruption. See
+// TestWritePayloadConsumedFiresAfterConsumption.
+func WithWritePayloadConsumed(fn func(*bytestream.WriteRequest)) GRPCServerOption {
+	return func(s *grpcServer) error {
+		s.writePayloadConsumed = fn
+		return nil
+	}
+}
+
 // WithMaxBatchTotalSizeBytes limits the total declared blob bytes in one
 // batch CAS request and advertises that limit through
 // CacheCapabilities.MaxBatchTotalSizeBytes. Per REAPI that capability bounds
@@ -95,12 +123,13 @@ func WithMaxBatchTotalSizeBytes(maxBatchTotalSizeBytes int64) GRPCServerOption {
 
 type readLimiter struct {
 	activeReads    *semaphore.Weighted
+	maxActiveReads int64
 	bufferBytes    *semaphore.Weighted
 	maxBufferBytes int64
 }
 
 func newReadLimiter(maxActiveReads, maxBufferBytes int64) *readLimiter {
-	l := &readLimiter{maxBufferBytes: maxBufferBytes}
+	l := &readLimiter{maxActiveReads: maxActiveReads, maxBufferBytes: maxBufferBytes}
 	if maxActiveReads > 0 {
 		l.activeReads = semaphore.NewWeighted(maxActiveReads)
 	}
@@ -137,4 +166,59 @@ func (l *readLimiter) releaseBuffer(size int64) {
 	if l != nil && l.bufferBytes != nil && size > 0 && size <= l.maxBufferBytes {
 		l.bufferBytes.Release(size)
 	}
+}
+
+// sourceBufferPool recycles ByteStream read source buffers so a burst of read
+// RPCs does not allocate one fresh chunk-sized array per request. The
+// active-read admission limit is what bounds live memory (at most
+// maxActiveReads buffers in flight); the pool only reduces allocation churn.
+//
+// Retention is delegated to sync.Pool, i.e. to the garbage collector: an
+// array unused for two consecutive GC cycles is reclaimed, so quiet stretches
+// return the memory to the runtime at the cost of re-allocating the working
+// set after such gaps. There is deliberately no fixed retained floor.
+//
+// Reuse across RPCs is safe for the same reason the read loop reuses one
+// buffer across chunks within an RPC: ServerStream.SendMsg marshals the
+// response synchronously, so once Send returns (and therefore once the
+// handler returns) the transport holds no reference to the source array.
+type sourceBufferPool struct {
+	capacity int64
+	pool     sync.Pool
+}
+
+func newSourceBufferPool(capacity int64) *sourceBufferPool {
+	if capacity <= 0 {
+		return nil
+	}
+	return &sourceBufferPool{capacity: capacity}
+}
+
+// get returns a length-size buffer, recycling a pooled array when one is
+// available. A nil pool (limits disabled) or an oversized request falls back
+// to upstream bazel-remote behavior: one fresh allocation per call.
+func (p *sourceBufferPool) get(size int64) []byte {
+	if p == nil || size > p.capacity {
+		return make([]byte, size)
+	}
+	if v := p.pool.Get(); v != nil {
+		return (*v.(*[]byte))[:size]
+	}
+	// Allocate at full capacity so this array is admissible on put.
+	return make([]byte, size, p.capacity)
+}
+
+// put returns a buffer to the pool. Arrays that do not match the pool
+// capacity (fallback allocations for oversized requests) are dropped for the
+// GC so get can keep aliasing pooled arrays at full chunk capacity.
+func (p *sourceBufferPool) put(b []byte) {
+	if p == nil || int64(cap(b)) != p.capacity {
+		return
+	}
+	b = b[:0]
+	// Pointer indirection is the shape staticcheck SA6002 asks for. One
+	// small slice-header allocation still escapes per put (get discards the
+	// pointer, so the header is not itself recycled); that cost is noise
+	// next to the chunk-sized array being reused.
+	p.pool.Put(&b)
 }
