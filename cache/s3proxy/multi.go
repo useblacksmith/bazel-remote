@@ -24,6 +24,12 @@ import (
 // decision.
 
 var (
+	// backendUnknown is belt-and-braces coverage for interceptor/config
+	// drift and stays flat in practice: the gRPC interceptor rejects
+	// unknown selectors at the boundary, and the HTTP listener carries no
+	// selector at all. Do NOT alert on it — the interceptor rejection
+	// counters (bazel_remote_s3_backend_selector_rejected_total{cause})
+	// are the signal.
 	backendUnknown = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_backend_unknown_total",
 		Help: "Requests carrying a backend selector not present in the configured backends map (refused; indicates an interceptor/config mismatch).",
