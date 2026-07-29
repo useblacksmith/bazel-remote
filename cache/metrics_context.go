@@ -37,6 +37,14 @@ type OperationObserver interface {
 type OperationOutcome struct {
 	Labels MetricsLabels
 	Method string
+	// Kind is the cache entry kind ("ac", "cas", or "raw", per
+	// EntryKind.String()) when the outcome concerns a specific entry kind;
+	// empty otherwise. A string rather than EntryKind so the zero value
+	// reads as "unset" instead of AC. Emitters that know the kind should
+	// set it: observers must be able to account AC and CAS writes
+	// differently (AC updates are unconditional same-digest rewrites, CAS
+	// writes are content-addressed and deduplicated).
+	Kind   string
 	Status string
 	Reason string
 	Ops    uint64

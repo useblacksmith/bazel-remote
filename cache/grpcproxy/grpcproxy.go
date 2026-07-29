@@ -223,7 +223,11 @@ func (r *remoteGrpcProxyCache) StopUploaders() {
 // observeUpload reports one terminal backend-upload outcome. Failure statuses
 // ("error", "dropped") match the shared build-cache status taxonomy so
 // downstream failure counting keeps working; success is "forwarded" (see
-// WithOperationObserver).
+// WithOperationObserver). The entry kind is carried on the outcome because a
+// "forwarded" CAS write and a "forwarded" AC write mean different things to a
+// storage accountant: CAS writes are deduplicated by FindMissingBlobs before
+// upload, while AC updates unconditionally rewrite the same action digest on
+// every build, so observers must be able to tell them apart.
 func (r *remoteGrpcProxyCache) observeUpload(item backendproxy.UploadReq, status, reason string) {
 	switch status {
 	case "forwarded":
@@ -236,6 +240,7 @@ func (r *remoteGrpcProxyCache) observeUpload(item backendproxy.UploadReq, status
 	uploadQueueDepth.Set(float64(len(r.uploadQueue)))
 	cache.ObserveOperation(cache.WithMetricsLabels(context.Background(), item.MetricsLabels), r.observer, cache.OperationOutcome{
 		Method: "backend_upload",
+		Kind:   item.Kind.String(),
 		Status: status,
 		Reason: reason,
 		Ops:    1,
