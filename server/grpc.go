@@ -34,7 +34,10 @@ const (
 	emptySha256   = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 )
 
-const grpcHealthServiceName = "/grpc.health.v1.Health/Check"
+// grpcHealthCheckMethod is the full method path of the health check RPC.
+// It is used by the auth interceptors to exempt health checks; it is NOT a
+// health service name and must not be passed to SetServingStatus.
+const grpcHealthCheckMethod = "/grpc.health.v1.Health/Check"
 
 type grpcServer struct {
 	cache                  disk.Cache
@@ -117,7 +120,14 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 
 	h := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(srv, h)
-	h.SetServingStatus(grpcHealthServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+	// Explicitly mark the overall server (the empty service name "") as
+	// SERVING. health.NewServer() already defaults to this, but external
+	// health pollers (e.g. the L1 ring client) check service "", and the
+	// planned drain endpoint (BLA-4499 follow-up) will flip exactly this
+	// status to NOT_SERVING, so the intent should be explicit. Previously
+	// this registered the method path "/grpc.health.v1.Health/Check" as a
+	// "service name", which nothing should query as a service.
+	h.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 
 	return srv.Serve(l)
 }
@@ -218,7 +228,7 @@ func GRPCmTLSUnaryServerInterceptor(allowUnauthenticatedReads bool) grpc.UnarySe
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 
 		// Always allow health service requests.
-		if info.FullMethod == grpcHealthServiceName {
+		if info.FullMethod == grpcHealthCheckMethod {
 			return handler(ctx, req)
 		}
 
