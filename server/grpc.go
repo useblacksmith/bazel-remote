@@ -113,10 +113,10 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 	}
 	if s.readLimiter != nil && s.readLimiter.maxActiveReads > 0 {
 		// The active-read admission limit guarantees at most maxActiveReads
-		// source buffers are in flight, so a same-sized free list recycles
-		// every read buffer instead of allocating one per RPC. Without read
-		// limits, upstream per-RPC allocation behavior is preserved.
-		s.sourceBuffers = newSourceBufferPool(s.readLimiter.maxActiveReads, s.readChunkSizeBytes)
+		// source buffers are in flight, so recycling caps allocation churn
+		// without affecting the live-memory bound. Without read limits,
+		// upstream per-RPC allocation behavior is preserved.
+		s.sourceBuffers = newSourceBufferPool(s.readChunkSizeBytes)
 	}
 	pb.RegisterActionCacheServer(srv, s)
 	pb.RegisterCapabilitiesServer(srv, s)

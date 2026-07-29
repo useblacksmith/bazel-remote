@@ -195,11 +195,12 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 
 	// Note on accounting: the byte semaphore above reserves the requested
 	// bufSize, but a pooled array always retains full chunk capacity. The
-	// true retained-memory bound is therefore the pool's count x capacity
-	// (maxActiveReads x readChunkSizeBytes), not the semaphore total.
+	// in-flight bound is therefore maxActiveReads x readChunkSizeBytes, not
+	// the semaphore total; retention beyond in-flight use is GC-managed
+	// (sync.Pool), so unused arrays are reclaimed after two idle GC cycles.
 	buf := s.sourceBuffers.get(bufSize)
 	// Recycle before the deferred budget release admits the next reader, so
-	// an admitted reader finds a pooled array instead of allocating.
+	// an admitted reader can find a pooled array instead of allocating.
 	defer s.sourceBuffers.put(buf)
 
 	var chunkResp bytestream.ReadResponse

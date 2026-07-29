@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -128,7 +129,11 @@ func TestMaxBatchTotalSizeOption(t *testing.T) {
 }
 
 func TestSourceBufferPoolRecyclesBuffers(t *testing.T) {
-	pool := newSourceBufferPool(2, 16)
+	// Pin to one P so put/get hit the same sync.Pool private slot; with
+	// multiple Ps a goroutine migration between the calls could miss the
+	// recycled array and flake the recycling assertion.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	pool := newSourceBufferPool(16)
 
 	first := pool.get(8)
 	if len(first) != 8 || cap(first) != 16 {
@@ -146,24 +151,27 @@ func TestSourceBufferPoolRecyclesBuffers(t *testing.T) {
 	}
 }
 
-func TestSourceBufferPoolDropsForeignAndExcessBuffers(t *testing.T) {
-	pool := newSourceBufferPool(1, 16)
+func TestSourceBufferPoolDropsForeignBuffers(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	pool := newSourceBufferPool(16)
 
-	// Arrays that don't match the pool capacity must not be admitted.
-	pool.put(make([]byte, 8))
-	if len(pool.buffers) != 0 {
-		t.Fatal("foreign buffer was admitted to the pool")
+	// An array that doesn't match the pool capacity must not be admitted:
+	// the next get must mint a fresh full-capacity array, not recycle the
+	// foreign one.
+	foreign := make([]byte, 8)
+	foreign[0] = 0x42
+	pool.put(foreign)
+	got := pool.get(8)
+	if cap(got) != 16 {
+		t.Fatalf("got cap=%d, want a fresh full-capacity array (16)", cap(got))
 	}
-
-	// Puts beyond the pool size must not block; extras go to the GC.
-	pool.put(make([]byte, 0, 16))
-	pool.put(make([]byte, 0, 16))
-	if len(pool.buffers) != 1 {
-		t.Fatalf("pool holds %d buffers, want 1", len(pool.buffers))
+	if got[0] == 0x42 {
+		t.Fatal("foreign buffer was admitted to the pool")
 	}
 }
 
 func TestSourceBufferPoolNilAndOversizedFallBackToAllocation(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	var pool *sourceBufferPool
 	buf := pool.get(8)
 	if len(buf) != 8 {
@@ -171,22 +179,20 @@ func TestSourceBufferPoolNilAndOversizedFallBackToAllocation(t *testing.T) {
 	}
 	pool.put(buf)
 
-	pool = newSourceBufferPool(1, 4)
+	pool = newSourceBufferPool(4)
 	oversized := pool.get(8)
 	if len(oversized) != 8 {
 		t.Fatalf("oversized get returned len=%d, want 8", len(oversized))
 	}
+	oversized[0] = 0x42
 	pool.put(oversized)
-	if len(pool.buffers) != 0 {
+	if recycled := pool.get(4); recycled[0] == 0x42 {
 		t.Fatal("oversized buffer must not be admitted to the pool")
 	}
 }
 
-func TestSourceBufferPoolDisabledWithoutPositiveBounds(t *testing.T) {
-	if pool := newSourceBufferPool(0, 16); pool != nil {
-		t.Fatal("expected nil pool for zero count")
-	}
-	if pool := newSourceBufferPool(4, 0); pool != nil {
+func TestSourceBufferPoolDisabledWithoutPositiveCapacity(t *testing.T) {
+	if pool := newSourceBufferPool(0); pool != nil {
 		t.Fatal("expected nil pool for zero capacity")
 	}
 }

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -168,11 +169,14 @@ func (l *readLimiter) releaseBuffer(size int64) {
 }
 
 // sourceBufferPool recycles ByteStream read source buffers so a burst of read
-// RPCs does not allocate one fresh chunk-sized array per request. The pool is
-// deliberately a plain bounded free list rather than a sync.Pool: the
-// active-read admission limit already guarantees at most maxActiveReads
-// buffers are in flight, so a channel of that capacity retains every buffer
-// across bursts instead of surrendering them to the next GC cycle.
+// RPCs does not allocate one fresh chunk-sized array per request. The
+// active-read admission limit is what bounds live memory (at most
+// maxActiveReads buffers in flight); the pool only reduces allocation churn.
+//
+// Retention is delegated to sync.Pool, i.e. to the garbage collector: an
+// array unused for two consecutive GC cycles is reclaimed, so quiet stretches
+// return the memory to the runtime at the cost of re-allocating the working
+// set after such gaps. There is deliberately no fixed retained floor.
 //
 // Reuse across RPCs is safe for the same reason the read loop reuses one
 // buffer across chunks within an RPC: ServerStream.SendMsg marshals the
@@ -180,17 +184,14 @@ func (l *readLimiter) releaseBuffer(size int64) {
 // handler returns) the transport holds no reference to the source array.
 type sourceBufferPool struct {
 	capacity int64
-	buffers  chan []byte
+	pool     sync.Pool
 }
 
-func newSourceBufferPool(count, capacity int64) *sourceBufferPool {
-	if count <= 0 || capacity <= 0 {
+func newSourceBufferPool(capacity int64) *sourceBufferPool {
+	if capacity <= 0 {
 		return nil
 	}
-	return &sourceBufferPool{
-		capacity: capacity,
-		buffers:  make(chan []byte, count),
-	}
+	return &sourceBufferPool{capacity: capacity}
 }
 
 // get returns a length-size buffer, recycling a pooled array when one is
@@ -200,25 +201,21 @@ func (p *sourceBufferPool) get(size int64) []byte {
 	if p == nil || size > p.capacity {
 		return make([]byte, size)
 	}
-	select {
-	case b := <-p.buffers:
-		return b[:size]
-	default:
-		// Allocate at full capacity so this array is admissible on put.
-		return make([]byte, size, p.capacity)
+	if v := p.pool.Get(); v != nil {
+		return (*v.(*[]byte))[:size]
 	}
+	// Allocate at full capacity so this array is admissible on put.
+	return make([]byte, size, p.capacity)
 }
 
 // put returns a buffer to the pool. Arrays that do not match the pool
-// capacity (fallback allocations) and buffers beyond the pool size are
-// dropped for the GC, which keeps the pool's retained memory exactly
-// count x capacity in the worst case.
+// capacity (fallback allocations for oversized requests) are dropped for the
+// GC so get can keep aliasing pooled arrays at full chunk capacity.
 func (p *sourceBufferPool) put(b []byte) {
 	if p == nil || int64(cap(b)) != p.capacity {
 		return
 	}
-	select {
-	case p.buffers <- b[:0]:
-	default:
-	}
+	b = b[:0]
+	// Pointer indirection keeps the slice header off the heap (SA6002).
+	p.pool.Put(&b)
 }
