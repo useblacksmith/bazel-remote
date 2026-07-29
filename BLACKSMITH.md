@@ -83,10 +83,22 @@ to the existing endpoint metrics decorator for semantic cache outcomes:
 - `action_cache_get`: `hit`, `miss`, or `error`
 - `cas_lookup`: `hit`, `miss`, or `error`
 
-The S3 proxy accepts the same observer and records backend async upload health
-only:
+The S3 proxy accepts the same observer and records the terminal outcome of
+every backend async upload:
 
-- `backend_upload`: `error` or `dropped`
+- `backend_upload`: `created` (net-new object stored via the create-if-absent
+  conditional PUT), `already_exists` (precondition failure: the object was
+  already present), `error`, or `dropped`
+
+The gRPC proxy accepts the same observer; it cannot see whether the downstream
+L1's own conditional PUT stored a net-new object, so successful uploads are
+reported as `forwarded` (never `created`):
+
+- `backend_upload`: `forwarded`, `error`, or `dropped`
+
+FA owns the mapping of `forwarded` rows to `created` (reason `l1_forwarded`)
+for storage accounting, sound because miss determination falls through the L1
+to MinIO (design decision log entry 8).
 
 Client transfer bytes are intentionally not inferred inside bazel-remote; FA
 observes gRPC request/response payloads and emits `client_upload` and

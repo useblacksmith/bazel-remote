@@ -28,7 +28,7 @@ var (
 	// drift and stays flat in practice: the gRPC interceptor rejects
 	// unknown selectors at the boundary, and the HTTP listener carries no
 	// selector at all. Do NOT alert on it — the interceptor rejection
-	// counters (bazel_remote_s3_backend_selector_rejected_total{cause})
+	// counters (bazel_remote_s3_backend_selector_rejected_total{reason})
 	// are the signal.
 	backendUnknown = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_backend_unknown_total",

@@ -611,8 +611,8 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 		// rejection — the backend trust interceptors' marked config
 		// rejections, auth failures, transport errors — degrades to a
 		// metered miss right here, identically to the unary paths, instead
-		// of surfacing as an unmetered mid-fill error in the disk layer's
-		// catch-all. A deferred NotFound is the plain miss it always was;
+		// of becoming an unmetered, unclassified mid-fill miss in the disk
+		// layer's catch-all. A deferred NotFound is the plain miss it always was;
 		// unmarked errors keep failing strictly, matching the unary
 		// contract.
 		first, err := stream.Recv()
