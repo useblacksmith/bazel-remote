@@ -35,9 +35,10 @@ type S3CloudStorageConfig struct {
 	// connections so new dials re-resolve DNS. MinIO clusters have no load
 	// balancer — the endpoint is a DNS name round-robinning bare node IPs —
 	// so a long-lived proxy that never re-dials pins its traffic to whichever
-	// nodes it happened to connect to first. Zero/unset means the default
-	// (see s3proxy.DefaultConnRecycleInterval); negative disables recycling.
-	// In YAML this is a duration string ("90s", "5m"); see UnmarshalYAML.
+	// nodes it happened to connect to first. YAML-only (no flag/env surface),
+	// as a duration string ("90s", "5m"); see UnmarshalYAML. Unset resolves
+	// to defaultConnRecycleInterval at config load; negative disables
+	// recycling. The s3proxy receives the resolved, concrete value.
 	ConnRecycleInterval time.Duration `yaml:"-"`
 
 	// Backends optionally declares a map of allowlisted S3 backends for
@@ -77,6 +78,12 @@ func (s3c *S3CloudStorageConfig) UnmarshalYAML(unmarshal func(interface{}) error
 	}
 	return nil
 }
+
+// defaultConnRecycleInterval is applied at config load when
+// conn_recycle_interval is unset. Modest by design: dials to the LAN-local
+// MinIO endpoints are cheap, and frequent re-dials are what rotate traffic
+// across the DNS round-robin.
+const defaultConnRecycleInterval = 5 * time.Minute
 
 // S3BackendConfig describes one entry of the allowlisted backends map. Every
 // field is optional and inherits from the surrounding S3CloudStorageConfig

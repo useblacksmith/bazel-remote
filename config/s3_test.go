@@ -104,6 +104,59 @@ func TestS3BackendsMapConfig(t *testing.T) {
 	}
 }
 
+func TestConnRecycleIntervalResolvedAtConfigLoad(t *testing.T) {
+	base := `host: localhost
+port: 8080
+dir: /opt/cache-dir
+max_size: 100
+s3_proxy:
+  endpoint: minio.example.com:9000
+  bucket: test-bucket
+  auth_method: access_key
+  access_key_id: EXAMPLE_ACCESS_KEY
+  secret_access_key: EXAMPLE_SECRET_KEY
+`
+
+	t.Run("unset resolves to the default", func(t *testing.T) {
+		config, err := NewFromYaml([]byte(base))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if config.S3CloudStorage.ConnRecycleInterval != defaultConnRecycleInterval {
+			t.Fatalf("ConnRecycleInterval = %v, want default %v",
+				config.S3CloudStorage.ConnRecycleInterval, defaultConnRecycleInterval)
+		}
+	})
+
+	t.Run("negative disables and is preserved", func(t *testing.T) {
+		config, err := NewFromYaml([]byte(base + "  conn_recycle_interval: -1s\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if config.S3CloudStorage.ConnRecycleInterval != -time.Second {
+			t.Fatalf("ConnRecycleInterval = %v, want -1s", config.S3CloudStorage.ConnRecycleInterval)
+		}
+	})
+}
+
+// Multi-backend mode lowers the per-backend upload-pool defaults (queues
+// preallocate per backend); explicit top-level settings are inherited
+// per backend unchanged.
+func TestPerBackendUploadLimits(t *testing.T) {
+	defaults := &Config{NumUploaders: defaultNumUploaders, MaxQueuedUploads: defaultMaxQueuedUploads}
+	numUploaders, maxQueued := defaults.perBackendUploadLimits()
+	if numUploaders != multiBackendNumUploaders || maxQueued != multiBackendMaxQueuedUploads {
+		t.Fatalf("default limits resolved to (%d, %d), want (%d, %d)",
+			numUploaders, maxQueued, multiBackendNumUploaders, multiBackendMaxQueuedUploads)
+	}
+
+	explicit := &Config{NumUploaders: 40, MaxQueuedUploads: 250000}
+	numUploaders, maxQueued = explicit.perBackendUploadLimits()
+	if numUploaders != 40 || maxQueued != 250000 {
+		t.Fatalf("explicit limits resolved to (%d, %d), want (40, 250000)", numUploaders, maxQueued)
+	}
+}
+
 func TestS3BackendsWithoutMapIsBackwardCompatible(t *testing.T) {
 	yaml := `host: localhost
 port: 8080

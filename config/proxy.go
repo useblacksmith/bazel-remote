@@ -141,11 +141,14 @@ func (c *Config) setProxy() error {
 			if err != nil {
 				return err
 			}
+			// Upload pools are per backend; resolve the (lower) multi-backend
+			// defaults unless explicitly overridden at the top level.
+			numUploaders, maxQueuedUploads := c.perBackendUploadLimits()
 			proxy, err := s3proxy.NewMulti(
 				specs,
 				c.S3CloudStorage.UpdateTimestamps,
 				c.S3CloudStorage.ConnRecycleInterval,
-				c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
+				c.StorageMode, c.AccessLogger, c.ErrorLogger, numUploaders, maxQueuedUploads,
 				s3proxy.PrometheusMetrics())
 			if err != nil {
 				return err

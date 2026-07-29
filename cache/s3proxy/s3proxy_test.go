@@ -6,13 +6,17 @@ import (
 	"io"
 	stdlog "log"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type recordingObserver struct {
@@ -221,6 +225,7 @@ func TestPutRecordsUploadQueueDrop(t *testing.T) {
 	observer := &recordingObserver{}
 	var errBuf bytes.Buffer
 	c := &s3Cache{
+		key:         backendKeyA,
 		prefix:      "minio-prefix/staging/10/717982840/v0/bazel",
 		uploadQueue: uploadQueue,
 		errorLogger: stdlog.New(&errBuf, "", 0),
@@ -251,6 +256,11 @@ func TestPutRecordsUploadQueueDrop(t *testing.T) {
 	}
 	if outcome.Labels.RepositoryID != "717982840" || outcome.Labels.JobID != "job-456" {
 		t.Fatalf("unexpected labels: %+v", outcome.Labels)
+	}
+	// The overflow log names the backend so a multi-backend L1's logs
+	// identify which shard's queue is saturated.
+	if !strings.Contains(errBuf.String(), backendKeyA) {
+		t.Fatalf("queue-full log %q does not name the backend key", errBuf.String())
 	}
 }
 
@@ -365,6 +375,9 @@ func TestMultiBackendMissingSelectorRoutesToDefault(t *testing.T) {
 	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	m, queueA, queueB := twoBackendMulti(t)
 
+	// The fallback is metered: it is the HTTP-side-door / lost-selector
+	// signal on a multi-backend node.
+	before := testutil.ToFloat64(defaultBackendFallback.WithLabelValues("UPLOAD"))
 	m.Put(context.Background(), cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
 	select {
 	case item := <-queueA:
@@ -376,6 +389,79 @@ func TestMultiBackendMissingSelectorRoutesToDefault(t *testing.T) {
 	case <-queueB:
 		t.Fatal("upload leaked into the non-default backend's queue")
 	default:
+	}
+	if got := testutil.ToFloat64(defaultBackendFallback.WithLabelValues("UPLOAD")) - before; got != 1 {
+		t.Fatalf("defaultBackendFallback{UPLOAD} delta = %v, want 1", got)
+	}
+
+	// A selector-carrying request does not touch the fallback meter.
+	before = testutil.ToFloat64(defaultBackendFallback.WithLabelValues("UPLOAD"))
+	m.Put(cache.WithS3Backend(context.Background(), backendKeyB), cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
+	if item := <-queueB; item.Rc != nil {
+		_ = item.Rc.Close()
+	}
+	if got := testutil.ToFloat64(defaultBackendFallback.WithLabelValues("UPLOAD")) - before; got != 0 {
+		t.Fatalf("defaultBackendFallback{UPLOAD} delta = %v, want 0", got)
+	}
+}
+
+// TestUploadFileDeadlineReclaimsWorkerFromHungBackend pins the upload
+// deadline seam: a PutObject against a backend that never responds must
+// return once uploadTimeout elapses (reporting an error outcome) instead of
+// pinning the upload worker forever.
+func TestUploadFileDeadlineReclaimsWorkerFromHungBackend(t *testing.T) {
+	hung := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-hung // Hold every request open until the test finishes.
+	}))
+	defer ts.Close()
+	defer close(hung)
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := minio.NewCore(u.Host, &minio.Options{
+		Creds:        credentials.NewStaticV4("KEY", "SECRET", ""),
+		Secure:       false,
+		BucketLookup: minio.BucketLookupPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldTimeout := uploadTimeout
+	uploadTimeout = 100 * time.Millisecond
+	defer func() { uploadTimeout = oldTimeout }()
+
+	observer := &recordingObserver{}
+	c := &s3Cache{
+		key:          backendKeyA,
+		mcore:        core,
+		bucket:       "test-bucket",
+		objectKey:    objectKeyV2,
+		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
+		observer:     observer,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.UploadFile(backendproxy.UploadReq{
+			Hash:       "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+			Kind:       cache.CAS,
+			SizeOnDisk: 4,
+			Rc:         io.NopCloser(strings.NewReader("blob")),
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("UploadFile did not return: the upload deadline is not applied")
+	}
+	if len(observer.outcomes) != 1 || observer.outcomes[0].Status != "error" {
+		t.Fatalf("expected one error outcome, got %+v", observer.outcomes)
 	}
 }
 
@@ -426,6 +512,9 @@ func TestMultiBackendUnknownSelectorRefusesOperations(t *testing.T) {
 	}
 }
 
+// NewMulti validates only what config validation cannot express: exactly
+// one default backend. Structural spec checks (non-empty keys, endpoints,
+// duplicate map keys) are config validation's job.
 func TestNewMultiValidation(t *testing.T) {
 	creds := credentials.NewStaticV4("ak", "sk", "")
 	spec := func(key string, def bool) BackendSpec {
@@ -439,8 +528,9 @@ func TestNewMultiValidation(t *testing.T) {
 		}
 	}
 
-	if _, err := NewMulti(nil, false, -1, "uncompressed", nil, nil, 0, 0, nil); err == nil {
-		t.Fatal("expected error for empty backend list")
+	if _, err := NewMulti(nil, false, -1, "uncompressed", nil, nil, 0, 0, nil); err == nil ||
+		!strings.Contains(err.Error(), "no S3 backend marked as default") {
+		t.Fatal("expected no-default error for empty backend list")
 	}
 
 	if _, err := NewMulti([]BackendSpec{spec(backendKeyA, false)},
@@ -449,10 +539,10 @@ func TestNewMultiValidation(t *testing.T) {
 		t.Fatal("expected error when no backend is default")
 	}
 
-	if _, err := NewMulti([]BackendSpec{spec(backendKeyA, true), spec(backendKeyA, false)},
+	if _, err := NewMulti([]BackendSpec{spec(backendKeyA, true), spec(backendKeyB, true)},
 		false, -1, "uncompressed", nil, nil, 0, 0, nil); err == nil ||
-		!strings.Contains(err.Error(), "duplicate S3 backend key") {
-		t.Fatal("expected error for duplicate backend keys")
+		!strings.Contains(err.Error(), "multiple S3 backends marked as default") {
+		t.Fatal("expected error for multiple default backends")
 	}
 
 	proxy, err := NewMulti([]BackendSpec{spec(backendKeyA, true), spec(backendKeyB, false)},

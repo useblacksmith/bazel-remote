@@ -34,8 +34,8 @@ type Metrics interface {
 
 type s3Cache struct {
 	// key identifies this backend in a multi-backend deployment: the
-	// tenant-facing selector from the backends map (also the metrics label).
-	// Single-backend deployments use the endpoint.
+	// tenant-facing selector from the backends map (also the "backend"
+	// metrics label). Single-backend deployments use the endpoint.
 	key              string
 	mcore            *minio.Core
 	prefix           string
@@ -48,12 +48,6 @@ type s3Cache struct {
 	updateTimestamps bool
 	objectKey        func(prefix string, hash string, kind cache.EntryKind) string
 	observer         cache.OperationObserver
-
-	// Per-backend metric instances, bound to the "backend" label value.
-	hits         prometheus.Counter
-	misses       prometheus.Counter
-	queueDropped prometheus.Counter
-	queueDepth   prometheus.Gauge
 }
 
 type Option func(*s3Cache)
@@ -85,10 +79,6 @@ var (
 		Name: "bazel_remote_s3_prefix_missing_total",
 		Help: "Requests that required a request-scoped storage prefix but carried none (configured fallback prefix used).",
 	}, []string{"operation"})
-	backendUnknown = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "bazel_remote_s3_backend_unknown_total",
-		Help: "Requests carrying a backend selector not present in the configured backends map (refused; indicates an interceptor/config mismatch).",
-	}, []string{"operation"})
 )
 
 // PrometheusMetrics returns a Metrics implementation backed by this package's
@@ -107,13 +97,6 @@ func (promMetricsSink) IncPrefixMissing(operation string) {
 // Used in place of minio's verbose "NoSuchKey" error.
 var errNotFound = errors.New("NOT FOUND")
 
-// errUnknownBackend is returned when a request carries a backend selector
-// that is not in the configured backends map. The gRPC interceptor validates
-// selectors fail-closed at the boundary, so hitting this means an
-// interceptor/config mismatch bug; refusing the operation is safer than
-// touching the wrong shard.
-var errUnknownBackend = errors.New("unknown S3 backend selector")
-
 // Connection hygiene defaults. MinIO clusters have no load balancer: the
 // endpoint is a DNS name round-robinning bare node IPs, so load spread
 // depends on connections being (re-)dialed often enough to sample fresh DNS
@@ -127,35 +110,24 @@ var errUnknownBackend = errors.New("unknown S3 backend selector")
 //     execution plan's 16–64 band, and double minio-go's own 16 to absorb
 //     request bursts without churn; previously the unset flag clobbered the
 //     transport to Go's per-host fallback of 2),
-//   - periodic CloseIdleConnections() (default every 5 minutes), which closes
-//     whatever is momentarily idle so subsequent requests re-dial and
-//     re-resolve, rotating across MinIO nodes within a few intervals. Dials
-//     are cheap here (plaintext, one LAN RTT), so the recycle interval errs
-//     toward responsiveness; the per-MinIO-node balance dashboard is the
-//     acceptance gauge.
+//   - periodic CloseIdleConnections() (config default: every 5 minutes,
+//     resolved at config load; non-positive disables), which closes whatever
+//     is momentarily idle so subsequent requests re-dial and re-resolve,
+//     rotating across MinIO nodes within a few intervals. Dials are cheap
+//     here (plaintext, one LAN RTT), so the recycle interval errs toward
+//     responsiveness; the per-MinIO-node balance dashboard is the acceptance
+//     gauge.
 const (
-	DefaultConnRecycleInterval = 5 * time.Minute
-
 	defaultMaxIdleConns        = 64
 	defaultMaxIdleConnsPerHost = 32
 )
 
-// BackendSpec describes one S3 backend of a multi-backend proxy.
-type BackendSpec struct {
-	// Key is the tenant-facing selector this backend is registered under
-	// (the allowlisted endpoint URL forwarded as gRPC metadata). It is also
-	// the "backend" metrics label.
-	Key              string
-	Endpoint         string
-	Bucket           string
-	BucketLookupType minio.BucketLookupType
-	Prefix           string
-	Credentials      *credentials.Credentials
-	DisableSSL       bool
-	Region           string
-	MaxIdleConns     int
-	Default          bool
-}
+// uploadTimeout bounds a single backend PutObject, mirroring grpcproxy's
+// uploadTimeout: a hung MinIO connection must not pin one of this backend's
+// upload workers forever. The bound is generous (large CAS blobs can be slow
+// on a busy link); it exists to reclaim workers, not to police latency. A
+// var only so tests can shrink it.
+var uploadTimeout = 10 * time.Minute
 
 func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval time.Duration,
 	storageMode string, accessLogger cache.Logger, errorLogger cache.Logger,
@@ -179,9 +151,8 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 		tr.MaxIdleConnsPerHost = defaultMaxIdleConnsPerHost
 	}
 
-	if connRecycleInterval == 0 {
-		connRecycleInterval = DefaultConnRecycleInterval
-	}
+	// connRecycleInterval arrives fully resolved from config load (the
+	// default is applied there); non-positive disables recycling.
 	if connRecycleInterval > 0 {
 		go func() {
 			for range time.Tick(connRecycleInterval) {
@@ -223,10 +194,6 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 		metrics:          metrics,
 		v2mode:           storageMode == "zstd",
 		updateTimestamps: updateTimestamps,
-		hits:             cacheHits.WithLabelValues(key),
-		misses:           cacheMisses.WithLabelValues(key),
-		queueDropped:     uploadQueueDropped.WithLabelValues(key),
-		queueDepth:       uploadQueueDepth.WithLabelValues(key),
 	}
 	for _, opt := range options {
 		opt(c)
@@ -279,108 +246,6 @@ func New(
 	}
 
 	return c
-}
-
-// NewMulti returns a cache.Proxy that dispatches over a map of allowlisted S3
-// backends. Each backend gets its own minio client, transport, and upload
-// queue (numUploaders/maxQueuedUploads apply per backend). Requests carrying
-// a backend selector on the context (lifted from validated gRPC metadata by
-// the server interceptor) route to the matching backend; requests without a
-// selector route to the designated default backend.
-func NewMulti(specs []BackendSpec, updateTimestamps bool, connRecycleInterval time.Duration,
-	storageMode string, accessLogger cache.Logger, errorLogger cache.Logger,
-	numUploaders, maxQueuedUploads int, metrics Metrics, options ...Option) (cache.Proxy, error) {
-
-	if len(specs) == 0 {
-		return nil, errors.New("s3proxy.NewMulti requires at least one backend")
-	}
-
-	m := &multiS3Cache{
-		backends:    make(map[string]*s3Cache, len(specs)),
-		errorLogger: errorLogger,
-	}
-	for _, spec := range specs {
-		if spec.Key == "" {
-			return nil, errors.New("s3proxy.NewMulti backends require a non-empty Key")
-		}
-		if _, exists := m.backends[spec.Key]; exists {
-			return nil, fmt.Errorf("duplicate S3 backend key %q", spec.Key)
-		}
-		backend, err := newBackend(spec, updateTimestamps, connRecycleInterval, storageMode,
-			accessLogger, errorLogger, numUploaders, maxQueuedUploads, metrics, options...)
-		if err != nil {
-			return nil, err
-		}
-		m.backends[spec.Key] = backend
-		if spec.Default {
-			if m.def != nil {
-				return nil, errors.New("multiple S3 backends marked as default")
-			}
-			m.def = backend
-		}
-	}
-	if m.def == nil {
-		return nil, errors.New("no S3 backend marked as default")
-	}
-
-	fmt.Printf("Using S3 backend map with %d backends (default: %s).\n", len(m.backends), m.def.key)
-
-	return m, nil
-}
-
-// multiS3Cache routes cache.Proxy operations to one of several s3Cache
-// backends based on the request-scoped backend selector.
-type multiS3Cache struct {
-	backends    map[string]*s3Cache
-	def         *s3Cache
-	errorLogger cache.Logger
-}
-
-// backendFor resolves the backend for a request. A missing selector routes
-// to the default backend (single-backend compatibility, HTTP API paths, RAW
-// entries); an unknown selector refuses the operation — the gRPC interceptor
-// already rejects those fail-closed, so this is a belt-and-braces guard
-// against interceptor/config drift, and must never fall back to a guessed
-// backend.
-func (m *multiS3Cache) backendFor(ctx context.Context, operation string) *s3Cache {
-	selector, ok := cache.S3BackendFromContext(ctx)
-	if !ok {
-		return m.def
-	}
-	backend, ok := m.backends[selector]
-	if !ok {
-		backendUnknown.WithLabelValues(operation).Inc()
-		if m.errorLogger != nil {
-			m.errorLogger.Printf("S3 %s unknown backend selector %q; refusing operation", operation, selector)
-		}
-		return nil
-	}
-	return backend
-}
-
-func (m *multiS3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
-	backend := m.backendFor(ctx, "UPLOAD")
-	if backend == nil {
-		_ = rc.Close()
-		return
-	}
-	backend.Put(ctx, kind, hash, logicalSize, sizeOnDisk, rc)
-}
-
-func (m *multiS3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64) (io.ReadCloser, int64, error) {
-	backend := m.backendFor(ctx, "DOWNLOAD")
-	if backend == nil {
-		return nil, -1, errUnknownBackend
-	}
-	return backend.Get(ctx, kind, hash, size)
-}
-
-func (m *multiS3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64) {
-	backend := m.backendFor(ctx, "CONTAINS")
-	if backend == nil {
-		return false, -1
-	}
-	return backend.Contains(ctx, kind, hash, size)
 }
 
 func objectKeyV2(prefix string, hash string, kind cache.EntryKind) string {
@@ -442,32 +307,6 @@ func (c *s3Cache) logMissingRequiredStoragePrefix(operation string, kind cache.E
 	)
 }
 
-// Metric helpers, nil-safe so tests can construct s3Cache directly without
-// binding Prometheus instances.
-func (c *s3Cache) incHits() {
-	if c.hits != nil {
-		c.hits.Inc()
-	}
-}
-
-func (c *s3Cache) incMisses() {
-	if c.misses != nil {
-		c.misses.Inc()
-	}
-}
-
-func (c *s3Cache) incQueueDropped() {
-	if c.queueDropped != nil {
-		c.queueDropped.Inc()
-	}
-}
-
-func (c *s3Cache) setQueueDepth() {
-	if c.queueDepth != nil {
-		c.queueDepth.Set(float64(len(c.uploadQueue)))
-	}
-}
-
 // Helper function for logging responses
 func logResponse(log cache.Logger, method, bucket, key string, err error) {
 	status := "OK"
@@ -506,8 +345,13 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	// already_exists instead of created.
 	opts.SetMatchETagExcept("*")
 
+	// Uploads run on background workers with no request deadline; the
+	// timeout reclaims a worker pinned by a hung MinIO connection.
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	defer cancel()
+
 	_, err := c.mcore.PutObject(
-		context.Background(),
+		ctx,
 		c.bucket,        // bucketName
 		objectKey,       // objectName
 		item.Rc,         // reader
@@ -521,7 +365,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 
 	status, reason := classifyUploadOutcome(err)
 	c.observeUpload(context.Background(), item, status, reason)
-	c.setQueueDepth()
+	uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
 
 	_ = item.Rc.Close()
 }
@@ -570,10 +414,10 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		RequireStoragePrefix:       requirePrefix,
 		MetricsLabels:              labels,
 	}:
-		c.setQueueDepth()
+		uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
 	default:
-		c.errorLogger.Printf("too many uploads queued\n")
-		c.incQueueDropped()
+		c.errorLogger.Printf("too many uploads queued for S3 backend %s\n", c.key)
+		uploadQueueDropped.WithLabelValues(c.key).Inc()
 		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
 			Method: "backend_upload",
 			Status: "dropped",
@@ -616,16 +460,15 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 		minio.GetObjectOptions{}, // opts
 	)
 	if err != nil {
+		cacheMisses.WithLabelValues(c.key).Inc()
 		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
-			c.incMisses()
 			logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, errNotFound)
 			return nil, -1, nil
 		}
-		c.incMisses()
 		logResponse(c.accessLogger, "DOWNLOAD", c.bucket, objectKey, err)
 		return nil, -1, err
 	}
-	c.incHits()
+	cacheHits.WithLabelValues(c.key).Inc()
 
 	if c.updateTimestamps {
 		c.UpdateModificationTimestamp(ctx, c.bucket, objectKey)

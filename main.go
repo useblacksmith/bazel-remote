@@ -71,6 +71,14 @@ func run(ctx *cli.Context) error {
 		return cli.Exit(err.Error(), 1)
 	}
 
+	err = validateMultiBackendTrust(c,
+		os.Getenv("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER") == "1",
+		os.Getenv("BAZEL_REMOTE_L1_AUTH_SECRET"))
+	if err != nil {
+		_, _ = fmt.Fprintf(ctx.App.Writer, "%v\n\n", err)
+		return cli.Exit(err.Error(), 1)
+	}
+
 	if ctx.NArg() > 0 {
 		_, _ = fmt.Fprintf(ctx.App.Writer,
 			"Error: bazel-remote does not take positional aguments\n")
@@ -231,6 +239,26 @@ func run(ctx *cli.Context) error {
 	}
 
 	return servers.Wait()
+}
+
+// validateMultiBackendTrust refuses to start a multi-backend (s3_proxy
+// backends map) node whose companion trust toggles are off. The backends map
+// only makes sense on an L1 that routes per-tenant traffic, and that routing
+// is only safe when the storage-prefix trust interceptor partitions tenant
+// keyspaces AND the shared auth secret gates who may forward tenant
+// metadata. A map without them would serve every unauthenticated caller
+// from tenant-selected backends.
+func validateMultiBackendTrust(c *config.Config, trustStoragePrefix bool, authSecret string) error {
+	if c.S3CloudStorage == nil || len(c.S3CloudStorage.Backends) == 0 {
+		return nil
+	}
+	if !trustStoragePrefix || authSecret == "" {
+		return fmt.Errorf("the s3_proxy 'backends' map requires the companion trust toggles: " +
+			"set BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER=1 (storage-prefix trust, fail-closed) " +
+			"and a non-empty BAZEL_REMOTE_L1_AUTH_SECRET (shared upstream auth secret), " +
+			"or remove 's3_proxy.backends'")
+	}
+	return nil
 }
 
 func startHttpServer(c *config.Config, httpServer **http.Server,

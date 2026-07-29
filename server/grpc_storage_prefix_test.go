@@ -14,17 +14,13 @@ import (
 func TestStoragePrefixFromIncomingContext(t *testing.T) {
 	t.Run("no metadata is rejected (fail-closed)", func(t *testing.T) {
 		_, err := storagePrefixFromIncomingContext(context.Background(), "")
-		if status.Code(err) != codes.InvalidArgument {
-			t.Fatalf("expected InvalidArgument for missing metadata, got %v", err)
-		}
+		requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "missing")
 	})
 
 	t.Run("missing prefix key is rejected", func(t *testing.T) {
 		md := metadata.Pairs("some-other-key", "value")
 		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "")
-		if status.Code(err) != codes.InvalidArgument {
-			t.Fatalf("expected InvalidArgument for missing prefix, got %v", err)
-		}
+		requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "missing")
 	})
 
 	t.Run("duplicate prefix values are rejected", func(t *testing.T) {
@@ -33,9 +29,7 @@ func TestStoragePrefixFromIncomingContext(t *testing.T) {
 			cache.StoragePrefixGRPCMetadataKey, "bazel/staging/us-west/43/1234/v0/bazel/",
 		)
 		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "")
-		if status.Code(err) != codes.InvalidArgument {
-			t.Fatalf("expected InvalidArgument for duplicate prefixes, got %v", err)
-		}
+		requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "duplicate")
 	})
 
 	t.Run("valid prefix is lifted onto context", func(t *testing.T) {
@@ -57,9 +51,7 @@ func TestStoragePrefixFromIncomingContext(t *testing.T) {
 		t.Run("rejects "+invalid, func(t *testing.T) {
 			md := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, invalid)
 			_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "")
-			if status.Code(err) != codes.InvalidArgument {
-				t.Fatalf("expected InvalidArgument for %q, got %v", invalid, err)
-			}
+			requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "invalid")
 		})
 	}
 }
@@ -112,7 +104,7 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 	})
 }
 
-func TestExemptFromStoragePrefix(t *testing.T) {
+func TestExemptFromTenantMetadata(t *testing.T) {
 	for method, want := range map[string]bool{
 		"/grpc.health.v1.Health/Check":                                  true,
 		"/grpc.health.v1.Health/Watch":                                  true,
@@ -120,8 +112,8 @@ func TestExemptFromStoragePrefix(t *testing.T) {
 		"/build.bazel.remote.execution.v2.ActionCache/GetActionResult":  false,
 		"/google.bytestream.ByteStream/Read":                            false,
 	} {
-		if got := exemptFromStoragePrefix(method); got != want {
-			t.Errorf("exemptFromStoragePrefix(%q) = %v, want %v", method, got, want)
+		if got := exemptFromTenantMetadata(method); got != want {
+			t.Errorf("exemptFromTenantMetadata(%q) = %v, want %v", method, got, want)
 		}
 	}
 }

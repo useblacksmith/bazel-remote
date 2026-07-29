@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -48,6 +49,11 @@ var transportMisses = promauto.NewCounterVec(prometheus.CounterOpts{
 var authMisses = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bazel_remote_grpcproxy_auth_miss_total",
 	Help: "Proxy backend requests rejected as unauthenticated/permission-denied, degraded to cache misses. Nonzero means the backend auth secret is misconfigured — alertable.",
+}, []string{"method"})
+
+var configRejectMisses = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_config_reject_miss_total",
+	Help: "Proxy backend requests rejected by the backend's own trust interceptors (marked with the cache.blacksmith.sh ErrorInfo domain), degraded to cache misses. Nonzero means FA/L1 config skew (backend allowlist or prefix trust drift) — alertable.",
 }, []string{"method"})
 
 var uploadsDropped = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -107,12 +113,39 @@ func isAuthFailure(err error) bool {
 	return ok && (s.Code() == codes.Unauthenticated || s.Code() == codes.PermissionDenied)
 }
 
+// isConfigRejection reports whether err was minted by the backend's own
+// trust interceptors: it carries the typed google.rpc.ErrorInfo detail with
+// cache.TrustRejectionErrorDomain. These are config-race rejections
+// (backend-selector allowlist drift, storage-prefix trust drift, FA/L1
+// version skew), never customer input, so they degrade to metered misses.
+// The check is deliberately marker-based, not error-class based: an
+// unmarked InvalidArgument (or Internal, Unknown, ...) from any other origin
+// keeps failing strictly.
+func isConfigRejection(err error) bool {
+	s, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	for _, detail := range s.Details() {
+		if info, ok := detail.(*errdetails.ErrorInfo); ok &&
+			info.GetDomain() == cache.TrustRejectionErrorDomain {
+			return true
+		}
+	}
+	return false
+}
+
 // missForBackendError applies the fail-open read contract to a backend
-// error: auth rejections and transport failures are counted on their
-// distinct meters and degraded to misses; anything else stays an error.
+// error: auth rejections, marked trust-interceptor rejections, and transport
+// failures are counted on their distinct meters and degraded to misses;
+// anything else stays an error.
 func missForBackendError(err error, method string) bool {
 	if isAuthFailure(err) {
 		authMisses.WithLabelValues(method).Inc()
+		return true
+	}
+	if isConfigRejection(err) {
+		configRejectMisses.WithLabelValues(method).Inc()
 		return true
 	}
 	if isTransportFailure(err) {

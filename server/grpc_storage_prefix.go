@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"crypto/subtle"
-	"strings"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 
@@ -26,20 +25,15 @@ import (
 // a shared keyspace is an isolation bug, and the server rejection is the
 // mechanism that surfaces it loudly. Health and capabilities RPCs are exempt
 // so probes and CheckCapabilities work without tenant context.
-
-// exemptFromStoragePrefix reports whether a gRPC method carries no tenant
-// data and is therefore allowed without prefix/auth metadata.
-func exemptFromStoragePrefix(fullMethod string) bool {
-	return strings.HasPrefix(fullMethod, "/grpc.health.v1.Health/") ||
-		strings.HasPrefix(fullMethod, "/build.bazel.remote.execution.v2.Capabilities/")
-}
+//
+// Prefix rejections carry the cache.TrustRejectionErrorDomain ErrorInfo
+// marker (the prefix is minted by the trusted upstream itself, so a
+// rejection means upstream drift, never customer input); auth rejections
+// stay unmarked Unauthenticated, which the upstream already degrades via its
+// code-based auth check.
 
 func storagePrefixFromIncomingContext(ctx context.Context, authSecret string) (context.Context, error) {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return ctx, status.Errorf(codes.InvalidArgument,
-			"missing %s metadata", cache.StoragePrefixGRPCMetadataKey)
-	}
+	md, _ := metadata.FromIncomingContext(ctx)
 
 	if authSecret != "" {
 		secrets := md.Get(cache.AuthSecretGRPCMetadataKey)
@@ -50,20 +44,13 @@ func storagePrefixFromIncomingContext(ctx context.Context, authSecret string) (c
 		}
 	}
 
-	values := md.Get(cache.StoragePrefixGRPCMetadataKey)
-	switch {
-	case len(values) == 0:
-		return ctx, status.Errorf(codes.InvalidArgument,
-			"missing %s metadata", cache.StoragePrefixGRPCMetadataKey)
-	case len(values) > 1:
-		// Duplicate prefixes mean an attachment bug upstream; honoring either
-		// value risks silent cross-tenant reads/writes, so reject loudly.
-		return ctx, status.Errorf(codes.InvalidArgument,
-			"duplicate %s metadata (%d values)", cache.StoragePrefixGRPCMetadataKey, len(values))
+	prefix, cause := singleMetadataValue(md, cache.StoragePrefixGRPCMetadataKey)
+	if cause != "" {
+		return ctx, trustRejection(cache.RejectionReasonStoragePrefix, cause,
+			"%s %s metadata", cause, cache.StoragePrefixGRPCMetadataKey)
 	}
-	prefix := values[0]
 	if !cache.ValidStoragePrefix(prefix) {
-		return ctx, status.Errorf(codes.InvalidArgument,
+		return ctx, trustRejection(cache.RejectionReasonStoragePrefix, "invalid",
 			"invalid %s metadata value", cache.StoragePrefixGRPCMetadataKey)
 	}
 	return cache.WithRequiredStoragePrefix(cache.WithStoragePrefix(ctx, prefix)), nil
@@ -75,7 +62,7 @@ func storagePrefixFromIncomingContext(ctx context.Context, authSecret string) (c
 // cache.AuthSecretGRPCMetadataKey metadata on every non-exempt RPC.
 func GRPCStoragePrefixUnaryServerInterceptor(authSecret string) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		if exemptFromStoragePrefix(info.FullMethod) {
+		if exemptFromTenantMetadata(info.FullMethod) {
 			return handler(ctx, req)
 		}
 		ctx, err := storagePrefixFromIncomingContext(ctx, authSecret)
@@ -91,22 +78,13 @@ func GRPCStoragePrefixUnaryServerInterceptor(authSecret string) grpc.UnaryServer
 // prefix onto the context.
 func GRPCStoragePrefixStreamServerInterceptor(authSecret string) grpc.StreamServerInterceptor {
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if exemptFromStoragePrefix(info.FullMethod) {
+		if exemptFromTenantMetadata(info.FullMethod) {
 			return handler(srv, ss)
 		}
 		ctx, err := storagePrefixFromIncomingContext(ss.Context(), authSecret)
 		if err != nil {
 			return err
 		}
-		return handler(srv, &storagePrefixServerStream{ServerStream: ss, ctx: ctx})
+		return handler(srv, &tenantMetadataServerStream{ServerStream: ss, ctx: ctx})
 	}
-}
-
-type storagePrefixServerStream struct {
-	grpc.ServerStream
-	ctx context.Context
-}
-
-func (s *storagePrefixServerStream) Context() context.Context {
-	return s.ctx
 }
