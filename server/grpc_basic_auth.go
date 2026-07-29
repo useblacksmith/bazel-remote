@@ -43,7 +43,7 @@ func NewGrpcBasicAuth(secrets auth.SecretProvider, allowUnauthenticatedReadOnly 
 func (b *GrpcBasicAuth) StreamServerInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 
 	// Always allow health service requests.
-	if info.FullMethod == grpcHealthServiceName {
+	if info.FullMethod == grpcHealthCheckMethod {
 		return handler(srv, ss)
 	}
 
@@ -74,7 +74,7 @@ func (b *GrpcBasicAuth) StreamServerInterceptor(srv interface{}, ss grpc.ServerS
 func (b *GrpcBasicAuth) UnaryServerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 
 	// Always allow health service requests.
-	if info.FullMethod == grpcHealthServiceName {
+	if info.FullMethod == grpcHealthCheckMethod {
 		return handler(ctx, req)
 	}
 

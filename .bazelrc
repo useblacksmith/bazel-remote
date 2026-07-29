@@ -1,5 +1,5 @@
 # Include git version info
 build --stamp
-build --workspace_status_command=$(pwd)/git-commit.sh
+build --workspace_status_command=./git-commit.sh
 
 common --enable_bzlmod

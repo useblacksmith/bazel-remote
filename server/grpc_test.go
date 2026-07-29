@@ -2738,7 +2738,9 @@ func TestHealthCheck(t *testing.T) {
 	fixture := grpcTestSetup(t)
 	defer func() { _ = os.Remove(fixture.tempdir) }()
 
-	req := grpc_health_v1.HealthCheckRequest{Service: grpcHealthServiceName}
+	// The empty service name is the overall-server health surface that
+	// external pollers (e.g. the L1 ring client) check.
+	req := grpc_health_v1.HealthCheckRequest{Service: ""}
 	resp, err := fixture.healthClient.Check(ctx, &req)
 	if err != nil {
 		t.Fatal(err)
