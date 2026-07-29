@@ -604,8 +604,30 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 			}
 			return nil, -1, err
 		}
+
+		// gRPC surfaces almost every backend rejection of a server-streaming
+		// call on the first Recv, not at stream creation, so the check above
+		// rarely fires. Pull the first message eagerly so a deferred
+		// rejection — the backend trust interceptors' marked config
+		// rejections, auth failures, transport errors — degrades to a
+		// metered miss right here, identically to the unary paths, instead
+		// of surfacing as an unmetered mid-fill error in the disk layer's
+		// catch-all. A deferred NotFound is the plain miss it always was;
+		// unmarked errors keep failing strictly, matching the unary
+		// contract.
+		first, err := stream.Recv()
+		if err != nil && err != io.EOF {
+			logResponse(r.errorLogger, "Read", err.Error(), kind, hash)
+			if status.Code(err) == codes.NotFound {
+				return nil, -1, nil
+			}
+			if missForBackendError(err, "cas_read") {
+				return nil, -1, nil
+			}
+			return nil, -1, err
+		}
 		logResponse(r.errorLogger, "Read", "Completed", kind, hash)
-		rc := StreamReadCloser[*bs.ReadResponse]{Stream: stream}
+		rc := StreamReadCloser[*bs.ReadResponse]{Stream: stream, buf: first.GetData()}
 		return &rc, size, nil
 	default:
 		return nil, -1, fmt.Errorf("unexpected kind %s", kind)

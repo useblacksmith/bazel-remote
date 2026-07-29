@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+	bs "google.golang.org/genproto/googleapis/bytestream"
 )
 
 // markedRejection builds the exact error shape the L1 trust interceptors
@@ -76,6 +77,7 @@ type rejectingBackend struct {
 	pb.UnimplementedActionCacheServer
 	pb.UnimplementedContentAddressableStorageServer
 	pb.UnimplementedCapabilitiesServer
+	bs.UnimplementedByteStreamServer
 	err error
 }
 
@@ -87,6 +89,13 @@ func (b *rejectingBackend) FindMissingBlobs(context.Context, *pb.FindMissingBlob
 	return nil, b.err
 }
 
+// Read rejects the stream from the handler, which the client observes on
+// its first Recv — exactly how the L1's trust interceptors reject
+// header-first ByteStream reads.
+func (b *rejectingBackend) Read(*bs.ReadRequest, bs.ByteStream_ReadServer) error {
+	return b.err
+}
+
 func newRejectingFixture(t *testing.T, backendErr error) *remoteGrpcProxyCache {
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)
@@ -94,6 +103,7 @@ func newRejectingFixture(t *testing.T, backendErr error) *remoteGrpcProxyCache {
 	backend := &rejectingBackend{err: backendErr}
 	pb.RegisterActionCacheServer(srv, backend)
 	pb.RegisterContentAddressableStorageServer(srv, backend)
+	bs.RegisterByteStreamServer(srv, backend)
 	go func() { _ = srv.Serve(listener) }()
 	t.Cleanup(srv.Stop)
 
@@ -143,6 +153,57 @@ func TestMarkedRejectionDegradesContainsToMiss(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(configRejectMisses.WithLabelValues("cas_contains")) - before; got != 1 {
 		t.Fatalf("configRejectMisses{cas_contains} delta = %v, want 1", got)
+	}
+}
+
+// TestMarkedRejectionDegradesStreamingCASGetToMiss covers the streaming
+// read path: a ByteStream Read rejection surfaces on the client's first
+// Recv, after the stream object exists. Get must pull that first message
+// eagerly and degrade a marked rejection to a metered miss, identically to
+// the unary paths — previously the error escaped into the disk layer's
+// mid-fill catch-all and was never counted as a config-reject miss.
+func TestMarkedRejectionDegradesStreamingCASGetToMiss(t *testing.T) {
+	r := newRejectingFixture(t, markedRejection(t, cache.RejectionReasonS3BackendSelector))
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+
+	before := testutil.ToFloat64(configRejectMisses.WithLabelValues("cas_read"))
+	rc, size, err := r.Get(context.Background(), cache.CAS, hash, 4)
+	if err != nil {
+		t.Fatalf("marked rejection must degrade streaming CAS Get to a miss, got err %v", err)
+	}
+	if rc != nil || size != -1 {
+		t.Fatalf("expected miss (nil, -1), got (%v, %d)", rc, size)
+	}
+	if got := testutil.ToFloat64(configRejectMisses.WithLabelValues("cas_read")) - before; got != 1 {
+		t.Fatalf("configRejectMisses{cas_read} delta = %v, want 1", got)
+	}
+}
+
+func TestStreamingCASGetNotFoundIsCleanMiss(t *testing.T) {
+	// A deferred NotFound (missing blob) on the first Recv is a plain,
+	// unmetered miss — not an error and not a config-reject.
+	r := newRejectingFixture(t, status.Error(codes.NotFound, "blob not found"))
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+
+	before := testutil.ToFloat64(configRejectMisses.WithLabelValues("cas_read"))
+	rc, size, err := r.Get(context.Background(), cache.CAS, hash, 4)
+	if err != nil || rc != nil || size != -1 {
+		t.Fatalf("expected clean miss (nil, -1, nil), got (%v, %d, %v)", rc, size, err)
+	}
+	if got := testutil.ToFloat64(configRejectMisses.WithLabelValues("cas_read")) - before; got != 0 {
+		t.Fatalf("configRejectMisses{cas_read} delta = %v, want 0", got)
+	}
+}
+
+func TestUnmarkedErrorStillFailsStreamingCASGet(t *testing.T) {
+	// Unmarked, non-transport errors keep failing strictly on the stream
+	// path, matching the unary contract.
+	r := newRejectingFixture(t, status.Error(codes.Internal, "backend exploded"))
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+
+	_, _, err := r.Get(context.Background(), cache.CAS, hash, 4)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("unmarked Internal must surface as an error, got %v", err)
 	}
 }
 
