@@ -95,12 +95,13 @@ func WithMaxBatchTotalSizeBytes(maxBatchTotalSizeBytes int64) GRPCServerOption {
 
 type readLimiter struct {
 	activeReads    *semaphore.Weighted
+	maxActiveReads int64
 	bufferBytes    *semaphore.Weighted
 	maxBufferBytes int64
 }
 
 func newReadLimiter(maxActiveReads, maxBufferBytes int64) *readLimiter {
-	l := &readLimiter{maxBufferBytes: maxBufferBytes}
+	l := &readLimiter{maxActiveReads: maxActiveReads, maxBufferBytes: maxBufferBytes}
 	if maxActiveReads > 0 {
 		l.activeReads = semaphore.NewWeighted(maxActiveReads)
 	}
@@ -136,5 +137,61 @@ func (l *readLimiter) acquireBuffer(ctx context.Context, size int64) (bool, erro
 func (l *readLimiter) releaseBuffer(size int64) {
 	if l != nil && l.bufferBytes != nil && size > 0 && size <= l.maxBufferBytes {
 		l.bufferBytes.Release(size)
+	}
+}
+
+// sourceBufferPool recycles ByteStream read source buffers so a burst of read
+// RPCs does not allocate one fresh chunk-sized array per request. The pool is
+// deliberately a plain bounded free list rather than a sync.Pool: the
+// active-read admission limit already guarantees at most maxActiveReads
+// buffers are in flight, so a channel of that capacity retains every buffer
+// across bursts instead of surrendering them to the next GC cycle.
+//
+// Reuse across RPCs is safe for the same reason the read loop reuses one
+// buffer across chunks within an RPC: ServerStream.SendMsg marshals the
+// response synchronously, so once Send returns (and therefore once the
+// handler returns) the transport holds no reference to the source array.
+type sourceBufferPool struct {
+	capacity int64
+	buffers  chan []byte
+}
+
+func newSourceBufferPool(count, capacity int64) *sourceBufferPool {
+	if count <= 0 || capacity <= 0 {
+		return nil
+	}
+	return &sourceBufferPool{
+		capacity: capacity,
+		buffers:  make(chan []byte, count),
+	}
+}
+
+// get returns a length-size buffer, recycling a pooled array when one is
+// available. A nil pool (limits disabled) or an oversized request falls back
+// to upstream bazel-remote behavior: one fresh allocation per call.
+func (p *sourceBufferPool) get(size int64) []byte {
+	if p == nil || size > p.capacity {
+		return make([]byte, size)
+	}
+	select {
+	case b := <-p.buffers:
+		return b[:size]
+	default:
+		// Allocate at full capacity so this array is admissible on put.
+		return make([]byte, size, p.capacity)
+	}
+}
+
+// put returns a buffer to the pool. Arrays that do not match the pool
+// capacity (fallback allocations) and buffers beyond the pool size are
+// dropped for the GC, which keeps the pool's retained memory exactly
+// count x capacity in the worst case.
+func (p *sourceBufferPool) put(b []byte) {
+	if p == nil || int64(cap(b)) != p.capacity {
+		return
+	}
+	select {
+	case p.buffers <- b[:0]:
+	default:
 	}
 }

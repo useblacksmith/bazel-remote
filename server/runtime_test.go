@@ -126,3 +126,67 @@ func TestMaxBatchTotalSizeOption(t *testing.T) {
 		t.Fatal("expected negative max batch total size to fail")
 	}
 }
+
+func TestSourceBufferPoolRecyclesBuffers(t *testing.T) {
+	pool := newSourceBufferPool(2, 16)
+
+	first := pool.get(8)
+	if len(first) != 8 || cap(first) != 16 {
+		t.Fatalf("got len=%d cap=%d, want len=8 cap=16", len(first), cap(first))
+	}
+	first[0] = 0x42
+	pool.put(first)
+
+	second := pool.get(4)
+	if len(second) != 4 {
+		t.Fatalf("got len=%d, want 4", len(second))
+	}
+	if second[0] != 0x42 {
+		t.Fatal("expected the pooled backing array to be recycled")
+	}
+}
+
+func TestSourceBufferPoolDropsForeignAndExcessBuffers(t *testing.T) {
+	pool := newSourceBufferPool(1, 16)
+
+	// Arrays that don't match the pool capacity must not be admitted.
+	pool.put(make([]byte, 8))
+	if len(pool.buffers) != 0 {
+		t.Fatal("foreign buffer was admitted to the pool")
+	}
+
+	// Puts beyond the pool size must not block; extras go to the GC.
+	pool.put(make([]byte, 0, 16))
+	pool.put(make([]byte, 0, 16))
+	if len(pool.buffers) != 1 {
+		t.Fatalf("pool holds %d buffers, want 1", len(pool.buffers))
+	}
+}
+
+func TestSourceBufferPoolNilAndOversizedFallBackToAllocation(t *testing.T) {
+	var pool *sourceBufferPool
+	buf := pool.get(8)
+	if len(buf) != 8 {
+		t.Fatalf("nil pool returned len=%d, want 8", len(buf))
+	}
+	pool.put(buf)
+
+	pool = newSourceBufferPool(1, 4)
+	oversized := pool.get(8)
+	if len(oversized) != 8 {
+		t.Fatalf("oversized get returned len=%d, want 8", len(oversized))
+	}
+	pool.put(oversized)
+	if len(pool.buffers) != 0 {
+		t.Fatal("oversized buffer must not be admitted to the pool")
+	}
+}
+
+func TestSourceBufferPoolDisabledWithoutPositiveBounds(t *testing.T) {
+	if pool := newSourceBufferPool(0, 16); pool != nil {
+		t.Fatal("expected nil pool for zero count")
+	}
+	if pool := newSourceBufferPool(4, 0); pool != nil {
+		t.Fatal("expected nil pool for zero capacity")
+	}
+}

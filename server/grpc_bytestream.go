@@ -193,7 +193,14 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		defer s.runtimeMetrics.ByteStreamReadBufferReleased(ctx, bufSize)
 	}
 
-	buf := make([]byte, bufSize)
+	// Note on accounting: the byte semaphore above reserves the requested
+	// bufSize, but a pooled array always retains full chunk capacity. The
+	// true retained-memory bound is therefore the pool's count x capacity
+	// (maxActiveReads x readChunkSizeBytes), not the semaphore total.
+	buf := s.sourceBuffers.get(bufSize)
+	// Recycle before the deferred budget release admits the next reader, so
+	// an admitted reader finds a pooled array instead of allocating.
+	defer s.sourceBuffers.put(buf)
 
 	var chunkResp bytestream.ReadResponse
 	for {
@@ -432,6 +439,19 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 
 	cmp := casblob.Identity
 
+	// LOAD-BEARING CONSUMPTION CONTRACT: this receive loop is strictly
+	// sequential. Every path either fully consumes req.Data before calling
+	// srv.Recv() for the next message - pw.Write(req.Data) returns only after
+	// the io.Pipe reader has copied all bytes out - or exits the goroutine
+	// without another Recv. The handler sends its response only after this
+	// goroutine has posted to recvResult/putResult and stopped touching req.
+	//
+	// Embedders depend on this ordering to recycle the backing arrays of
+	// decoded WriteRequest payloads (see the FA agent's write-request buffer
+	// controller and TestWriteRecvLoopConsumesPayloadBeforeNextRecv). If a
+	// rebase introduces pipelining, buffering of req.Data across iterations,
+	// or an early response, that reuse becomes silent cross-stream cache
+	// corruption - re-verify the embedder contract before changing this loop.
 	go func() {
 		firstIteration := true
 		var resourceName string
@@ -451,7 +471,14 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 				return
 			}
 			if err != nil {
-				recvResult <- status.Error(codes.Internal, err.Error())
+				// Preserve status errors (e.g. Canceled from a client
+				// disconnect surfaced through the stream) instead of
+				// flattening everything to Internal.
+				if _, ok := status.FromError(err); ok {
+					recvResult <- err
+				} else {
+					recvResult <- status.Error(codes.Internal, err.Error())
+				}
 				return
 			}
 
