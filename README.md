@@ -382,7 +382,8 @@ OPTIONS:
       [$BAZEL_REMOTE_S3_KEY_VERSION]
 
    --s3.max_idle_conns value The maximum number of idle connections to use
-      when using the S3 proxy backend. (default: 1024)
+      when using the S3 proxy backend. Applied to both the transport total
+      and the per-host limit. (default: 64 total / 32 per host)
       [$BAZEL_REMOTE_S3_MAX_IDLE_CONNS]
 
    --azblob.tenant_id value The Azure blob storage tenant id to use when

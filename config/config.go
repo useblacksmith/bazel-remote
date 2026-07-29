@@ -151,6 +151,21 @@ type YamlConfig struct {
 
 const disabledGRPCListener = "none"
 
+// Proxy-backend upload-pool defaults. The single-backend defaults are
+// bazel-remote's historical ones (also mirrored by the CLI flag defaults in
+// utils/flags). In multi-backend S3 mode the pool is per backend and the
+// queue preallocates (~200B/slot), so the historical defaults would cost
+// ~200MB + 100 goroutines per map entry; multi-backend mode therefore
+// lowers the per-backend defaults, and an explicit top-level
+// num_uploaders/max_queued_uploads setting still applies per backend.
+const (
+	defaultNumUploaders     = 100
+	defaultMaxQueuedUploads = 1000000
+
+	multiBackendNumUploaders     = 25
+	multiBackendMaxQueuedUploads = 100000
+)
+
 var defaultDurationBuckets = []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320}
 
 // newFromArgs returns a validated Config with the specified values, and
@@ -256,9 +271,9 @@ func NewFromYaml(data []byte) (*Config, error) {
 		Config: Config{
 			StorageMode:            "zstd",
 			ZstdImplementation:     "go",
-			NumUploaders:           100,
+			NumUploaders:           defaultNumUploaders,
 			MinTLSVersion:          "1.0",
-			MaxQueuedUploads:       1000000,
+			MaxQueuedUploads:       defaultMaxQueuedUploads,
 			MaxBlobSize:            math.MaxInt64,
 			MaxProxyBlobSize:       math.MaxInt64,
 			MetricsDurationBuckets: defaultDurationBuckets,
@@ -422,6 +437,13 @@ func validateConfig(c *Config) error {
 	}
 
 	if c.S3CloudStorage != nil {
+		// Resolve the connection-recycle default here so the s3proxy always
+		// receives a concrete duration (positive recycles, negative
+		// disables); the YAML surface uses 0/unset to mean "default".
+		if c.S3CloudStorage.ConnRecycleInterval == 0 {
+			c.S3CloudStorage.ConnRecycleInterval = defaultConnRecycleInterval
+		}
+
 		if !s3proxy.IsValidAuthMethod(c.S3CloudStorage.AuthMethod) {
 			return fmt.Errorf("invalid s3.auth_method: %s", c.S3CloudStorage.AuthMethod)
 		}
@@ -441,6 +463,27 @@ func validateConfig(c *Config) error {
 			c.S3CloudStorage.SignatureType != "anonymous" {
 			return fmt.Errorf("s3.signature_type must be one of: \"v2\", \"v4\", \"v4streaming\", \"anonymous\" or empty/unspecified, found: \"%s\"",
 				c.S3CloudStorage.SignatureType)
+		}
+
+		if len(c.S3CloudStorage.Backends) > 0 {
+			defaults := 0
+			for key, backend := range c.S3CloudStorage.Backends {
+				if key == "" {
+					return errors.New("s3.backends keys must be non-empty backend selectors")
+				}
+				if backend.Default {
+					defaults++
+				}
+				if _, err := c.S3CloudStorage.mergedBackendConfig(key); err != nil {
+					return err
+				}
+				if _, err := c.S3CloudStorage.allowedBucketsForBackend(key); err != nil {
+					return err
+				}
+			}
+			if defaults != 1 {
+				return fmt.Errorf("s3.backends must designate exactly one entry with 'default: true', found %d", defaults)
+			}
 		}
 	}
 
@@ -501,6 +544,25 @@ func validateConfig(c *Config) error {
 	}
 
 	return nil
+}
+
+// perBackendUploadLimits resolves the upload-pool sizing for one backend of
+// a multi-backend S3 proxy. num_uploaders/max_queued_uploads apply per
+// backend (queue isolation is the point), so when they are left at the
+// single-backend defaults the multi-backend defaults take over — the
+// historical defaults preallocate ~200MB of queue and 100 goroutines per
+// map entry. Any explicitly configured non-default value is inherited
+// unchanged by every backend.
+func (c *Config) perBackendUploadLimits() (numUploaders, maxQueuedUploads int) {
+	numUploaders = c.NumUploaders
+	if numUploaders == defaultNumUploaders {
+		numUploaders = multiBackendNumUploaders
+	}
+	maxQueuedUploads = c.MaxQueuedUploads
+	if maxQueuedUploads == defaultMaxQueuedUploads {
+		maxQueuedUploads = multiBackendMaxQueuedUploads
+	}
+	return numUploaders, maxQueuedUploads
 }
 
 func Get(ctx *cli.Context) (*Config, error) {
@@ -573,6 +635,8 @@ func get(ctx *cli.Context) (*Config, error) {
 			AWSProfile:               ctx.String("s3.aws_profile"),
 			AWSSharedCredentialsFile: ctx.String("s3.aws_shared_credentials_file"),
 			MaxIdleConns:             ctx.Int("s3.max_idle_conns"),
+			// ConnRecycleInterval is YAML-only; flag mode gets the default,
+			// resolved in validateConfig.
 		}
 	}
 
