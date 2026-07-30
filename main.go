@@ -413,7 +413,15 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 	if os.Getenv("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER") == "1" {
 		authSecret := os.Getenv("BAZEL_REMOTE_L1_AUTH_SECRET")
 		if authSecret == "" {
-			log.Println("WARNING: storage-prefix trust enabled without BAZEL_REMOTE_L1_AUTH_SECRET; relying on network-level access control only")
+			// Trust mode without the shared secret means anyone who can
+			// reach the port gets prefix-scoped cache access — the only
+			// barrier left is network ACLs, and an ACL slip fails silently.
+			// That posture must be an explicit dev-only choice, never the
+			// result of a secret going missing from the node's env file.
+			if os.Getenv("BAZEL_REMOTE_L1_UNSAFE_NO_AUTH_SECRET") != "1" {
+				return fmt.Errorf("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER=1 requires BAZEL_REMOTE_L1_AUTH_SECRET; refusing to start with network-level access control as the only barrier (set BAZEL_REMOTE_L1_UNSAFE_NO_AUTH_SECRET=1 to accept this for development)")
+			}
+			log.Println("WARNING: storage-prefix trust enabled WITHOUT an auth secret (BAZEL_REMOTE_L1_UNSAFE_NO_AUTH_SECRET=1); relying on network-level access control only — development posture")
 		}
 		log.Println("Trusting forwarded storage-prefix gRPC metadata, fail-closed (BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER=1)")
 		streamInterceptors = append(streamInterceptors, server.GRPCStoragePrefixStreamServerInterceptor(authSecret))
