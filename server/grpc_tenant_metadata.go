@@ -2,7 +2,11 @@ package server
 
 import (
 	"context"
+	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 
@@ -45,6 +49,29 @@ func singleMetadataValue(md metadata.MD, key string) (value string, cause string
 	}
 }
 
+// trustRejectionLogEvery rate-limits rejection logging to one line per
+// (reason, cause) pair per interval. A misconfigured fleet can reject at
+// full request rate, and rejections are already metered per cause
+// (bazel_remote_..._rejected_total) — the log line exists so a live
+// debugging session on the node sees the incident in journald at all
+// (validated 2026-07-30: counters incremented, journal stayed empty),
+// not to reproduce the counter's volume.
+const trustRejectionLogEvery = 30 * time.Second
+
+var trustRejectionLastLog sync.Map // "reason/cause" -> *atomic.Int64 (unix nanos)
+
+func logTrustRejection(reason, cause, message string) {
+	gateAny, _ := trustRejectionLastLog.LoadOrStore(reason+"/"+cause, new(atomic.Int64))
+	gate := gateAny.(*atomic.Int64)
+	last := gate.Load()
+	now := time.Now().UnixNano()
+	if now-last < int64(trustRejectionLogEvery) || !gate.CompareAndSwap(last, now) {
+		return
+	}
+	log.Printf("trust interceptor rejected request (reason=%s cause=%s, logged at most once per %v per cause; see the *_rejected_total counters for volume): %s",
+		reason, cause, trustRejectionLogEvery, message)
+}
+
 // trustRejection mints an InvalidArgument rejection carrying the typed
 // google.rpc.ErrorInfo marker (cache.TrustRejectionErrorDomain). The trusted
 // upstream's grpcproxy degrades marked rejections to metered cache misses —
@@ -53,6 +80,7 @@ func singleMetadataValue(md metadata.MD, key string) (value string, cause string
 // by our own trust interceptors may carry this marker.
 func trustRejection(reason, cause, format string, args ...interface{}) error {
 	st := status.Newf(codes.InvalidArgument, format, args...)
+	logTrustRejection(reason, cause, st.Message())
 	detailed, err := st.WithDetails(&errdetails.ErrorInfo{
 		Domain:   cache.TrustRejectionErrorDomain,
 		Reason:   reason,
