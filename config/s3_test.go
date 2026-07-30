@@ -159,8 +159,9 @@ s3_proxy:
 }
 
 // Multi-backend mode lowers the per-backend upload-pool defaults (queues
-// preallocate per backend); explicit top-level settings are inherited
-// per backend unchanged.
+// preallocate per backend); explicitly configured settings are inherited
+// per backend unchanged — including values that happen to equal the
+// single-backend defaults (presence-aware, not value-equality).
 func TestPerBackendUploadLimits(t *testing.T) {
 	defaults := &Config{NumUploaders: defaultNumUploaders, MaxQueuedUploads: defaultMaxQueuedUploads}
 	numUploaders, maxQueued := defaults.perBackendUploadLimits()
@@ -169,10 +170,71 @@ func TestPerBackendUploadLimits(t *testing.T) {
 			numUploaders, maxQueued, multiBackendNumUploaders, multiBackendMaxQueuedUploads)
 	}
 
-	explicit := &Config{NumUploaders: 40, MaxQueuedUploads: 250000}
+	explicit := &Config{
+		NumUploaders: 40, MaxQueuedUploads: 250000,
+		NumUploadersExplicit: true, MaxQueuedUploadsExplicit: true,
+	}
 	numUploaders, maxQueued = explicit.perBackendUploadLimits()
 	if numUploaders != 40 || maxQueued != 250000 {
 		t.Fatalf("explicit limits resolved to (%d, %d), want (40, 250000)", numUploaders, maxQueued)
+	}
+
+	// The equality trap: an operator passing exactly the single-backend
+	// defaults must keep them per backend — this was the "explicit
+	// --num_uploaders 100 silently becomes 25/backend" bug.
+	explicitDefaults := &Config{
+		NumUploaders: defaultNumUploaders, MaxQueuedUploads: defaultMaxQueuedUploads,
+		NumUploadersExplicit: true, MaxQueuedUploadsExplicit: true,
+	}
+	numUploaders, maxQueued = explicitDefaults.perBackendUploadLimits()
+	if numUploaders != defaultNumUploaders || maxQueued != defaultMaxQueuedUploads {
+		t.Fatalf("explicit default-valued limits resolved to (%d, %d), want (%d, %d)",
+			numUploaders, maxQueued, defaultNumUploaders, defaultMaxQueuedUploads)
+	}
+}
+
+// The YAML path must record key presence, not just values, so explicit
+// default-valued settings survive multi-backend resolution.
+func TestUploadLimitPresenceFromYaml(t *testing.T) {
+	withKeys, err := NewFromYaml([]byte(`host: localhost
+port: 8080
+dir: /opt/cache-dir
+max_size: 100
+num_uploaders: 100
+max_queued_uploads: 1000000
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !withKeys.NumUploadersExplicit || !withKeys.MaxQueuedUploadsExplicit {
+		t.Fatalf("explicit yaml keys not recorded: NumUploadersExplicit=%v MaxQueuedUploadsExplicit=%v",
+			withKeys.NumUploadersExplicit, withKeys.MaxQueuedUploadsExplicit)
+	}
+
+	withoutKeys, err := NewFromYaml([]byte(`host: localhost
+port: 8080
+dir: /opt/cache-dir
+max_size: 100
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutKeys.NumUploadersExplicit || withoutKeys.MaxQueuedUploadsExplicit {
+		t.Fatalf("absent yaml keys recorded as explicit: NumUploadersExplicit=%v MaxQueuedUploadsExplicit=%v",
+			withoutKeys.NumUploadersExplicit, withoutKeys.MaxQueuedUploadsExplicit)
+	}
+}
+
+// The aggregate worst-case FD consumption of the per-backend queues must be
+// asserted against the process NOFILE budget at startup, not discovered as
+// serving-path exhaustion under write pressure.
+func TestAggregateUploadFDBudget(t *testing.T) {
+	if err := assertAggregateUploadFDBudget(2, 100); err != nil {
+		t.Fatalf("tiny aggregate rejected: %v", err)
+	}
+	// backends × queue chosen to exceed any plausible soft limit.
+	if err := assertAggregateUploadFDBudget(1<<20, 1<<20); err == nil {
+		t.Fatal("absurd aggregate accepted; want budget error")
 	}
 }
 

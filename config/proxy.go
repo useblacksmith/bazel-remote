@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"syscall"
 
 	"github.com/buchgr/bazel-remote/v2/cache/azblobproxy"
 	"github.com/buchgr/bazel-remote/v2/cache/gcsproxy"
@@ -23,6 +24,33 @@ import (
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	prom "github.com/prometheus/client_golang/prometheus"
 )
+
+// aggregateUploadFDBudgetFraction caps how much of the process's soft
+// RLIMIT_NOFILE the multi-backend upload queues may collectively pin in the
+// worst case. Half is deliberately conservative: the other half must stay
+// free for the serving path (client connections, disk cache FDs), which is
+// the tier that must never lose to background write-through.
+const aggregateUploadFDBudgetFraction = 0.5
+
+// assertAggregateUploadFDBudget fails startup when the worst-case FD
+// consumption of the per-backend upload queues (backends × queue slots, one
+// open reader each) exceeds the budget fraction of the soft NOFILE limit.
+func assertAggregateUploadFDBudget(backendCount, maxQueuedUploadsPerBackend int) error {
+	var rlimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlimit); err != nil {
+		// No limit visible (unusual platform) — nothing to assert against.
+		return nil
+	}
+	budget := uint64(float64(rlimit.Cur) * aggregateUploadFDBudgetFraction)
+	aggregate := uint64(backendCount) * uint64(maxQueuedUploadsPerBackend)
+	if aggregate > budget {
+		return fmt.Errorf(
+			"aggregate upload-queue FD budget exceeded: %d backends × %d max_queued_uploads = %d worst-case open readers, over %d (%.0f%% of soft RLIMIT_NOFILE %d); lower max_queued_uploads (it applies PER backend) or raise LimitNOFILE",
+			backendCount, maxQueuedUploadsPerBackend, aggregate,
+			budget, aggregateUploadFDBudgetFraction*100, rlimit.Cur)
+	}
+	return nil
+}
 
 func getTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	config := &tls.Config{}
@@ -144,6 +172,15 @@ func (c *Config) setProxy() error {
 			// Upload pools are per backend; resolve the (lower) multi-backend
 			// defaults unless explicitly overridden at the top level.
 			numUploaders, maxQueuedUploads := c.perBackendUploadLimits()
+			// The queue limits are PER BACKEND and every queued upload holds
+			// an open file descriptor (the reader is opened before enqueue),
+			// so the process-wide worst case is len(backends) × queue size.
+			// Assert that aggregate against the process's actual FD budget at
+			// startup — a config that could exhaust NOFILE under write
+			// pressure must fail the converge, not the serving path later.
+			if err := assertAggregateUploadFDBudget(len(specs), maxQueuedUploads); err != nil {
+				return err
+			}
 			proxy, err := s3proxy.NewMulti(
 				specs,
 				c.S3CloudStorage.UpdateTimestamps,
