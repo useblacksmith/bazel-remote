@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -83,17 +84,22 @@ type ZstdLimits struct {
 type boundedGoZstd struct {
 	goZstd
 
-	sem      *semaphore.Weighted
-	timeout  time.Duration
-	metrics  ZstdMetrics
-	encoders chan *zstd.Encoder // free list; retention == MaxActiveEncoders
+	sem     *semaphore.Weighted
+	timeout time.Duration
+	metrics ZstdMetrics
+	// encoders is reuse only, never a bound: the semaphore alone caps live
+	// encoder memory. A sync.Pool is safe here because concurrency-1
+	// encoders own no goroutines between uses, so a silently dropped
+	// encoder is plain GC-reclaimable heap, and the GC draining the pool
+	// means idle hosts retain no encoder memory at all.
+	encoders sync.Pool
 	options  []zstd.EOption
 }
 
 // NewBoundedGoZstd returns a ZstdImpl backed by the pure-Go zstd
-// implementation whose streaming encoders are bounded by limits. Encoders
-// are retained on a free list of the same size as the admission budget, so
-// steady-state memory equals the worst-case bound and does not churn.
+// implementation whose streaming encoders are bounded by limits. Live
+// encoder memory is capped at MaxActiveEncoders x per-encoder cost; idle
+// encoders are reused opportunistically and drained by the GC.
 func NewBoundedGoZstd(limits ZstdLimits) (ZstdImpl, error) {
 	if limits.MaxActiveEncoders <= 0 {
 		return nil, fmt.Errorf("MaxActiveEncoders must be positive: %d", limits.MaxActiveEncoders)
@@ -122,11 +128,10 @@ func NewBoundedGoZstd(limits ZstdLimits) (ZstdImpl, error) {
 	_ = probe.Close()
 
 	return &boundedGoZstd{
-		sem:      semaphore.NewWeighted(limits.MaxActiveEncoders),
-		timeout:  limits.EncoderAdmissionTimeout,
-		metrics:  limits.Metrics,
-		encoders: make(chan *zstd.Encoder, limits.MaxActiveEncoders),
-		options:  options,
+		sem:     semaphore.NewWeighted(limits.MaxActiveEncoders),
+		timeout: limits.EncoderAdmissionTimeout,
+		metrics: limits.Metrics,
+		options: options,
 	}, nil
 }
 
@@ -163,10 +168,8 @@ func (b *boundedGoZstd) GetEncoder(ctx context.Context, out io.WriteCloser) (zst
 		b.metrics.EncoderAdmissionCompleted(EncoderAdmitted, time.Since(waitStarted))
 	}
 
-	var enc *zstd.Encoder
-	select {
-	case enc = <-b.encoders:
-	default:
+	enc, ok := b.encoders.Get().(*zstd.Encoder)
+	if !ok {
 		// The semaphore guarantees at most MaxActiveEncoders live encoders,
 		// so this allocation cannot exceed the budget.
 		enc, err = zstd.NewWriter(nil, b.options...)
@@ -180,16 +183,14 @@ func (b *boundedGoZstd) GetEncoder(ctx context.Context, out io.WriteCloser) (zst
 	return &boundedEncoder{owner: b, enc: enc}, nil
 }
 
-// release returns capacity and, when the encoder is still healthy, retains
-// it on the free list. A nil encoder (or a full free list, which cannot
-// happen while the semaphore is held but is handled defensively) releases
-// capacity only.
+// release returns capacity and, when the encoder is still healthy, offers
+// it to the reuse pool. A nil encoder releases capacity only.
 func (b *boundedGoZstd) release(enc *zstd.Encoder) {
 	if enc != nil {
-		select {
-		case b.encoders <- enc:
-		default:
-		}
+		// Drop the reference to the caller's writer so pooling the encoder
+		// does not pin the response stream it last wrote to.
+		enc.Reset(nil)
+		b.encoders.Put(enc)
 	}
 	b.sem.Release(1)
 	if b.metrics != nil {

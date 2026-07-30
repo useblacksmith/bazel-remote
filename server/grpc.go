@@ -49,7 +49,6 @@ type grpcServer struct {
 	runtimeMetrics         RuntimeMetrics
 	readLimiter            *readLimiter
 	sourceBuffers          *sourceBufferPool
-	zstdDecoders           zstdDecoderSource
 	// writePayloadConsumed, when set, is invoked once per fully-consumed
 	// ByteStream WriteRequest; see WithWritePayloadConsumed.
 	writePayloadConsumed func(*bytestream.WriteRequest)
@@ -99,7 +98,6 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 		mangleACKeys:        mangleACKeys,
 		maxCasBlobSizeBytes: maxCasBlobSizeBytes,
 		readChunkSizeBytes:  maxChunkSize,
-		zstdDecoders:        syncPoolDecoders{},
 	}
 	for _, option := range options {
 		if err := option(s); err != nil {

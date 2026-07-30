@@ -2,10 +2,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "go_default_library",
-    srcs = [
-        "bounded.go",
-        "zstdpool.go",
-    ],
+    srcs = ["zstdpool.go"],
     importpath = "github.com/buchgr/bazel-remote/v2/utils/zstdpool",
     visibility = ["//visibility:public"],
     deps = [
@@ -17,10 +14,7 @@ go_library(
 go_test(
     name = "go_default_test",
     size = "small",
-    srcs = [
-        "bounded_test.go",
-        "codecmem_test.go",
-    ],
+    srcs = ["codecmem_test.go"],
     deps = [
         ":go_default_library",
         "@com_github_klauspost_compress//zstd:go_default_library",

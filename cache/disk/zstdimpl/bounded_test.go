@@ -88,7 +88,7 @@ func TestBoundedGoZstdRoundTrip(t *testing.T) {
 			}
 		}
 
-		// Reuse the same slot several times to cover the free-list path.
+		// Reuse the same slot several times to cover the pool-reuse path.
 		for i := 0; i < 3; i++ {
 			var compressed bytes.Buffer
 			enc, err := impl.GetEncoder(context.Background(), nopWriteCloser{&compressed})

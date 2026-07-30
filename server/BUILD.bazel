@@ -12,7 +12,6 @@ go_library(
         "grpc_idle_timeout.go",
         "http.go",
         "runtime.go",
-        "zstd_decoders.go",
     ],
     importpath = "github.com/buchgr/bazel-remote/v2/server",
     visibility = ["//visibility:public"],
@@ -57,9 +56,9 @@ go_test(
         "grpc_bytestream_write_contract_test.go",
         "grpc_cas_spliceblobs_test.go",
         "grpc_test.go",
+        "grpc_zstd_test.go",
         "http_test.go",
         "runtime_test.go",
-        "zstd_decoders_test.go",
     ],
     embed = [":go_default_library"],
     deps = [
