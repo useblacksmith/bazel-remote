@@ -17,6 +17,7 @@ import (
 	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
 	"github.com/buchgr/bazel-remote/v2/utils/validate"
 )
 
@@ -195,46 +196,20 @@ func (s *grpcServer) getBlobData(ctx context.Context, hash string, size int64) (
 }
 
 func (s *grpcServer) getBlobResponse(ctx context.Context, digest *pb.Digest, allowZstd bool) *pb.BatchReadBlobsResponse_Response {
+	if allowZstd {
+		if r, ok := s.getZstdBlobResponse(ctx, digest); ok {
+			return r
+		}
+		// Bounded encoder capacity is busy. Fall back to identity encoding,
+		// which REAPI always permits, instead of parking this unary handler
+		// (and its buffered response payloads) in the encoder admission
+		// queue behind the streaming read path's waiters.
+	}
+
 	r := pb.BatchReadBlobsResponse_Response{Digest: digest}
 
 	var data []byte
 	var err error
-
-	if allowZstd {
-		rc, foundSize, err := s.cache.GetZstd(ctx, digest.Hash, digest.SizeBytes, 0)
-		if rc != nil {
-			defer func() { _ = rc.Close() }()
-		}
-
-		if err != nil {
-			s.errorLogger.Printf("GRPC CAS GET %s INTERNAL ERROR: %v", digest.Hash, err)
-			// Using codes.NotFound as default, in order to keep historical behaviour.
-			// That ensures that clients handle for example corrupted headers
-			// as normal cache misses and allows clients to gracefully replace corrupted
-			// entries on disk by new uploads.
-			// The drawback is that it hides the real reason in e.g. prometheus metrics.
-			r.Status = &status.Status{Code: int32(gRPCErrCode(err, codes.NotFound))}
-			return &r
-		}
-
-		if rc == nil || foundSize != digest.SizeBytes {
-			s.accessLogger.Printf("GRPC CAS GET %s NOT FOUND", digest.Hash)
-			r.Status = &status.Status{Code: int32(code.Code_NOT_FOUND)}
-			return &r
-		}
-
-		data, err := io.ReadAll(rc)
-		if err != nil {
-			s.errorLogger.Printf("GRPC CAS GET %s INTERNAL ERROR: %v", digest.Hash, err)
-			r.Status = &status.Status{Code: int32(code.Code_INTERNAL)}
-			return &r
-		}
-
-		r.Data = data
-		r.Compressor = pb.Compressor_ZSTD
-
-		return &r
-	}
 
 	data, err = s.getBlobData(ctx, digest.Hash, digest.SizeBytes)
 	if err == errBlobNotFound {
@@ -259,6 +234,51 @@ func (s *grpcServer) getBlobResponse(ctx context.Context, digest *pb.Digest, all
 	s.accessLogger.Printf("GRPC CAS GET %s OK", digest.Hash)
 	r.Status = &status.Status{Code: int32(codes.OK)}
 	return &r
+}
+
+// getZstdBlobResponse attempts to serve one batch read zstd-compressed. It
+// uses non-blocking encoder admission and reports ok=false on saturation so
+// the caller can fall back to identity encoding instead of queueing.
+func (s *grpcServer) getZstdBlobResponse(ctx context.Context, digest *pb.Digest) (*pb.BatchReadBlobsResponse_Response, bool) {
+	r := pb.BatchReadBlobsResponse_Response{Digest: digest}
+
+	rc, foundSize, err := s.cache.GetZstd(
+		zstdimpl.FastFailAdmission(ctx), digest.Hash, digest.SizeBytes, 0)
+	if rc != nil {
+		defer func() { _ = rc.Close() }()
+	}
+
+	if err != nil {
+		if errors.Is(err, zstdimpl.ErrEncoderSaturated) {
+			return nil, false
+		}
+		s.errorLogger.Printf("GRPC CAS GET %s INTERNAL ERROR: %v", digest.Hash, err)
+		// Using codes.NotFound as default, in order to keep historical behaviour.
+		// That ensures that clients handle for example corrupted headers
+		// as normal cache misses and allows clients to gracefully replace corrupted
+		// entries on disk by new uploads.
+		// The drawback is that it hides the real reason in e.g. prometheus metrics.
+		r.Status = &status.Status{Code: int32(gRPCErrCode(err, codes.NotFound))}
+		return &r, true
+	}
+
+	if rc == nil || foundSize != digest.SizeBytes {
+		s.accessLogger.Printf("GRPC CAS GET %s NOT FOUND", digest.Hash)
+		r.Status = &status.Status{Code: int32(code.Code_NOT_FOUND)}
+		return &r, true
+	}
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		s.errorLogger.Printf("GRPC CAS GET %s INTERNAL ERROR: %v", digest.Hash, err)
+		r.Status = &status.Status{Code: int32(code.Code_INTERNAL)}
+		return &r, true
+	}
+
+	r.Data = data
+	r.Compressor = pb.Compressor_ZSTD
+
+	return &r, true
 }
 
 func (s *grpcServer) BatchReadBlobs(ctx context.Context,

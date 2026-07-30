@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -37,7 +38,29 @@ const (
 	EncoderAdmitted          EncoderAdmissionOutcome = "admitted"
 	EncoderAdmissionTimeout  EncoderAdmissionOutcome = "timeout"
 	EncoderAdmissionCanceled EncoderAdmissionOutcome = "canceled"
+	// EncoderAdmissionRejected means the attempt failed immediately: either
+	// the caller requested non-blocking admission (FastFailAdmission) with
+	// no free slot, or the admission waiter ceiling was reached.
+	EncoderAdmissionRejected EncoderAdmissionOutcome = "rejected"
 )
+
+// fastFailKey marks a context as requesting non-blocking encoder admission.
+type fastFailKey struct{}
+
+// FastFailAdmission returns a context that makes bounded encoder admission
+// non-blocking: when no encoder slot is immediately free, GetEncoder fails
+// with ErrEncoderSaturated instead of queueing. Intended for callers with a
+// cheaper fallback than waiting - for example batch reads, which can serve
+// identity-encoded data instead of parking a unary handler (and its
+// response buffers) behind the streaming read path's waiters.
+func FastFailAdmission(ctx context.Context) context.Context {
+	return context.WithValue(ctx, fastFailKey{}, true)
+}
+
+func fastFailRequested(ctx context.Context) bool {
+	requested, _ := ctx.Value(fastFailKey{}).(bool)
+	return requested
+}
 
 // ZstdMetrics receives measurements from a bounded ZstdImpl.
 // Implementations must be safe for concurrent use. All methods are called
@@ -66,6 +89,14 @@ type ZstdLimits struct {
 	// caller's context is done.
 	EncoderAdmissionTimeout time.Duration
 
+	// MaxAdmissionWaiters bounds how many admission attempts may be queued
+	// (or in flight) at once; attempts beyond the ceiling fail immediately
+	// with ErrEncoderSaturated instead of parking their handler. This makes
+	// the waiter population a codec-level invariant rather than a property
+	// the embedder's per-caller limits must add up to. Zero means no
+	// ceiling.
+	MaxAdmissionWaiters int64
+
 	// EncoderWindowSizeBytes overrides the encoder window size. Zero keeps
 	// the library default (8 MiB, ~8.7 MiB retained per encoder); 1 MiB
 	// reduces retention to ~2.7 MiB per encoder at a small compression
@@ -84,9 +115,11 @@ type ZstdLimits struct {
 type boundedGoZstd struct {
 	goZstd
 
-	sem     *semaphore.Weighted
-	timeout time.Duration
-	metrics ZstdMetrics
+	sem        *semaphore.Weighted
+	timeout    time.Duration
+	maxWaiters int64
+	waiters    atomic.Int64
+	metrics    ZstdMetrics
 	// encoders is reuse only, never a bound: the semaphore alone caps live
 	// encoder memory. A sync.Pool is safe here because concurrency-1
 	// encoders own no goroutines between uses, so a silently dropped
@@ -106,6 +139,9 @@ func NewBoundedGoZstd(limits ZstdLimits) (ZstdImpl, error) {
 	}
 	if limits.EncoderAdmissionTimeout < 0 {
 		return nil, fmt.Errorf("EncoderAdmissionTimeout must not be negative: %v", limits.EncoderAdmissionTimeout)
+	}
+	if limits.MaxAdmissionWaiters < 0 {
+		return nil, fmt.Errorf("MaxAdmissionWaiters must not be negative: %d", limits.MaxAdmissionWaiters)
 	}
 	if limits.EncoderWindowSizeBytes < 0 {
 		return nil, fmt.Errorf("EncoderWindowSizeBytes must not be negative: %d", limits.EncoderWindowSizeBytes)
@@ -128,10 +164,11 @@ func NewBoundedGoZstd(limits ZstdLimits) (ZstdImpl, error) {
 	_ = probe.Close()
 
 	return &boundedGoZstd{
-		sem:     semaphore.NewWeighted(limits.MaxActiveEncoders),
-		timeout: limits.EncoderAdmissionTimeout,
-		metrics: limits.Metrics,
-		options: options,
+		sem:        semaphore.NewWeighted(limits.MaxActiveEncoders),
+		timeout:    limits.EncoderAdmissionTimeout,
+		maxWaiters: limits.MaxAdmissionWaiters,
+		metrics:    limits.Metrics,
+		options:    options,
 	}, nil
 }
 
@@ -140,6 +177,56 @@ func (b *boundedGoZstd) GetEncoder(ctx context.Context, out io.WriteCloser) (zst
 		b.metrics.EncoderAdmissionStarted()
 	}
 	waitStarted := time.Now()
+
+	if err := b.acquireSlot(ctx, waitStarted); err != nil {
+		return nil, err
+	}
+	if b.metrics != nil {
+		b.metrics.EncoderAdmissionCompleted(EncoderAdmitted, time.Since(waitStarted))
+	}
+
+	enc, ok := b.encoders.Get().(*zstd.Encoder)
+	if !ok {
+		// The semaphore guarantees at most MaxActiveEncoders live encoders,
+		// so this allocation cannot exceed the budget.
+		var err error
+		enc, err = zstd.NewWriter(nil, b.options...)
+		if err != nil {
+			b.release(nil)
+			return nil, err
+		}
+	}
+
+	enc.Reset(out)
+	return &boundedEncoder{owner: b, enc: enc}, nil
+}
+
+// acquireSlot performs one admission attempt: non-blocking when the context
+// requests fast-fail, otherwise queueing behind the waiter ceiling with the
+// configured timeout. On failure it reports the outcome to the metrics sink
+// and returns an error suitable for the caller.
+func (b *boundedGoZstd) acquireSlot(ctx context.Context, waitStarted time.Time) error {
+	rejected := func(err error) error {
+		if b.metrics != nil {
+			b.metrics.EncoderAdmissionCompleted(EncoderAdmissionRejected, time.Since(waitStarted))
+		}
+		return err
+	}
+
+	if fastFailRequested(ctx) {
+		if !b.sem.TryAcquire(1) {
+			return rejected(fmt.Errorf("%w: no encoder capacity for non-blocking admission", ErrEncoderSaturated))
+		}
+		return nil
+	}
+
+	if b.maxWaiters > 0 {
+		if waiting := b.waiters.Add(1); waiting > b.maxWaiters {
+			b.waiters.Add(-1)
+			return rejected(fmt.Errorf("%w: %d encoder admission waiters already queued", ErrEncoderSaturated, b.maxWaiters))
+		}
+		defer b.waiters.Add(-1)
+	}
 
 	acquireCtx := ctx
 	var cancel context.CancelFunc
@@ -162,25 +249,9 @@ func (b *boundedGoZstd) GetEncoder(ctx context.Context, out io.WriteCloser) (zst
 		if b.metrics != nil {
 			b.metrics.EncoderAdmissionCompleted(outcome, time.Since(waitStarted))
 		}
-		return nil, err
+		return err
 	}
-	if b.metrics != nil {
-		b.metrics.EncoderAdmissionCompleted(EncoderAdmitted, time.Since(waitStarted))
-	}
-
-	enc, ok := b.encoders.Get().(*zstd.Encoder)
-	if !ok {
-		// The semaphore guarantees at most MaxActiveEncoders live encoders,
-		// so this allocation cannot exceed the budget.
-		enc, err = zstd.NewWriter(nil, b.options...)
-		if err != nil {
-			b.release(nil)
-			return nil, err
-		}
-	}
-
-	enc.Reset(out)
-	return &boundedEncoder{owner: b, enc: enc}, nil
+	return nil
 }
 
 // release returns capacity and, when the encoder is still healthy, offers

@@ -23,6 +23,7 @@ type countingMetrics struct {
 	admitted  atomic.Int64
 	timeouts  atomic.Int64
 	canceled  atomic.Int64
+	rejected  atomic.Int64
 	released  atomic.Int64
 	waitTotal atomic.Int64
 }
@@ -40,6 +41,8 @@ func (m *countingMetrics) EncoderAdmissionCompleted(outcome EncoderAdmissionOutc
 		m.timeouts.Add(1)
 	case EncoderAdmissionCanceled:
 		m.canceled.Add(1)
+	case EncoderAdmissionRejected:
+		m.rejected.Add(1)
 	}
 }
 
@@ -259,6 +262,93 @@ func TestBoundedGoZstdCloseIdempotent(t *testing.T) {
 	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBoundedGoZstdFastFailAdmission(t *testing.T) {
+	metrics := &countingMetrics{}
+	impl := newBounded(t, ZstdLimits{
+		MaxActiveEncoders: 1,
+		// Deliberately long: fast-fail admission must not wait for it.
+		EncoderAdmissionTimeout: 10 * time.Second,
+		Metrics:                 metrics,
+	})
+
+	// With a free slot, fast-fail admission succeeds.
+	held, err := impl.GetEncoder(FastFailAdmission(context.Background()), nopWriteCloser{io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// With the slot held, fast-fail admission fails immediately instead of
+	// queueing for the admission timeout.
+	start := time.Now()
+	_, err = impl.GetEncoder(FastFailAdmission(context.Background()), nopWriteCloser{io.Discard})
+	if !errors.Is(err, ErrEncoderSaturated) {
+		t.Fatalf("expected ErrEncoderSaturated, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("fast-fail admission waited %v", elapsed)
+	}
+	if got := metrics.rejected.Load(); got != 1 {
+		t.Errorf("expected 1 rejected admission, got %d", got)
+	}
+
+	// Releasing the slot makes fast-fail admission succeed again.
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := impl.GetEncoder(FastFailAdmission(context.Background()), nopWriteCloser{io.Discard})
+	if err != nil {
+		t.Fatalf("expected fast-fail admission after release, got %v", err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBoundedGoZstdWaiterCeiling(t *testing.T) {
+	metrics := &countingMetrics{}
+	impl := newBounded(t, ZstdLimits{
+		MaxActiveEncoders:   1,
+		MaxAdmissionWaiters: 1,
+		Metrics:             metrics,
+	})
+	bounded := impl.(*boundedGoZstd)
+
+	held, err := impl.GetEncoder(context.Background(), nopWriteCloser{io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+
+	// Fill the single waiter slot with a blocked admission attempt.
+	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	waiterErr := make(chan error, 1)
+	go func() {
+		_, err := impl.GetEncoder(waiterCtx, nopWriteCloser{io.Discard})
+		waiterErr <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for bounded.waiters.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("waiter never queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The next attempt exceeds the ceiling and is rejected immediately.
+	_, err = impl.GetEncoder(context.Background(), nopWriteCloser{io.Discard})
+	if !errors.Is(err, ErrEncoderSaturated) {
+		t.Fatalf("expected ErrEncoderSaturated beyond the waiter ceiling, got %v", err)
+	}
+	if got := metrics.rejected.Load(); got != 1 {
+		t.Errorf("expected 1 rejected admission, got %d", got)
+	}
+
+	cancelWaiter()
+	if err := <-waiterErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected queued waiter to be canceled, got %v", err)
 	}
 }
 
