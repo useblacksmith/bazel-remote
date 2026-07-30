@@ -1,6 +1,7 @@
 package zstdimpl
 
 import (
+	"context"
 	"errors"
 	"io"
 
@@ -52,7 +53,7 @@ func (goZstd) GetDecoder(in io.ReadCloser) (io.ReadCloser, error) {
 	return dec.IOReadCloser(), nil
 }
 
-func (goZstd) GetEncoder(out io.WriteCloser) (zstdEncoder, error) {
+func (goZstd) GetEncoder(_ context.Context, out io.WriteCloser) (zstdEncoder, error) {
 	enc, ok := encoderPool.Get().(*syncpool.EncoderWrapper)
 	if !ok {
 		return nil, errEncoderPoolFail

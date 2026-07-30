@@ -116,6 +116,18 @@ func badReqErr(format string, a ...interface{}) *cache.Error {
 	}
 }
 
+// encoderAdmissionFailure reports whether err means we failed to acquire
+// bounded zstd encoder capacity (saturation, caller cancellation, or a
+// deadline) rather than finding evidence of a bad on-disk blob. Such
+// failures must fail only the current request: evicting the LRU entry or
+// logging a corruption warning would turn transient overload into cache
+// churn.
+func encoderAdmissionFailure(err error) bool {
+	return errors.Is(err, zstdimpl.ErrEncoderSaturated) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
 // Non-test users must call this to expose metrics.
 func (c *diskCache) RegisterMetrics() {
 	c.lru.RegisterMetrics()
@@ -595,20 +607,29 @@ func (c *diskCache) availableOrTryProxy(ctx context.Context, kind cache.EntryKin
 					// The file is uncompressed, without a casblob header.
 					_, err = f.Seek(offset, io.SeekStart)
 					if zstd && err == nil {
-						rc, err = casblob.GetLegacyZstdReadCloser(c.zstd, f)
+						rc, err = casblob.GetLegacyZstdReadCloser(ctx, c.zstd, f)
 					} else if err == nil {
 						rc = f
 					}
 				} else {
 					// The file is compressed.
 					if zstd {
-						rc, err = casblob.GetZstdReadCloser(c.zstd, f, size, offset)
+						rc, err = casblob.GetZstdReadCloser(ctx, c.zstd, f, size, offset)
 					} else {
 						rc, err = casblob.GetUncompressedReadCloser(c.zstd, f, size, offset)
 					}
 				}
 
 				if err != nil {
+					if encoderAdmissionFailure(err) {
+						// The blob on disk is healthy; we only failed to
+						// acquire bounded zstd encoder capacity (or the
+						// caller went away). Fail this request without
+						// evicting the entry.
+						_ = f.Close()
+						return nil, -1, false, err
+					}
+
 					log.Printf("Warning: expected item to be on disk, but something happened when retrieving %s (compressed: %v, legacy: %v): %v",
 						blobPath, zstd, item.legacy, err)
 					_ = f.Close()
@@ -836,18 +857,23 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		}
 
 		if zstd {
-			rc, err = casblob.GetLegacyZstdReadCloser(c.zstd, rcf)
+			rc, err = casblob.GetLegacyZstdReadCloser(ctx, c.zstd, rcf)
 		} else {
 			rc = rcf
 		}
 	} else { // Compressed CAS blob.
 		if zstd {
-			rc, err = casblob.GetZstdReadCloser(c.zstd, rcf, foundSize, offset)
+			rc, err = casblob.GetZstdReadCloser(ctx, c.zstd, rcf, foundSize, offset)
 		} else {
 			rc, err = casblob.GetUncompressedReadCloser(c.zstd, rcf, foundSize, offset)
 		}
 	}
 	if err != nil {
+		if encoderAdmissionFailure(err) {
+			// Keep the admission failure identifiable so the server layer
+			// can return a retryable status instead of Internal.
+			return nil, -1, err
+		}
 		return nil, -1, internalErr(err)
 	}
 

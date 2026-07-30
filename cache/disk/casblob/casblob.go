@@ -2,6 +2,7 @@ package casblob
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -316,7 +317,7 @@ func GetUncompressedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize 
 // caller must close the returned io.ReadCloser if it is non-nil. Doing so
 // will automatically close f. If there is an error f will be closed, the caller
 // does not need to do so.
-func GetZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, offset int64) (io.ReadCloser, error) {
+func GetZstdReadCloser(ctx context.Context, zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, offset int64) (io.ReadCloser, error) {
 
 	h, err := readHeader(f)
 	if err != nil {
@@ -342,7 +343,7 @@ func GetZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, o
 			}
 		}
 
-		return GetLegacyZstdReadCloser(zstd, f)
+		return GetLegacyZstdReadCloser(ctx, zstd, f)
 	}
 
 	if h.compression != Zstandard {
@@ -412,12 +413,14 @@ func GetZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, o
 }
 
 // GetLegacyZstdReadCloser returns an io.ReadCloser that provides
-// zstandard-compressed data from an uncompressed file.
-func GetLegacyZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File) (io.ReadCloser, error) {
+// zstandard-compressed data from an uncompressed file. The context bounds
+// the wait for encoder capacity when the zstd implementation is bounded;
+// acquisition failures are returned before any data is produced.
+func GetLegacyZstdReadCloser(ctx context.Context, zstd zstdimpl.ZstdImpl, f *os.File) (io.ReadCloser, error) {
 
 	pr, pw := io.Pipe()
 
-	enc, err := zstd.GetEncoder(pw)
+	enc, err := zstd.GetEncoder(ctx, pw)
 	if err != nil {
 		_ = f.Close()
 		return nil, err

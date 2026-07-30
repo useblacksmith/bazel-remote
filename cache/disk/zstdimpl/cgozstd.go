@@ -4,6 +4,7 @@
 package zstdimpl
 
 import (
+	"context"
 	"io"
 	"runtime"
 	"sync"
@@ -25,7 +26,7 @@ func (cgoZstd) GetDecoder(in io.ReadCloser) (io.ReadCloser, error) {
 	return &putReaderToPoolOnClose{r}, nil
 }
 
-func (cgoZstd) GetEncoder(out io.WriteCloser) (zstdEncoder, error) {
+func (cgoZstd) GetEncoder(_ context.Context, out io.WriteCloser) (zstdEncoder, error) {
 	w := writerPool.Get().(*writerWrapper)
 	w.Reset(out, nil, compressionLevel)
 	return &putWriterToPoolOnClose{w}, nil

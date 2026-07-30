@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/buchgr/bazel-remote/v2/utils/zstdpool"
+
 	"golang.org/x/sync/semaphore"
 	"google.golang.org/genproto/googleapis/bytestream"
 )
@@ -59,6 +61,27 @@ func WithReadLimits(maxActiveReads, maxBufferBytes int64) GRPCServerOption {
 			return nil
 		}
 		s.readLimiter = newReadLimiter(maxActiveReads, maxBufferBytes)
+		return nil
+	}
+}
+
+// WithZstdDecoderRetention bounds the number of idle zstd decoders retained
+// between compressed ByteStream writes. Upstream behavior uses a sync.Pool,
+// which retains a write burst's peak decoder memory (~5.2 MiB per decoder)
+// until later GC cycles drain it. With this option, decoders beyond the
+// retention limit are destroyed on release instead. Concurrent decoder
+// creation is not bounded here; embedders bound it upstream via
+// write-stream admission. A zero value preserves the sync.Pool behavior.
+func WithZstdDecoderRetention(retainedDecoders int64) GRPCServerOption {
+	return func(s *grpcServer) error {
+		if retainedDecoders < 0 {
+			return fmt.Errorf("retained zstd decoders must not be negative: %d", retainedDecoders)
+		}
+		if retainedDecoders == 0 {
+			s.zstdDecoders = syncPoolDecoders{}
+			return nil
+		}
+		s.zstdDecoders = zstdpool.NewBoundedDecoderPool(retainedDecoders)
 		return nil
 	}
 }

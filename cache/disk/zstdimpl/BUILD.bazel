@@ -1,8 +1,9 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "go_default_library",
     srcs = [
+        "bounded.go",
         "gozstd.go",
         "zstdimpl.go",
     ] + select({
@@ -17,10 +18,18 @@ go_library(
         "//utils/zstdpool:go_default_library",
         "@com_github_klauspost_compress//zstd:go_default_library",
         "@com_github_mostynb_zstdpool_syncpool//:go_default_library",
+        "@org_golang_x_sync//semaphore:go_default_library",
     ] + select({
         "@io_bazel_rules_go//go/toolchain:cgo_on": [
             "@com_github_valyala_gozstd//:go_default_library",
         ],
         "//conditions:default": [],
     }),
+)
+
+go_test(
+    name = "go_default_test",
+    size = "small",
+    srcs = ["bounded_test.go"],
+    embed = [":go_default_library"],
 )

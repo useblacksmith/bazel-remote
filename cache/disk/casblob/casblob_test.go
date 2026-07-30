@@ -2,6 +2,7 @@ package casblob_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -58,7 +59,7 @@ func TestZstdFromLegacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	zrc, err := casblob.GetLegacyZstdReadCloser(zstd, file)
+	zrc, err := casblob.GetLegacyZstdReadCloser(context.Background(), zstd, file)
 	if err != nil {
 		t.Fatal(err)
 	}

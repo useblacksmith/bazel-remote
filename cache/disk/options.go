@@ -42,6 +42,23 @@ func WithZstdImplementation(impl string) Option {
 	}
 }
 
+// WithZstdLimits replaces the cache's zstd implementation with a bounded
+// pure-Go implementation whose streaming encoders (used for on-demand
+// compression of identity-stored CAS blobs) are counted against a fixed
+// admission budget. See zstdimpl.ZstdLimits for the semantics of each
+// field. This option is mutually exclusive with selecting the "cgo"
+// implementation via WithZstdImplementation; the last applied option wins.
+func WithZstdLimits(limits zstdimpl.ZstdLimits) Option {
+	return func(c *CacheConfig) error {
+		impl, err := zstdimpl.NewBoundedGoZstd(limits)
+		if err != nil {
+			return err
+		}
+		c.diskCache.zstd = impl
+		return nil
+	}
+}
+
 func WithMaxBlobSize(size int64) Option {
 	return func(c *CacheConfig) error {
 		if size <= 0 {

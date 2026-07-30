@@ -23,6 +23,7 @@ import (
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
 	"github.com/buchgr/bazel-remote/v2/utils/validate"
 
 	_ "github.com/mostynb/go-grpc-compression/snappy" // Register snappy
@@ -48,6 +49,7 @@ type grpcServer struct {
 	runtimeMetrics         RuntimeMetrics
 	readLimiter            *readLimiter
 	sourceBuffers          *sourceBufferPool
+	zstdDecoders           zstdDecoderSource
 	// writePayloadConsumed, when set, is invoked once per fully-consumed
 	// ByteStream WriteRequest; see WithWritePayloadConsumed.
 	writePayloadConsumed func(*bytestream.WriteRequest)
@@ -97,6 +99,7 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 		mangleACKeys:        mangleACKeys,
 		maxCasBlobSizeBytes: maxCasBlobSizeBytes,
 		readChunkSizeBytes:  maxChunkSize,
+		zstdDecoders:        syncPoolDecoders{},
 	}
 	for _, option := range options {
 		if err := option(s); err != nil {
@@ -275,6 +278,20 @@ func checkGRPCClientCert(ctx context.Context) error {
 func gRPCErrCode(err error, dflt codes.Code) codes.Code {
 	if err == nil {
 		return codes.OK
+	}
+
+	// Bounded zstd transcoding saturation is a transient capacity
+	// condition, not a missing or corrupt blob: report it as retryable so
+	// clients back off and retry instead of treating the blob as absent
+	// (which would trigger pointless re-uploads on the batch path).
+	if errors.Is(err, zstdimpl.ErrEncoderSaturated) {
+		return codes.ResourceExhausted
+	}
+	if errors.Is(err, context.Canceled) {
+		return codes.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return codes.DeadlineExceeded
 	}
 
 	var cerr *cache.Error

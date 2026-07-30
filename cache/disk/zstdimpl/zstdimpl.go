@@ -1,6 +1,7 @@
 package zstdimpl
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"slices"
@@ -37,7 +38,14 @@ func GetImplementations() []string {
 
 type ZstdImpl interface {
 	GetDecoder(in io.ReadCloser) (io.ReadCloser, error)
-	GetEncoder(out io.WriteCloser) (zstdEncoder, error)
+
+	// GetEncoder returns a streaming encoder writing to out. The context
+	// bounds any wait for encoder capacity: implementations with bounded
+	// codec pools may block until an encoder is available, the context is
+	// done, or an implementation-defined admission timeout elapses (in
+	// which case ErrEncoderSaturated is returned).
+	GetEncoder(ctx context.Context, out io.WriteCloser) (zstdEncoder, error)
+
 	DecodeAll(in []byte) ([]byte, error)
 	EncodeAll(in []byte) []byte
 }
