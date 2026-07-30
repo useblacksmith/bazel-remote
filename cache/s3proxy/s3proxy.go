@@ -464,6 +464,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		uploadQueueDropped.WithLabelValues(c.key).Inc()
 		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
 			Method: "backend_upload",
+			Kind:   kind.String(),
 			Status: "dropped",
 			Reason: "upload_queue_full",
 			Ops:    1,
@@ -573,6 +574,7 @@ func (c *s3Cache) observeUpload(ctx context.Context, item backendproxy.UploadReq
 	// persists; the footprint accumulator and the MinIO drift scan share this unit.
 	cache.ObserveOperation(cache.WithMetricsLabels(ctx, item.MetricsLabels), c.observer, cache.OperationOutcome{
 		Method: "backend_upload",
+		Kind:   item.Kind.String(),
 		Status: status,
 		Reason: reason,
 		Ops:    1,
