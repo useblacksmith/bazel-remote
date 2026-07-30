@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 
@@ -52,6 +53,41 @@ func coreFor(t *testing.T, ts *httptest.Server, maxRetries int) *minio.Core {
 		t.Fatal(err)
 	}
 	return core
+}
+
+// TestReadDeadlineBoundsHungGet pins the read deadline: a backend that
+// accepts the connection and never responds must fail the Get once
+// readDeadline elapses, instead of pinning the caller for the transport's
+// 60s+.
+func TestReadDeadlineBoundsHungGet(t *testing.T) {
+	oldDeadline := readDeadline
+	readDeadline = 100 * time.Millisecond
+	defer func() { readDeadline = oldDeadline }()
+
+	hung := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-hung // Hold every request open until the test finishes.
+	}))
+	t.Cleanup(ts.Close)
+	t.Cleanup(func() { close(hung) })
+
+	c := &s3Cache{
+		key:          "deadline-test",
+		mcore:        coreFor(t, ts, 1),
+		bucket:       "test-bucket",
+		objectKey:    objectKeyV1,
+		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
+	}
+
+	start := time.Now()
+	rc, _, err := c.Get(context.Background(), cache.CAS, testHash, -1)
+	elapsed := time.Since(start)
+	if err == nil || rc != nil {
+		t.Fatalf("hung-backend Get = (%v, %v), want deadline error", rc, err)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("hung-backend Get took %v, want ~readDeadline (100ms)", elapsed)
+	}
 }
 
 // TestNewBackendCapsMinioRetries pins the retry cap on the constructed

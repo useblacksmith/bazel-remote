@@ -146,11 +146,32 @@ const (
 // var only so tests can shrink it.
 var uploadTimeout = 10 * time.Minute
 
+// readDeadline bounds a single read-path MinIO call (the miss fall-through
+// GetObject and the Contains StatObject): a sick MinIO node must answer a
+// read in seconds or the caller gets a miss-shaped failure instead of a
+// pinned connection. The deadline context also governs the streamed GET
+// body (canceled when the caller closes it), so a transfer stalled
+// mid-stream is reclaimed too. A var only so tests can shrink it.
+var readDeadline = 5 * time.Second
+
 // maxRetries caps minio-go's internal per-call retries (library default:
 // MaxRetry = 10 attempts with exponential backoff, ~a minute of retention
 // per failing call). Three attempts ride out a blip; anything worse must
 // surface as a failure in seconds.
 const maxRetries = 3
+
+// cancelReadCloser releases the readDeadline timer when the caller finishes
+// with a streamed GET body.
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
 
 func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval time.Duration,
 	storageMode string, accessLogger cache.Logger, errorLogger cache.Logger,
@@ -506,13 +527,16 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 	bucket := c.bucketForContext(ctx)
 
+	rctx, cancel := context.WithTimeout(ctx, readDeadline)
+
 	rc, info, _, err := c.mcore.GetObject(
-		ctx,
+		rctx,
 		bucket,                   // bucketName
 		objectKey,                // objectName
 		minio.GetObjectOptions{}, // opts
 	)
 	if err != nil {
+		cancel()
 		cacheMisses.WithLabelValues(c.key).Inc()
 		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
 			logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, errNotFound)
@@ -522,6 +546,10 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 		return nil, -1, err
 	}
 	cacheHits.WithLabelValues(c.key).Inc()
+
+	// The deadline context governs the streamed body; releasing the timer
+	// belongs to whoever closes the body.
+	rc = &cancelReadCloser{ReadCloser: rc, cancel: cancel}
 
 	if c.updateTimestamps {
 		c.UpdateModificationTimestamp(ctx, bucket, objectKey)
@@ -546,8 +574,11 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 	bucket := c.bucketForContext(ctx)
 
+	sctx, cancel := context.WithTimeout(ctx, readDeadline)
+	defer cancel()
+
 	s, err := c.mcore.StatObject(
-		ctx,
+		sctx,
 		bucket,                    // bucketName
 		objectKey,                 // objectName
 		minio.StatObjectOptions{}, // opts
