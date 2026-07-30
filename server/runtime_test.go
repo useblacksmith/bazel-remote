@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -124,5 +125,89 @@ func TestMaxBatchTotalSizeOption(t *testing.T) {
 
 	if err := WithMaxBatchTotalSizeBytes(-1)(s); err == nil {
 		t.Fatal("expected negative max batch total size to fail")
+	}
+}
+
+func TestSourceBufferPoolRecyclesBuffers(t *testing.T) {
+	// Pin to one P so put/get hit the same sync.Pool private slot; with
+	// multiple Ps a goroutine migration between the calls could miss the
+	// recycled array and flake the recycling assertion.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	pool := newSourceBufferPool(16)
+
+	first := pool.get(8)
+	if len(first) != 8 || cap(first) != 16 {
+		t.Fatalf("got len=%d cap=%d, want len=8 cap=16", len(first), cap(first))
+	}
+
+	// Under the race detector sync.Pool.Put randomly drops items (by design,
+	// to flush out invalid-reuse bugs), so a single put/get round can miss.
+	// Recycling within a bounded number of rounds is still guaranteed.
+	for round := 0; round < 256; round++ {
+		buf := pool.get(8)
+		buf[0] = 0x42
+		pool.put(buf)
+		second := pool.get(4)
+		if len(second) != 4 {
+			t.Fatalf("got len=%d, want 4", len(second))
+		}
+		if second[0] == 0x42 {
+			return
+		}
+		pool.put(second)
+	}
+	t.Fatal("expected a pooled backing array to be recycled within 256 rounds")
+}
+
+// TestSourceBufferPoolDropsForeignBuffers loops because a regression that
+// admits foreign arrays would be masked on some rounds under the race
+// detector, where sync.Pool.Put drops items at random; a correct
+// implementation passes every round deterministically (nothing is ever
+// admitted, so every get mints a fresh array regardless of P count).
+func TestSourceBufferPoolDropsForeignBuffers(t *testing.T) {
+	pool := newSourceBufferPool(16)
+
+	for round := 0; round < 64; round++ {
+		// An array that doesn't match the pool capacity must not be
+		// admitted: the next get must mint a fresh full-capacity array, not
+		// recycle the foreign one.
+		foreign := make([]byte, 8)
+		foreign[0] = 0x42
+		pool.put(foreign)
+		got := pool.get(8)
+		if cap(got) != 16 {
+			t.Fatalf("round %d: got cap=%d, want a fresh full-capacity array (16)", round, cap(got))
+		}
+		if got[0] == 0x42 {
+			t.Fatalf("round %d: foreign buffer was admitted to the pool", round)
+		}
+	}
+}
+
+func TestSourceBufferPoolNilAndOversizedFallBackToAllocation(t *testing.T) {
+	var pool *sourceBufferPool
+	buf := pool.get(8)
+	if len(buf) != 8 {
+		t.Fatalf("nil pool returned len=%d, want 8", len(buf))
+	}
+	pool.put(buf)
+
+	pool = newSourceBufferPool(4)
+	for round := 0; round < 64; round++ {
+		oversized := pool.get(8)
+		if len(oversized) != 8 {
+			t.Fatalf("oversized get returned len=%d, want 8", len(oversized))
+		}
+		oversized[0] = 0x42
+		pool.put(oversized)
+		if recycled := pool.get(4); recycled[0] == 0x42 {
+			t.Fatalf("round %d: oversized buffer must not be admitted to the pool", round)
+		}
+	}
+}
+
+func TestSourceBufferPoolDisabledWithoutPositiveCapacity(t *testing.T) {
+	if pool := newSourceBufferPool(0); pool != nil {
+		t.Fatal("expected nil pool for zero capacity")
 	}
 }
