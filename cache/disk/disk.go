@@ -814,6 +814,8 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	blobFile = tf.Name()
 
+	uncompressedOnDisk := (kind != cache.CAS) || (c.storageMode == casblob.Identity)
+
 	var sizeOnDisk int64
 	sizeOnDisk, err = io.Copy(tf, r)
 	_ = tf.Close()
@@ -825,13 +827,26 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		log.Printf("Proxy fill for %s %s failed mid-stream, treating as miss: %v", kind, hash, err)
 		return nil, -1, nil
 	}
+	if uncompressedOnDisk && sizeOnDisk != foundSize {
+		// A clean early EOF (io.Copy returns nil) must not commit a
+		// truncated blob: unlike client Puts, which run through the sha256
+		// verifier, the fill path trusts the backend's byte count.
+		// Transports normally surface truncation as an error (short HTTP
+		// body → ErrUnexpectedEOF, broken gRPC stream → Recv error), so
+		// this guards against a buggy backend, same posture as the
+		// mid-stream branch above. For the uncompressed representation the
+		// on-disk size is exactly foundSize; the compressed representation
+		// is covered below — casblob reader construction parses the
+		// container header before anything is committed.
+		log.Printf("Proxy fill for %s %s returned %d bytes where the on-disk representation requires %d, treating as miss",
+			kind, hash, sizeOnDisk, foundSize)
+		return nil, -1, nil
+	}
 
 	rcf, err := os.Open(blobFile)
 	if err != nil {
 		return nil, -1, internalErr(err)
 	}
-
-	uncompressedOnDisk := (kind != cache.CAS) || (c.storageMode == casblob.Identity)
 	if uncompressedOnDisk {
 		if offset > 0 {
 			_, err = rcf.Seek(offset, io.SeekStart)
