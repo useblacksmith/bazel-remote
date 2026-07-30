@@ -74,6 +74,18 @@ var (
 		Name: "bazel_remote_s3_prefix_missing_total",
 		Help: "Requests that required a request-scoped storage prefix but carried none (configured fallback prefix used).",
 	}, []string{"operation"})
+	// uploadOutcomes is the native terminal-outcome counter for write-through
+	// uploads, independent of any installed OperationObserver: standalone
+	// (L1-node) deployments install no observer, and without this series a
+	// sustained run of failed PUTs drains the queue while every queue-drop
+	// alert stays green. Labels are bounded: status/reason come from
+	// classifyUploadOutcome (created | already_exists/precondition_failed |
+	// error/s3_put_failed); backend is the single configured bucket here
+	// (the multi-backend map branch keys this by backend-map entry).
+	uploadOutcomes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "bazel_remote_s3_upload_outcomes_total",
+		Help: "Terminal S3 write-through upload outcomes per backend (created, already_exists, error).",
+	}, []string{"backend", "status", "reason"})
 )
 
 // PrometheusMetrics returns a Metrics implementation backed by this package's
@@ -282,6 +294,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	logResponse(c.accessLogger, "UPLOAD", c.bucket, objectKey, err)
 
 	status, reason := classifyUploadOutcome(err)
+	uploadOutcomes.WithLabelValues(c.bucket, status, reason).Inc()
 	c.observeUpload(context.Background(), item, status, reason)
 	uploadQueueDepth.Set(float64(len(c.uploadQueue)))
 
