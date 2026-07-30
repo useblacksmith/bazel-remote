@@ -146,6 +146,12 @@ const (
 // var only so tests can shrink it.
 var uploadTimeout = 10 * time.Minute
 
+// maxRetries caps minio-go's internal per-call retries (library default:
+// MaxRetry = 10 attempts with exponential backoff, ~a minute of retention
+// per failing call). Three attempts ride out a blip; anything worse must
+// surface as a failure in seconds.
+const maxRetries = 3
+
 func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval time.Duration,
 	storageMode string, accessLogger cache.Logger, errorLogger cache.Logger,
 	numUploaders, maxQueuedUploads int, metrics Metrics, options ...Option) (*s3Cache, error) {
@@ -181,6 +187,7 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 	minioOpts := &minio.Options{
 		Creds:        spec.Credentials,
 		BucketLookup: spec.BucketLookupType,
+		MaxRetries:   maxRetries,
 
 		Region:    spec.Region,
 		Secure:    secure,
