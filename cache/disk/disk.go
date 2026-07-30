@@ -842,6 +842,16 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		return nil, -1, internalErr(err)
 	}
 
+	// Commit the downloaded blob before constructing the serving reader, so
+	// a reader-construction failure - in particular bounded zstd encoder
+	// saturation - can never discard a blob that was already fetched from
+	// the proxy. A client retry is then served from local disk instead of
+	// re-downloading.
+	unreserve, removeTempfile, err = c.commit(key, legacy, blobFile, size, foundSize, sizeOnDisk, random)
+	if err != nil {
+		return nil, -1, internalErr(err)
+	}
+
 	rcf, err := os.Open(blobFile)
 	if err != nil {
 		return nil, -1, internalErr(err)
@@ -852,6 +862,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		if offset > 0 {
 			_, err = rcf.Seek(offset, io.SeekStart)
 			if err != nil {
+				_ = rcf.Close()
 				return nil, -1, internalErr(err)
 			}
 		}
@@ -869,17 +880,20 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		}
 	}
 	if err != nil {
+		// The casblob read-closer constructors close the file on failure.
 		if encoderAdmissionFailure(err) {
-			// Keep the admission failure identifiable so the server layer
-			// can return a retryable status instead of Internal.
+			// The committed blob is healthy; we only failed to acquire
+			// encoder capacity (or the caller went away). Keep the entry
+			// and the admission failure identifiable so the server layer
+			// returns a retryable status instead of Internal.
 			return nil, -1, err
 		}
-		return nil, -1, internalErr(err)
-	}
-
-	unreserve, removeTempfile, err = c.commit(key, legacy, blobFile, size, foundSize, sizeOnDisk, random)
-	if err != nil {
-		_ = rc.Close()
+		// The reader could not be constructed from data we just committed;
+		// treat the entry as corrupt and remove it, mirroring the
+		// local-hit path in availableOrTryProxy.
+		c.mu.Lock()
+		c.lru.RemoveKey(key)
+		c.mu.Unlock()
 		return nil, -1, internalErr(err)
 	}
 
