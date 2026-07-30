@@ -113,6 +113,14 @@ type Config struct {
 	GRPCBackend                 *URLBackendConfig         `yaml:"grpc_proxy,omitempty"`
 	NumUploaders                int                       `yaml:"num_uploaders"`
 	MaxQueuedUploads            int                       `yaml:"max_queued_uploads"`
+	// NumUploadersExplicit / MaxQueuedUploadsExplicit record whether the
+	// operator supplied the value (CLI flag set, or key present in the YAML
+	// file) as opposed to inheriting the default. perBackendUploadLimits
+	// needs presence, not value: an explicit `--num_uploaders 100` happens
+	// to equal defaultNumUploaders, and treating it as "unset" silently
+	// quarters the configured worker pool in multi-backend mode.
+	NumUploadersExplicit     bool `yaml:"-"`
+	MaxQueuedUploadsExplicit bool `yaml:"-"`
 	IdleTimeout                 time.Duration             `yaml:"idle_timeout"`
 	DisableHTTPACValidation     bool                      `yaml:"disable_http_ac_validation"`
 	DisableGRPCACDepsCheck      bool                      `yaml:"disable_grpc_ac_deps_check"`
@@ -287,6 +295,19 @@ func NewFromYaml(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse YAML config: %v", err)
 	}
 	c := yc.Config
+
+	// Presence probe: a second, minimal unmarshal with pointer fields
+	// distinguishes "key present in the file" from "inherited the seeded
+	// default" — required because perBackendUploadLimits must not treat an
+	// explicit value that equals the default as unset.
+	var presence struct {
+		NumUploaders     *int `yaml:"num_uploaders"`
+		MaxQueuedUploads *int `yaml:"max_queued_uploads"`
+	}
+	if err := yaml.Unmarshal(data, &presence); err == nil {
+		c.NumUploadersExplicit = presence.NumUploaders != nil
+		c.MaxQueuedUploadsExplicit = presence.MaxQueuedUploads != nil
+	}
 
 	if c.HTTPAddress == "" {
 		c.HTTPAddress = net.JoinHostPort(yc.Host, strconv.Itoa(yc.Port))
@@ -548,18 +569,19 @@ func validateConfig(c *Config) error {
 
 // perBackendUploadLimits resolves the upload-pool sizing for one backend of
 // a multi-backend S3 proxy. num_uploaders/max_queued_uploads apply per
-// backend (queue isolation is the point), so when they are left at the
-// single-backend defaults the multi-backend defaults take over — the
-// historical defaults preallocate ~200MB of queue and 100 goroutines per
-// map entry. Any explicitly configured non-default value is inherited
-// unchanged by every backend.
+// backend (queue isolation is the point), so when they are left unset the
+// multi-backend defaults take over — the historical defaults preallocate
+// ~200MB of queue and 100 goroutines per map entry. Any explicitly
+// configured value is inherited unchanged by every backend, even when it
+// happens to equal the single-backend default (presence-aware: see the
+// *Explicit fields — value equality must not be read as "unset").
 func (c *Config) perBackendUploadLimits() (numUploaders, maxQueuedUploads int) {
 	numUploaders = c.NumUploaders
-	if numUploaders == defaultNumUploaders {
+	if !c.NumUploadersExplicit {
 		numUploaders = multiBackendNumUploaders
 	}
 	maxQueuedUploads = c.MaxQueuedUploads
-	if maxQueuedUploads == defaultMaxQueuedUploads {
+	if !c.MaxQueuedUploadsExplicit {
 		maxQueuedUploads = multiBackendMaxQueuedUploads
 	}
 	return numUploaders, maxQueuedUploads
@@ -707,7 +729,7 @@ func get(ctx *cli.Context) (*Config, error) {
 		}
 	}
 
-	return newFromArgs(
+	cfg, err := newFromArgs(
 		ctx.String("dir"),
 		ctx.Int("max_size"),
 		ctx.String("storage_mode"),
@@ -744,4 +766,13 @@ func get(ctx *cli.Context) (*Config, error) {
 		ctx.Int64("max_blob_size"),
 		ctx.Int64("max_proxy_blob_size"),
 	)
+	if err != nil {
+		return nil, err
+	}
+	// Flag-path presence: urfave/cli knows whether the operator passed the
+	// flag; value equality with the default must not be read as "unset"
+	// (see perBackendUploadLimits).
+	cfg.NumUploadersExplicit = ctx.IsSet("num_uploaders")
+	cfg.MaxQueuedUploadsExplicit = ctx.IsSet("max_queued_uploads")
+	return cfg, nil
 }
