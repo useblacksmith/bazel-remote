@@ -46,7 +46,12 @@ type s3Cache struct {
 	// minio client and upload queue are per endpoint, but the bucket is per
 	// request (see cache.S3BucketGRPCMetadataKey).
 	bucket           string
-	uploadQueue      chan<- backendproxy.UploadReq
+	uploadQueue chan<- backendproxy.UploadReq
+	// breaker guards every MinIO call this backend makes (read fall-through,
+	// existence checks, write-through PUTs). Per backend by construction: in
+	// multi-backend map mode a sick shard trips only its own breaker and
+	// must not blind the healthy shards.
+	breaker          *breaker
 	accessLogger     cache.Logger
 	errorLogger      cache.Logger
 	metrics          Metrics
@@ -157,8 +162,47 @@ var readDeadline = 5 * time.Second
 // maxRetries caps minio-go's internal per-call retries (library default:
 // MaxRetry = 10 attempts with exponential backoff, ~a minute of retention
 // per failing call). Three attempts ride out a blip; anything worse must
-// surface as a failure in seconds.
+// surface to the circuit breaker in seconds, which owns backoff across
+// calls.
 const maxRetries = 3
+
+// isNotFound reports whether err is MinIO answering "no such object": a
+// miss is a healthy answer and must count as breaker success, or a burst of
+// legitimate misses would trip the breaker on a perfectly healthy backend.
+func isNotFound(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	return resp.Code == "NoSuchKey" || resp.StatusCode == http.StatusNotFound
+}
+
+// breakerReadOutcome classifies a read-path minio result for the breaker.
+// Not-found is success (see isNotFound). A parent-context cancellation (the
+// client went away mid-request) is not a backend-health signal and is
+// counted neither way; only genuine backend errors — including our own
+// readDeadline expiring — count as failures.
+func breakerReadOutcome(parent context.Context, err error) breakerOutcome {
+	if err == nil || isNotFound(err) {
+		return outcomeSuccess
+	}
+	if parent.Err() != nil {
+		return outcomeIgnore
+	}
+	return outcomeFailure
+}
+
+// breakerUploadOutcome classifies a write-path minio result for the
+// breaker. A precondition failure means the object already exists — MinIO
+// answered, so the backend is healthy (mirrors classifyUploadOutcome's
+// already_exists mapping).
+func breakerUploadOutcome(err error) breakerOutcome {
+	if err == nil {
+		return outcomeSuccess
+	}
+	switch minio.ToErrorResponse(err).StatusCode {
+	case http.StatusPreconditionFailed, http.StatusNotModified:
+		return outcomeSuccess
+	}
+	return outcomeFailure
+}
 
 // cancelReadCloser releases the readDeadline timer when the caller finishes
 // with a streamed GET body.
@@ -234,6 +278,7 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 		mcore:            minioCore,
 		prefix:           spec.Prefix,
 		bucket:           spec.Bucket,
+		breaker:          newBreaker(spec.Endpoint+"/"+spec.Bucket, errorLogger),
 		accessLogger:     accessLogger,
 		errorLogger:      errorLogger,
 		metrics:          metrics,
@@ -410,24 +455,39 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	opts.SetMatchETagExcept("*")
 
 	// Uploads run on background workers with no request deadline; the
-	// timeout reclaims a worker pinned by a hung MinIO connection.
+	// timeout reclaims a worker pinned by a hung MinIO connection. No
+	// tighter deadline here: large CAS blobs may legitimately take long,
+	// and the breaker covers the sick-MinIO case.
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
 
-	_, err := c.mcore.PutObject(
-		ctx,
-		bucket,          // bucketName
-		objectKey,       // objectName
-		item.Rc,         // reader
-		item.SizeOnDisk, // objectSize
-		"",              // md5base64
-		"",              // sha256
-		opts,            // metadata
-	)
+	var putErr error
+	berr := c.breaker.Execute(func() breakerOutcome {
+		_, err := c.mcore.PutObject(
+			ctx,
+			bucket,          // bucketName
+			objectKey,       // objectName
+			item.Rc,         // reader
+			item.SizeOnDisk, // objectSize
+			"",              // md5base64
+			"",              // sha256
+			opts,            // metadata
+		)
+		putErr = err
+		return breakerUploadOutcome(err)
+	})
 
-	logResponse(c.accessLogger, "UPLOAD", bucket, objectKey, err)
-
-	status, reason := classifyUploadOutcome(err)
+	var status, reason string
+	if berr != nil {
+		// The breaker refused the call without dialing MinIO: fail the item
+		// fast with its own terminal outcome so dashboards can tell a sick
+		// backend (breaker_open) from failing PUTs (s3_put_failed).
+		logResponse(c.accessLogger, "UPLOAD", bucket, objectKey, berr)
+		status, reason = "error", "breaker_open"
+	} else {
+		logResponse(c.accessLogger, "UPLOAD", bucket, objectKey, putErr)
+		status, reason = classifyUploadOutcome(putErr)
+	}
 	uploadOutcomes.WithLabelValues(c.key, status, reason).Inc()
 	c.observeUpload(context.Background(), item, status, reason)
 	uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
@@ -529,21 +589,36 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 
 	rctx, cancel := context.WithTimeout(ctx, readDeadline)
 
-	rc, info, _, err := c.mcore.GetObject(
-		rctx,
-		bucket,                   // bucketName
-		objectKey,                // objectName
-		minio.GetObjectOptions{}, // opts
-	)
-	if err != nil {
+	var rc io.ReadCloser
+	var info minio.ObjectInfo
+	var getErr error
+	berr := c.breaker.Execute(func() breakerOutcome {
+		rc, info, _, getErr = c.mcore.GetObject(
+			rctx,
+			bucket,                   // bucketName
+			objectKey,                // objectName
+			minio.GetObjectOptions{}, // opts
+		)
+		return breakerReadOutcome(ctx, getErr)
+	})
+	if berr != nil {
+		// Breaker open: report a clean miss without dialing MinIO. A miss is
+		// the honest answer the disk cache layer can act on (serve from
+		// elsewhere or rebuild); an error would surface to the client.
 		cancel()
 		cacheMisses.WithLabelValues(c.key).Inc()
-		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
+		logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, berr)
+		return nil, -1, nil
+	}
+	if getErr != nil {
+		cancel()
+		cacheMisses.WithLabelValues(c.key).Inc()
+		if minio.ToErrorResponse(getErr).Code == "NoSuchKey" {
 			logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, errNotFound)
 			return nil, -1, nil
 		}
-		logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, err)
-		return nil, -1, err
+		logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, getErr)
+		return nil, -1, getErr
 	}
 	cacheHits.WithLabelValues(c.key).Inc()
 
@@ -577,12 +652,23 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	sctx, cancel := context.WithTimeout(ctx, readDeadline)
 	defer cancel()
 
-	s, err := c.mcore.StatObject(
-		sctx,
-		bucket,                    // bucketName
-		objectKey,                 // objectName
-		minio.StatObjectOptions{}, // opts
-	)
+	var s minio.ObjectInfo
+	var err error
+	berr := c.breaker.Execute(func() breakerOutcome {
+		s, err = c.mcore.StatObject(
+			sctx,
+			bucket,                    // bucketName
+			objectKey,                 // objectName
+			minio.StatObjectOptions{}, // opts
+		)
+		return breakerReadOutcome(ctx, err)
+	})
+	if berr != nil {
+		// Breaker open: report "not present" without dialing MinIO — the
+		// existing miss convention of this method.
+		logResponse(c.accessLogger, "CONTAINS", bucket, objectKey, berr)
+		return false, -1
+	}
 
 	exists = (err == nil)
 	if err != nil {
