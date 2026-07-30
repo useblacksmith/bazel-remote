@@ -47,6 +47,10 @@ type grpcServer struct {
 	readChunkSizeBytes     int64
 	runtimeMetrics         RuntimeMetrics
 	readLimiter            *readLimiter
+	sourceBuffers          *sourceBufferPool
+	// writePayloadConsumed, when set, is invoked once per fully-consumed
+	// ByteStream WriteRequest; see WithWritePayloadConsumed.
+	writePayloadConsumed func(*bytestream.WriteRequest)
 }
 
 var readOnlyMethods = map[string]struct{}{
@@ -106,6 +110,13 @@ func ServeGRPC(l net.Listener, srv *grpc.Server,
 		_ = l.Close()
 		return fmt.Errorf("max read buffer bytes %d is smaller than the read chunk size %d",
 			s.readLimiter.maxBufferBytes, s.readChunkSizeBytes)
+	}
+	if s.readLimiter != nil && s.readLimiter.maxActiveReads > 0 {
+		// The active-read admission limit guarantees at most maxActiveReads
+		// source buffers are in flight, so recycling caps allocation churn
+		// without affecting the live-memory bound. Without read limits,
+		// upstream per-RPC allocation behavior is preserved.
+		s.sourceBuffers = newSourceBufferPool(s.readChunkSizeBytes)
 	}
 	pb.RegisterActionCacheServer(srv, s)
 	pb.RegisterCapabilitiesServer(srv, s)

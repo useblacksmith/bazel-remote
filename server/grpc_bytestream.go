@@ -193,7 +193,15 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 		defer s.runtimeMetrics.ByteStreamReadBufferReleased(ctx, bufSize)
 	}
 
-	buf := make([]byte, bufSize)
+	// Note on accounting: the byte semaphore above reserves the requested
+	// bufSize, but a pooled array always retains full chunk capacity. The
+	// in-flight bound is therefore maxActiveReads x readChunkSizeBytes, not
+	// the semaphore total; retention beyond in-flight use is GC-managed
+	// (sync.Pool), so unused arrays are reclaimed after two idle GC cycles.
+	buf := s.sourceBuffers.get(bufSize)
+	// Recycle before the deferred budget release admits the next reader, so
+	// an admitted reader can find a pooled array instead of allocating.
+	defer s.sourceBuffers.put(buf)
 
 	var chunkResp bytestream.ReadResponse
 	for {
@@ -425,6 +433,13 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 
 	var resp bytestream.WriteResponse
 	pr, pw := io.Pipe()
+	// Tear down the pipe on every handler exit path. Without this, an early
+	// cache.Put failure whose reader does not close the underlying pipe -
+	// e.g. malformed zstd input, where the pooled decoder's Close only resets
+	// the decoder - leaves the receive goroutine blocked in pw.Write forever,
+	// leaking the goroutine and the payload buffer it holds. Closing the
+	// reader unblocks any pending or future pw.Write with io.ErrClosedPipe.
+	defer func() { _ = pr.Close() }()
 
 	putResult := make(chan error, 1)
 	recvResult := make(chan error, 1)
@@ -432,6 +447,21 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 
 	cmp := casblob.Identity
 
+	// LOAD-BEARING CONSUMPTION CONTRACT: this receive loop is strictly
+	// sequential. Every path either fully consumes req.Data before calling
+	// srv.Recv() for the next message - pw.Write(req.Data) returns only after
+	// the io.Pipe reader has copied all bytes out - or exits the goroutine
+	// without another Recv. The handler sends its response only after this
+	// goroutine has posted to recvResult/putResult and stopped touching req.
+	//
+	// The s.writePayloadConsumed callback below is the explicit ownership
+	// hand-off for embedders that decode WriteRequest payloads into reusable
+	// buffers (see WithWritePayloadConsumed and the FA agent's write-request
+	// buffer controller). If this loop is ever restructured, the callback
+	// must move with the true consumption point; firing it while req.Data is
+	// still referenced becomes silent cross-stream cache corruption. Pinned
+	// by TestWriteRecvLoopConsumesPayloadBeforeNextRecv and
+	// TestWritePayloadConsumedFiresAfterConsumption.
 	go func() {
 		firstIteration := true
 		var resourceName string
@@ -451,7 +481,14 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 				return
 			}
 			if err != nil {
-				recvResult <- status.Error(codes.Internal, err.Error())
+				// Preserve status errors (e.g. Canceled from a client
+				// disconnect surfaced through the stream) instead of
+				// flattening everything to Internal.
+				if _, ok := status.FromError(err); ok {
+					recvResult <- err
+				} else {
+					recvResult <- status.Error(codes.Internal, err.Error())
+				}
 				return
 			}
 
@@ -533,6 +570,12 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 				return
 			}
 			resp.CommittedSize += int64(n)
+			if s.writePayloadConsumed != nil {
+				// pw.Write returned, so the pipe reader has copied all of
+				// req.Data out: ownership of the payload's backing array
+				// returns to the embedder.
+				s.writePayloadConsumed(req)
+			}
 
 			if cmp == casblob.Identity && resp.CommittedSize > size {
 				msg := fmt.Sprintf("Client sent more than %d data! %d", size, resp.CommittedSize)
