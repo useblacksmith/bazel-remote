@@ -17,6 +17,7 @@ type CacheConfig struct {
 	diskCache        *diskCache        // Assumed to be non-nil.
 	metrics          *metricsDecorator // May be nil.
 	maxSizeHardLimit int64
+	maxEntries       int64
 }
 
 func WithStorageMode(mode string) Option {
@@ -55,6 +56,21 @@ func WithZstdLimits(limits zstdimpl.ZstdLimits) Option {
 			return err
 		}
 		c.diskCache.zstd = impl
+		return nil
+	}
+}
+
+// WithMaxEntries bounds the number of entries resident in the cache index,
+// evicting least-recently-used entries when the bound is exceeded - the same
+// semantics as the byte budget, but counting entries. Each resident entry
+// costs a fixed ~270 bytes of process memory (key string, entry struct, list
+// node, map slot) regardless of blob size, while charging at most one 4 KiB
+// block against the byte budget (zero-byte blobs charge nothing), so without
+// a count bound the index metadata of a byte-full cache is effectively
+// unbounded. n <= 0 (the default) disables the bound.
+func WithMaxEntries(n int64) Option {
+	return func(c *CacheConfig) error {
+		c.maxEntries = n
 		return nil
 	}
 }
