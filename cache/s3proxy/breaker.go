@@ -34,6 +34,10 @@ import (
 //   - Outcome classification is the caller's job (breakerReadOutcome,
 //     breakerUploadOutcome): a not-found is a success (MinIO answered), a
 //     parent-context cancellation is counted neither way.
+//   - Streamed GETs defer their outcome to the body's terminal state via
+//     allow/record and bodyOutcomeReadCloser (healthy headers prove nothing
+//     in a brownout), holding a half-open probe slot until the body
+//     finishes. Write-through uploads never probe at all (ExecuteNoProbe).
 
 var (
 	breakerState = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -93,8 +97,10 @@ var errBreakerOpen = errors.New("circuit breaker is open")
 // breaker is one backend's circuit breaker. Safe for concurrent use by the
 // upload workers and the request-path reads.
 type breaker struct {
-	// name is the backend's endpoint/bucket: the "backend" label on the
-	// breaker metrics and the subject of the transition log lines.
+	// name is the backend's key (backends-map selector, endpoint fallback):
+	// the "backend" label on the breaker metrics — matching every other
+	// backend-labeled series so they join on dashboards — and the subject
+	// of the transition log lines.
 	name        string
 	errorLogger cache.Logger
 
@@ -120,6 +126,26 @@ func newBreaker(name string, errorLogger cache.Logger) *breaker {
 // across the call itself.
 func (b *breaker) Execute(call func() breakerOutcome) error {
 	if !b.allow() {
+		return errBreakerOpen
+	}
+	b.record(call())
+	return nil
+}
+
+// ExecuteNoProbe is Execute for calls too expensive to serve as the
+// half-open recovery probe — write-through PutObjects bounded only by the
+// 10m uploadTimeout. If such a call claimed the single probe slot, every
+// read on the backend would keep failing fast as errBreakerOpen for however
+// long the upload takes, so a recovered MinIO could serve artificial misses
+// for minutes. Instead these calls run only while the breaker is closed and
+// fail fast otherwise; probing is left to the read path, whose calls are
+// bounded in seconds and arrive constantly (the host's FindMissingBlobs
+// falls through to a backend Stat before every upload cycle).
+func (b *breaker) ExecuteNoProbe(call func() breakerOutcome) error {
+	b.mu.Lock()
+	closed := b.state == breakerClosed
+	b.mu.Unlock()
+	if !closed {
 		return errBreakerOpen
 	}
 	b.record(call())

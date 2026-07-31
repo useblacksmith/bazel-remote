@@ -289,6 +289,10 @@ func TestBreakerProbeFailureReopens(t *testing.T) {
 	if err != nil || rc == nil {
 		t.Fatalf("recovered probe Get = (%v, %v), want hit", rc, err)
 	}
+	// The probe's outcome is the body's terminal state; consume to EOF.
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatalf("recovered probe body: %v", err)
+	}
 	_ = rc.Close()
 	if c.breaker.State() != breakerClosed {
 		t.Fatalf("breaker state after recovered probe = %v, want closed", c.breaker.State())
@@ -344,6 +348,12 @@ func TestBreakerHalfOpenAdmitsSingleProbe(t *testing.T) {
 	go func() {
 		rc, _, err := c.Get(context.Background(), cache.CAS, testHash, -1)
 		if rc != nil {
+			// Consume to EOF: the probe's breaker outcome is the BODY's
+			// terminal state — closing an unread body is an abandonment
+			// and would report nothing.
+			if _, rerr := io.ReadAll(rc); err == nil {
+				err = rerr
+			}
 			_ = rc.Close()
 		}
 		probeDone <- err
@@ -472,6 +482,136 @@ func TestSlowBodySurvivesConnectTimeoutLegs(t *testing.T) {
 	}
 	if failures := c.breaker.consecutiveFailures; failures != 0 {
 		t.Fatalf("healthy slow body counted %d breaker failures, want 0", failures)
+	}
+}
+
+// TestBodyStallTripsBreaker pins the brownout mode Piotr's 5/5 review
+// called out: connections open fine and headers flow, but body bytes don't.
+// Every read must record exactly ONE failure (the body's terminal state —
+// no header-success resetting the streak first), so five stalled reads trip
+// the breaker and the fleet flips to fast-miss instead of paying a full
+// deadline per read forever.
+func TestBodyStallTripsBreaker(t *testing.T) {
+	stall := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("early bytes"))
+		w.(http.Flusher).Flush()
+		<-stall // Body never finishes until the test ends.
+	}))
+	t.Cleanup(ts.Close)
+	t.Cleanup(func() { close(stall) })
+
+	c := breakerCache(t, coreFor(t, ts, 1), "breaker-bodystall-test", nil)
+	c.readDeadline = 100 * time.Millisecond
+
+	for i := 0; i < breakerConsecutiveFailures; i++ {
+		rc, _, err := c.Get(context.Background(), cache.CAS, testHash, -1)
+		if err != nil || rc == nil {
+			t.Fatalf("read %d: Get = (%v, %v), want a body to consume", i, rc, err)
+		}
+		if _, err := io.ReadAll(rc); err == nil {
+			t.Fatalf("read %d: stalled body completed cleanly", i)
+		}
+		_ = rc.Close()
+		if got, want := c.breaker.consecutiveFailures, i+1; c.breaker.State() == breakerClosed && got != want {
+			t.Fatalf("read %d: consecutive failures = %d, want %d", i, got, want)
+		}
+	}
+	if c.breaker.State() != breakerOpen {
+		t.Fatalf("breaker state after %d stalled bodies = %v, want open", breakerConsecutiveFailures, c.breaker.State())
+	}
+}
+
+// TestBodyAbandonmentDoesNotCountAgainstBreaker pins the other side: a
+// caller that closes a healthy stream early (deliberately or because it
+// went away) says nothing about backend health.
+func TestBodyAbandonmentDoesNotCountAgainstBreaker(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 1<<16)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(ts.Close)
+
+	c := breakerCache(t, coreFor(t, ts, 1), "breaker-abandon-test", nil)
+
+	rc, _, err := c.Get(context.Background(), cache.CAS, testHash, -1)
+	if err != nil || rc == nil {
+		t.Fatalf("Get = (%v, %v), want a body", rc, err)
+	}
+	buf := make([]byte, 16)
+	_, _ = rc.Read(buf) // Take a bite, then walk away.
+	_ = rc.Close()
+
+	if got := c.breaker.consecutiveFailures; got != 0 {
+		t.Fatalf("abandoned healthy body counted %d breaker failures, want 0", got)
+	}
+	if c.breaker.State() != breakerClosed {
+		t.Fatalf("breaker state after abandonment = %v, want closed", c.breaker.State())
+	}
+}
+
+// TestUploadNeverClaimsHalfOpenProbe pins ExecuteNoProbe: a write-through
+// PutObject (bounded only by the 10m uploadTimeout) must not become the
+// half-open recovery probe — it fails fast, leaving the probe slot for the
+// tightly-bounded read path — and while merely half-open the breaker's
+// state is not advanced by upload traffic.
+func TestUploadNeverClaimsHalfOpenProbe(t *testing.T) {
+	oldTimeout := breakerTimeout
+	breakerTimeout = 50 * time.Millisecond
+	defer func() { breakerTimeout = oldTimeout }()
+
+	backend := s3mem.New()
+	if err := backend.CreateBucket("test-bucket"); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(gofakes3.New(backend).Server())
+	t.Cleanup(ts.Close)
+	core := coreFor(t, ts, 1)
+	name := "breaker-uploadprobe-test"
+	c := breakerCache(t, core, name, nil)
+
+	content := []byte("blob")
+	key := objectKeyV1("", testHash, cache.CAS)
+	if _, err := core.PutObject(context.Background(), "test-bucket", key,
+		bytes.NewReader(content), int64(len(content)), "", "", minio.PutObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	tripBreaker(t, c.breaker)
+	time.Sleep(breakerTimeout + 20*time.Millisecond)
+
+	// Past the open window: an upload must NOT be admitted as the probe.
+	before := testutil.ToFloat64(uploadOutcomes.WithLabelValues(name, "error", "breaker_open"))
+	c.UploadFile(backendproxy.UploadReq{
+		Hash:       testHash,
+		Kind:       cache.CAS,
+		SizeOnDisk: 4,
+		Rc:         io.NopCloser(strings.NewReader("blob")),
+	})
+	if got := testutil.ToFloat64(uploadOutcomes.WithLabelValues(name, "error", "breaker_open")) - before; got != 1 {
+		t.Fatalf("uploadOutcomes{error,breaker_open} delta = %v, want 1 (upload must fail fast, not probe)", got)
+	}
+	if c.breaker.State() != breakerOpen {
+		t.Fatalf("breaker state after refused upload = %v, want still open", c.breaker.State())
+	}
+
+	// The read path still probes and recovers as designed.
+	rc, _, err := c.Get(context.Background(), cache.CAS, testHash, -1)
+	if err != nil || rc == nil {
+		t.Fatalf("read probe Get = (%v, %v), want hit", rc, err)
+	}
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatalf("read probe body: %v", err)
+	}
+	_ = rc.Close()
+	if c.breaker.State() != breakerClosed {
+		t.Fatalf("breaker state after successful read probe = %v, want closed", c.breaker.State())
 	}
 }
 
