@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -49,6 +50,10 @@ type grpcServer struct {
 	runtimeMetrics         RuntimeMetrics
 	readLimiter            *readLimiter
 	sourceBuffers          *sourceBufferPool
+	// GetTree guards; see GetTreeLimits.
+	getTreeSem              *semaphore.Weighted
+	getTreeMaxResponseBytes int64
+	getTreeMetrics          GetTreeMetrics
 	// writePayloadConsumed, when set, is invoked once per fully-consumed
 	// ByteStream WriteRequest; see WithWritePayloadConsumed.
 	writePayloadConsumed func(*bytestream.WriteRequest)

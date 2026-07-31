@@ -93,6 +93,12 @@ type diskCache struct {
 	// observation, D15). Lazily initialized; see lruCaptureBudgetBytes.
 	lruCaptureSem *semaphore.Weighted
 
+	// Cap on total declared output-directory Tree bytes read into memory
+	// per ActionResult validation; see WithTreeValidationSizeLimit.
+	// Zero or negative disables the cap.
+	maxTreeValidationBytes int64
+	treeValidationExceeded func(declaredBytes int64)
+
 	mu  sync.Mutex
 	lru SizedLRU
 
@@ -1007,6 +1013,25 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 	}
 
 	pendingValidations := []*pb.Digest{}
+
+	// Pre-flight guard on validation memory (see
+	// WithTreeValidationSizeLimit): every referenced Tree blob is read
+	// wholly into memory below, and their sizes are declared in the
+	// ActionResult, so the total is knowable before allocating anything.
+	// Over-cap results are reported as a miss - semantically safe, the
+	// client rebuilds - and the trip is surfaced via the callback.
+	if c.maxTreeValidationBytes > 0 && len(result.OutputDirectories) > 0 {
+		var declaredTreeBytes int64
+		for _, d := range result.OutputDirectories {
+			declaredTreeBytes += d.TreeDigest.SizeBytes
+		}
+		if declaredTreeBytes > c.maxTreeValidationBytes {
+			if c.treeValidationExceeded != nil {
+				c.treeValidationExceeded(declaredTreeBytes)
+			}
+			return nil, nil, nil // aka "not found"
+		}
+	}
 
 	// treeLeafHashes collects output_directories Tree blob hashes for the LRU
 	// closure. The Tree blobs are recorded as closure leaves (the sweep must

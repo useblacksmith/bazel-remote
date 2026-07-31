@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"math"
 
 	"google.golang.org/genproto/googleapis/rpc/code"
 	"google.golang.org/genproto/googleapis/rpc/status"
@@ -349,6 +350,21 @@ func (s *grpcServer) GetTree(in *pb.GetTreeRequest,
 		return errNilDigest
 	}
 
+	// Fail-fast concurrency guard (see GetTreeLimits): GetTree materializes
+	// the whole tree in memory, so its memory bound is this slot count times
+	// the response byte cap. No queueing - a saturated caller retries.
+	if s.getTreeSem != nil {
+		if !s.getTreeSem.TryAcquire(1) {
+			if s.getTreeMetrics != nil {
+				s.getTreeMetrics.GetTreeDenied(GetTreeDeniedSaturated)
+			}
+			s.accessLogger.Printf("%s %s DENIED: concurrency limit", errorPrefix, in.RootDigest.Hash)
+			return grpc_status.Error(codes.ResourceExhausted,
+				"too many concurrent GetTree requests, please retry")
+		}
+		defer s.getTreeSem.Release(1)
+	}
+
 	err := s.validateHash(in.RootDigest.Hash, in.RootDigest.SizeBytes, errorPrefix)
 	if err != nil {
 		return err
@@ -365,6 +381,19 @@ func (s *grpcServer) GetTree(in *pb.GetTreeRequest,
 		return grpc_status.Error(codes.Unknown, err.Error())
 	}
 
+	// Running response byte budget (see GetTreeLimits). The response size is
+	// discovered directory-by-directory during the walk, so this is a
+	// mid-traversal check on accumulated serialized bytes, not an up-front
+	// reservation. Zero (disabled) means an effectively unlimited budget.
+	budget := s.getTreeMaxResponseBytes
+	if budget <= 0 {
+		budget = math.MaxInt64
+	}
+	budget -= int64(len(data))
+	if budget < 0 {
+		return s.getTreeOverBudget(errorPrefix, in.RootDigest.Hash)
+	}
+
 	dir := pb.Directory{}
 	err = proto.Unmarshal(data, &dir)
 	if err != nil {
@@ -372,7 +401,10 @@ func (s *grpcServer) GetTree(in *pb.GetTreeRequest,
 		return grpc_status.Error(codes.DataLoss, err.Error())
 	}
 
-	err = s.fillDirectories(stream.Context(), &resp, &dir, errorPrefix)
+	err = s.fillDirectories(stream.Context(), &resp, &dir, &budget, errorPrefix)
+	if err == errGetTreeOverBudget {
+		return s.getTreeOverBudget(errorPrefix, in.RootDigest.Hash)
+	}
 	if err != nil {
 		return err
 	}
@@ -388,9 +420,27 @@ func (s *grpcServer) GetTree(in *pb.GetTreeRequest,
 	return nil
 }
 
+// errGetTreeOverBudget aborts the traversal when the accumulated response
+// exceeds the configured byte cap. Mapped to ResourceExhausted in GetTree.
+var errGetTreeOverBudget = errors.New("GetTree response byte budget exceeded")
+
+func (s *grpcServer) getTreeOverBudget(errorPrefix, rootHash string) error {
+	if s.getTreeMetrics != nil {
+		s.getTreeMetrics.GetTreeDenied(GetTreeDeniedResponseBytes)
+	}
+	s.accessLogger.Printf("%s %s DENIED: response over %d byte limit",
+		errorPrefix, rootHash, s.getTreeMaxResponseBytes)
+	return grpc_status.Errorf(codes.ResourceExhausted,
+		"tree exceeds the server's %d byte GetTree response limit",
+		s.getTreeMaxResponseBytes)
+}
+
 // Attempt to populate `resp`. Return errors for invalid requests, but
-// otherwise attempt to return as many blobs as possible.
-func (s *grpcServer) fillDirectories(ctx context.Context, resp *pb.GetTreeResponse, dir *pb.Directory, errorPrefix string) error {
+// otherwise attempt to return as many blobs as possible. budget is the
+// remaining serialized-byte allowance for the accumulated response; it is
+// decremented as the walk discovers directories, and crossing it aborts
+// with errGetTreeOverBudget.
+func (s *grpcServer) fillDirectories(ctx context.Context, resp *pb.GetTreeResponse, dir *pb.Directory, budget *int64, errorPrefix string) error {
 
 	// Add this dir.
 	resp.Directories = append(resp.Directories, dir)
@@ -403,14 +453,23 @@ func (s *grpcServer) fillDirectories(ctx context.Context, resp *pb.GetTreeRespon
 			return err
 		}
 
+		// Check the declared size before fetching, so the guard also
+		// bounds the transient getBlobData allocation.
+		*budget -= dirNode.Digest.SizeBytes
+		if *budget < 0 {
+			return errGetTreeOverBudget
+		}
+
 		data, err := s.getBlobData(ctx, dirNode.Digest.Hash, dirNode.Digest.SizeBytes)
 		if err == errBlobNotFound {
 			s.accessLogger.Printf("GRPC GETTREEREQUEST BLOB %s NOT FOUND",
 				dirNode.Digest.Hash)
+			*budget += dirNode.Digest.SizeBytes
 			continue
 		}
 		if err != nil {
 			s.accessLogger.Printf("GRPC GETTREEREQUEST BLOB %s ERR: %v", err)
+			*budget += dirNode.Digest.SizeBytes
 			continue
 		}
 
@@ -418,13 +477,14 @@ func (s *grpcServer) fillDirectories(ctx context.Context, resp *pb.GetTreeRespon
 		err = proto.Unmarshal(data, &dirMsg)
 		if err != nil {
 			s.accessLogger.Printf("GRPC GETTREEREQUEST BAD BLOB: %v", err)
+			*budget += dirNode.Digest.SizeBytes
 			continue
 		}
 
 		s.accessLogger.Printf("GRPC GETTREEREQUEST BLOB %s ADDED OK",
 			dirNode.Digest.Hash)
 
-		err = s.fillDirectories(ctx, resp, &dirMsg, errorPrefix)
+		err = s.fillDirectories(ctx, resp, &dirMsg, budget, errorPrefix)
 		if err != nil {
 			return err
 		}

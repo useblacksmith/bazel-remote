@@ -106,6 +106,61 @@ func WithWritePayloadConsumed(fn func(*bytestream.WriteRequest)) GRPCServerOptio
 	}
 }
 
+// GetTree denial reasons reported to GetTreeMetrics.
+const (
+	// GetTreeDeniedSaturated means no concurrency slot was free.
+	GetTreeDeniedSaturated = "saturated"
+	// GetTreeDeniedResponseBytes means the materialized response exceeded
+	// the configured byte cap mid-traversal.
+	GetTreeDeniedResponseBytes = "response_bytes"
+)
+
+// GetTreeMetrics receives GetTree guard trips. Implementations must be safe
+// for concurrent use.
+type GetTreeMetrics interface {
+	GetTreeDenied(reason string)
+}
+
+// GetTreeLimits guards the GetTree handler, which materializes the entire
+// directory tree into one in-memory response before sending (there is no
+// pagination). Its response size is unknowable before the traversal runs, so
+// unlike the batch paths it cannot take an up-front reservation; the guard is
+// a fail-fast concurrency slot plus a running byte cap checked as the walk
+// discovers directories. Both trips return ResourceExhausted (retryable) and
+// are reported to Metrics; they are expected to stay silent, and a trip is
+// the evidence bar for building pagination.
+type GetTreeLimits struct {
+	// MaxConcurrent bounds simultaneous GetTree handlers (fail-fast, no
+	// queueing). Zero disables the concurrency guard.
+	MaxConcurrent int64
+	// MaxResponseBytes bounds the serialized size of the directory data
+	// accumulated into one response. Zero disables the byte cap.
+	MaxResponseBytes int64
+	// Metrics, when non-nil, receives guard trips.
+	Metrics GetTreeMetrics
+}
+
+// WithGetTreeLimits installs the GetTree guards. Zero limits preserve
+// bazel-remote's existing unbounded behavior.
+func WithGetTreeLimits(limits GetTreeLimits) GRPCServerOption {
+	return func(s *grpcServer) error {
+		if limits.MaxConcurrent < 0 {
+			return fmt.Errorf("max concurrent GetTree must not be negative: %d", limits.MaxConcurrent)
+		}
+		if limits.MaxResponseBytes < 0 {
+			return fmt.Errorf("max GetTree response bytes must not be negative: %d", limits.MaxResponseBytes)
+		}
+		if limits.MaxConcurrent > 0 {
+			s.getTreeSem = semaphore.NewWeighted(limits.MaxConcurrent)
+		} else {
+			s.getTreeSem = nil
+		}
+		s.getTreeMaxResponseBytes = limits.MaxResponseBytes
+		s.getTreeMetrics = limits.Metrics
+		return nil
+	}
+}
+
 // WithMaxBatchTotalSizeBytes limits the total declared blob bytes in one
 // batch CAS request and advertises that limit through
 // CacheCapabilities.MaxBatchTotalSizeBytes. Per REAPI that capability bounds

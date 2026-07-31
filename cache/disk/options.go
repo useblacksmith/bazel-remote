@@ -75,6 +75,25 @@ func WithMaxEntries(n int64) Option {
 	}
 }
 
+// WithTreeValidationSizeLimit caps the total declared bytes of the
+// output-directory Tree blobs that GetValidatedActionResult will read into
+// memory while validating one ActionResult. Validation buffers each
+// referenced Tree blob wholly (read + unmarshal), so without a cap a single
+// action with a huge output directory pins an arbitrarily large allocation
+// per concurrent GetActionResult. An over-cap ActionResult is reported as a
+// cache miss - always semantically safe, the client rebuilds - rather than
+// an error. exceeded, when non-nil, is invoked once per capped validation
+// with the total declared Tree bytes; a trip means a client was just forced
+// to rebuild, so it should be wired to a visible metric. maxBytes <= 0
+// disables the cap.
+func WithTreeValidationSizeLimit(maxBytes int64, exceeded func(declaredBytes int64)) Option {
+	return func(c *CacheConfig) error {
+		c.diskCache.maxTreeValidationBytes = maxBytes
+		c.diskCache.treeValidationExceeded = exceeded
+		return nil
+	}
+}
+
 func WithMaxBlobSize(size int64) Option {
 	return func(c *CacheConfig) error {
 		if size <= 0 {
