@@ -689,6 +689,22 @@ func (c *diskCache) GetZstd(ctx context.Context, hash string, size int64, offset
 	return c.get(ctx, cache.CAS, hash, size, offset, true)
 }
 
+// writeErrTagger remembers whether a copy failure originated on the WRITE
+// side (our local temp file) rather than the read side (the proxy stream),
+// so the proxy-fill path can tell a broken local disk from a broken backend.
+type writeErrTagger struct {
+	w        io.Writer
+	writeErr error
+}
+
+func (t *writeErrTagger) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if err != nil {
+		t.writeErr = err
+	}
+	return n, err
+}
+
 func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (rc io.ReadCloser, s int64, rErr error) {
 	// The hash format is checked properly in the http/grpc code.
 	// Just perform a simple/fast check here, to catch bad tests.
@@ -817,9 +833,22 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	uncompressedOnDisk := (kind != cache.CAS) || (c.storageMode == casblob.Identity)
 
 	var sizeOnDisk int64
-	sizeOnDisk, err = io.Copy(tf, r)
-	_ = tf.Close()
-	if err != nil {
+	sink := &writeErrTagger{w: tf}
+	sizeOnDisk, err = io.Copy(sink, r)
+	closeErr := tf.Close()
+	if err != nil || closeErr != nil {
+		// Distinguish the two ends of the copy. A LOCAL write failure
+		// (disk-full, I/O error on the temp file) is our storage breaking,
+		// not the backend's: masking it as a miss would hide the real
+		// problem behind silent rebuild storms, so it surfaces as an error.
+		if sink.writeErr != nil || (err == nil && closeErr != nil) {
+			localErr := sink.writeErr
+			if localErr == nil {
+				localErr = closeErr
+			}
+			log.Printf("Proxy fill for %s %s failed writing to local storage: %v", kind, hash, localErr)
+			return nil, -1, internalErr(localErr)
+		}
 		// The proxy stream died mid-fill. Nothing has been sent to the client
 		// yet (the fill lands in a temp file first, discarded by the deferred
 		// cleanup), so degrade to a cache miss instead of failing the request:

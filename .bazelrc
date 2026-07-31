@@ -1,5 +1,8 @@
 # Include git version info
 build --stamp
-build --workspace_status_command=./git-commit.sh
+# Quoted absolute path: unquoted $(pwd) broke checkouts with spaces in the
+# path, and a bare relative path is resolved against the execroot, not the
+# workspace, which silently un-stamps releases.
+build --workspace_status_command="$(pwd)/git-commit.sh"
 
 common --enable_bzlmod
