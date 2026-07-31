@@ -41,6 +41,17 @@ type S3CloudStorageConfig struct {
 	// disables recycling. The s3proxy receives the resolved, concrete value.
 	ConnRecycleInterval time.Duration `yaml:"-"`
 
+	// ReadTimeout overrides the s3proxy's overall per-call read deadline
+	// (miss fall-through GetObject including its streamed body, Contains
+	// StatObject). YAML-only, as a duration string ("60s", "5m"); see
+	// UnmarshalYAML. Unset or zero keeps the s3proxy default (5m).
+	// Connection establishment (dial / TLS / response headers) is bounded
+	// separately and much tighter by the s3proxy's constant connectTimeout —
+	// this knob only governs how long a healthy, answering backend may take
+	// to finish a read, so raising it does not slow down failure detection
+	// on a dead one.
+	ReadTimeout time.Duration `yaml:"-"`
+
 	// Backends optionally declares a map of allowlisted S3 backends for
 	// multi-shard deployments (an L1 node in front of several MinIO
 	// clusters). Keys are the tenant-facing endpoint selectors — the exact
@@ -66,6 +77,7 @@ func (s3c *S3CloudStorageConfig) UnmarshalYAML(unmarshal func(interface{}) error
 	var aux struct {
 		Aux                 `yaml:",inline"`
 		ConnRecycleInterval string `yaml:"conn_recycle_interval"`
+		ReadTimeout         string `yaml:"read_timeout"`
 	}
 
 	if err := unmarshal(&aux); err != nil {
@@ -78,6 +90,16 @@ func (s3c *S3CloudStorageConfig) UnmarshalYAML(unmarshal func(interface{}) error
 			return fmt.Errorf("invalid s3_proxy conn_recycle_interval %q: %w", aux.ConnRecycleInterval, err)
 		}
 		s3c.ConnRecycleInterval = d
+	}
+	if aux.ReadTimeout != "" {
+		d, err := time.ParseDuration(aux.ReadTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid s3_proxy read_timeout %q: %w", aux.ReadTimeout, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("s3_proxy read_timeout must be positive, got %q", aux.ReadTimeout)
+		}
+		s3c.ReadTimeout = d
 	}
 	return nil
 }

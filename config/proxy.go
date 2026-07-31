@@ -186,7 +186,8 @@ func (c *Config) setProxy() error {
 				c.S3CloudStorage.UpdateTimestamps,
 				c.S3CloudStorage.ConnRecycleInterval,
 				c.StorageMode, c.AccessLogger, c.ErrorLogger, numUploaders, maxQueuedUploads,
-				s3proxy.PrometheusMetrics())
+				s3proxy.PrometheusMetrics(),
+				s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout))
 			if err != nil {
 				return err
 			}
@@ -218,7 +219,8 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.MaxIdleConns,
 			c.S3CloudStorage.ConnRecycleInterval,
 			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
-			s3proxy.PrometheusMetrics())
+			s3proxy.PrometheusMetrics(),
+			s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout))
 		return nil
 	}
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"path"
 	"time"
@@ -57,8 +58,13 @@ type s3Cache struct {
 	metrics          Metrics
 	v2mode           bool
 	updateTimestamps bool
-	objectKey        func(prefix string, hash string, kind cache.EntryKind) string
-	observer         cache.OperationObserver
+	// readDeadline is the overall bound on one read-path call including the
+	// streamed body; defaults to the package-level readDeadline, overridable
+	// via WithReadDeadline. Connection failure is bounded separately and
+	// much tighter by connectTimeout on the transport.
+	readDeadline time.Duration
+	objectKey    func(prefix string, hash string, kind cache.EntryKind) string
+	observer     cache.OperationObserver
 }
 
 type Option func(*s3Cache)
@@ -151,13 +157,49 @@ const (
 // var only so tests can shrink it.
 var uploadTimeout = 10 * time.Minute
 
-// readDeadline bounds a single read-path MinIO call (the miss fall-through
-// GetObject and the Contains StatObject): a sick MinIO node must answer a
-// read in seconds or the caller gets a miss-shaped failure instead of a
-// pinned connection. The deadline context also governs the streamed GET
-// body (canceled when the caller closes it), so a transfer stalled
-// mid-stream is reclaimed too. A var only so tests can shrink it.
-var readDeadline = 5 * time.Second
+// connectTimeout bounds the connection-establishment legs of every MinIO
+// call at the transport layer: TCP dial, TLS handshake, and time to response
+// headers. This — not the overall read deadline — is what makes a dead or
+// black-holed backend fail in seconds: a sick node must ANSWER fast, but a
+// healthy node streaming a large blob may legitimately take much longer than
+// this to finish. 10s is forgiving to a browning-out-but-alive backend while
+// staying well inside a Bazel client's own 60s remote_timeout. Deliberately
+// a constant: raising it toward that client timeout re-introduces the
+// 60-220s miss stalls the catastrophe drills measured pre-deadline.
+const connectTimeout = 10 * time.Second
+
+// readDeadline is the default overall bound on a single read-path MinIO
+// call (the miss fall-through GetObject and the Contains StatObject),
+// INCLUDING the streamed GET body (the deadline context governs it and is
+// canceled when the caller closes the body), so a transfer stalled
+// mid-stream is reclaimed too. Generous by design, mirroring uploadTimeout's
+// reasoning: multi-GB CAS blobs are minutes on a busy link, and guillotining
+// a healthy fill means that blob can never be served through the L1 at all.
+// Connection failure is connectTimeout's job; this only has to reclaim
+// mid-stream stalls. Configurable per deployment via WithReadDeadline
+// (s3_proxy.read_timeout in standalone config). A var so tests can shrink
+// it.
+var readDeadline = 5 * time.Minute
+
+// WithReadDeadline overrides the overall read-path deadline for this
+// backend. Non-positive values keep the default.
+func WithReadDeadline(d time.Duration) Option {
+	return func(c *s3Cache) {
+		if d > 0 {
+			c.readDeadline = d
+		}
+	}
+}
+
+// effectiveReadDeadline returns the configured per-backend deadline, falling
+// back to the package default for s3Cache values built without newBackend
+// (test fixtures) — a zero deadline would expire every read instantly.
+func (c *s3Cache) effectiveReadDeadline() time.Duration {
+	if c.readDeadline > 0 {
+		return c.readDeadline
+	}
+	return readDeadline
+}
 
 // maxRetries caps minio-go's internal per-call retries (library default:
 // MaxRetry = 10 attempts with exponential backoff, ~a minute of retention
@@ -239,6 +281,17 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 		tr.MaxIdleConnsPerHost = defaultMaxIdleConnsPerHost
 	}
 
+	// Fail connection establishment fast, independent of the (generous)
+	// overall read deadline: a black-holed backend must be answered in
+	// seconds by the dialer / TLS / response-header legs, while an
+	// established stream keeps the full readDeadline to move its body.
+	tr.DialContext = (&net.Dialer{
+		Timeout:   connectTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	tr.TLSHandshakeTimeout = connectTimeout
+	tr.ResponseHeaderTimeout = connectTimeout
+
 	// connRecycleInterval arrives fully resolved from config load (the
 	// default is applied there); non-positive disables recycling.
 	if connRecycleInterval > 0 {
@@ -284,6 +337,7 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 		metrics:          metrics,
 		v2mode:           storageMode == "zstd",
 		updateTimestamps: updateTimestamps,
+		readDeadline:     readDeadline,
 	}
 	for _, opt := range options {
 		opt(c)
@@ -587,7 +641,7 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 	bucket := c.bucketForContext(ctx)
 
-	rctx, cancel := context.WithTimeout(ctx, readDeadline)
+	rctx, cancel := context.WithTimeout(ctx, c.effectiveReadDeadline())
 
 	var rc io.ReadCloser
 	var info minio.ObjectInfo
@@ -649,7 +703,7 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 	bucket := c.bucketForContext(ctx)
 
-	sctx, cancel := context.WithTimeout(ctx, readDeadline)
+	sctx, cancel := context.WithTimeout(ctx, c.effectiveReadDeadline())
 	defer cancel()
 
 	var s minio.ObjectInfo
