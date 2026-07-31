@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"strings"
 	"time"
 
@@ -43,7 +45,12 @@ const (
 
 var transportMisses = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bazel_remote_grpcproxy_transport_miss_total",
-	Help: "Proxy backend requests degraded to cache misses by transport-level failures (fail-open).",
+	Help: "Proxy backend requests degraded to cache misses by transport-level failures (fail-open). Excludes caller-induced cancellations (see client_canceled_miss_total) so this series stays a clean L1-health signal.",
+}, []string{"method"})
+
+var clientCanceledMisses = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_client_canceled_miss_total",
+	Help: "Proxy backend requests degraded to cache misses because the caller's own context ended first (build canceled / client-side deadline). Deliberately separate from transport_miss_total: these say nothing about L1 health and must not feed its alerts.",
 }, []string{"method"})
 
 var authMisses = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -92,9 +99,16 @@ func isTransportFailure(err error) bool {
 	}
 	s, ok := status.FromError(err)
 	if !ok {
-		// Non-gRPC errors from the client stack (dial, net, context) are
-		// transport-class by construction.
-		return true
+		// Non-status errors degrade only when they are unambiguously
+		// transport-class (context expiry, network stack). A plain
+		// application error (e.g. a FetchBlob response status stringified
+		// upstream, a hex-decode failure) must keep failing strictly —
+		// blanket-classifying every non-status error as transport would
+		// silently convert application failures into metered misses.
+		var netErr net.Error
+		return errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, context.Canceled) ||
+			errors.As(err, &netErr)
 	}
 	switch s.Code() {
 	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
@@ -138,8 +152,12 @@ func isConfigRejection(err error) bool {
 // missForBackendError applies the fail-open read contract to a backend
 // error: auth rejections, marked trust-interceptor rejections, and transport
 // failures are counted on their distinct meters and degraded to misses;
-// anything else stays an error.
-func missForBackendError(err error, method string) bool {
+// anything else stays an error. ctx is the caller's request context: a
+// transport-class failure observed after the caller's own context died
+// (build canceled, client deadline) still degrades — the caller is gone
+// either way — but is metered separately, because it says nothing about L1
+// health and must not inflate the alertable transport-miss series.
+func missForBackendError(ctx context.Context, err error, method string) bool {
 	if isAuthFailure(err) {
 		authMisses.WithLabelValues(method).Inc()
 		return true
@@ -149,7 +167,11 @@ func missForBackendError(err error, method string) bool {
 		return true
 	}
 	if isTransportFailure(err) {
-		transportMisses.WithLabelValues(method).Inc()
+		if ctx.Err() != nil {
+			clientCanceledMisses.WithLabelValues(method).Inc()
+		} else {
+			transportMisses.WithLabelValues(method).Inc()
+		}
 		return true
 	}
 	return false
@@ -293,22 +315,44 @@ func logResponse(logger cache.Logger, method string, msg string, kind cache.Entr
 	logger.Printf("GRPC PROXY %s %s %s: %s", strings.ToUpper(method), strings.ToUpper(kind.String()), hash, msg)
 }
 
+// ensureOutgoingMetadataValue attaches key=value to the outgoing metadata,
+// idempotently by VALUE, not mere key presence. Re-entrant call paths
+// (Contains(RAW/AC) delegating to Get) share one context and must not attach
+// twice — but "the key is already set" is only trustworthy when it carries
+// the same value. If an outer layer ever attached a *different* value, the
+// request-scoped one wins: silently deferring to a foreign value could route
+// a tenant's data to the wrong keyspace or shard, which is exactly what the
+// downstream's fail-closed duplicate rejection exists to prevent. No
+// legitimate layering produces a conflict today, so it is also logged.
+func ensureOutgoingMetadataValue(ctx context.Context, key, value string) context.Context {
+	md, ok := metadata.FromOutgoingContext(ctx)
+	if !ok || len(md.Get(key)) == 0 {
+		return metadata.AppendToOutgoingContext(ctx, key, value)
+	}
+	existing := md.Get(key)
+	if len(existing) == 1 && existing[0] == value {
+		return ctx
+	}
+	log.Printf("GRPC PROXY: outgoing metadata %s already set to %q, overriding with request-scoped %q",
+		key, strings.Join(existing, ","), value)
+	md = md.Copy()
+	md.Set(key, value)
+	return metadata.NewOutgoingContext(ctx, md)
+}
+
 // withOutgoingStoragePrefix forwards the request-scoped storage prefix (when
 // one is attached to ctx) to the downstream bazel-remote as gRPC metadata, so
 // the downstream node can preserve tenant isolation on its local disk and its
-// own storage backend. Attachment is idempotent: the downstream rejects
-// duplicate prefix values as a fail-closed isolation guard, so a call path
-// that layers this twice (e.g. Contains(AC) delegating to Get) must not
-// produce two copies of the header.
+// own storage backend. Attachment is idempotent by value (see
+// ensureOutgoingMetadataValue): the downstream rejects duplicate prefix
+// values as a fail-closed isolation guard, so a call path that layers this
+// twice (e.g. Contains(AC) delegating to Get) must not produce two copies.
 func withOutgoingStoragePrefix(ctx context.Context) context.Context {
 	prefix, ok := cache.StoragePrefixFromContext(ctx)
 	if !ok {
 		return ctx
 	}
-	if md, ok := metadata.FromOutgoingContext(ctx); ok && len(md.Get(cache.StoragePrefixGRPCMetadataKey)) > 0 {
-		return ctx
-	}
-	return metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
+	return ensureOutgoingMetadataValue(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
 }
 
 // withOutgoingS3Backend forwards the request-scoped (endpoint, bucket)
@@ -316,19 +360,15 @@ func withOutgoingStoragePrefix(ctx context.Context) context.Context {
 // gRPC metadata, so a multi-backend L1 routes the operation to the right
 // storage cluster and bucket. The bucket key is attached only when the
 // selection carries one (a context minted before the bucket contract may
-// not). Idempotent per key for the same reason as withOutgoingStoragePrefix:
-// the downstream rejects duplicate values fail-closed.
+// not). Idempotent by value per key, same as withOutgoingStoragePrefix.
 func withOutgoingS3Backend(ctx context.Context) context.Context {
 	selection, ok := cache.S3BackendFromContext(ctx)
 	if !ok {
 		return ctx
 	}
-	md, _ := metadata.FromOutgoingContext(ctx)
-	if len(md.Get(cache.S3BackendGRPCMetadataKey)) == 0 {
-		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BackendGRPCMetadataKey, selection.Endpoint)
-	}
-	if selection.Bucket != "" && len(md.Get(cache.S3BucketGRPCMetadataKey)) == 0 {
-		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BucketGRPCMetadataKey, selection.Bucket)
+	ctx = ensureOutgoingMetadataValue(ctx, cache.S3BackendGRPCMetadataKey, selection.Endpoint)
+	if selection.Bucket != "" {
+		ctx = ensureOutgoingMetadataValue(ctx, cache.S3BucketGRPCMetadataKey, selection.Bucket)
 	}
 	return ctx
 }
@@ -542,7 +582,11 @@ func (r *remoteGrpcProxyCache) fetchBlobDigest(ctx context.Context, hash string)
 		return nil, errBlobNotFound
 	}
 	if res.Status.GetCode() != int32(codes.OK) {
-		return nil, errors.New(res.Status.Message)
+		// Preserve the application status code instead of flattening to a
+		// plain error: callers classify errors by code (a ResourceExhausted
+		// from the asset API must fail strictly, not degrade as a
+		// transport-class miss).
+		return nil, status.Error(codes.Code(res.Status.GetCode()), res.Status.GetMessage())
 	}
 	return res.BlobDigest, nil
 }
@@ -571,7 +615,7 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 
 		if err != nil {
 			logResponse(r.errorLogger, "Get", err.Error(), kind, hash)
-			if missForBackendError(err, "ac_get") {
+			if missForBackendError(ctx, err, "ac_get") {
 				return nil, -1, nil
 			}
 			return nil, -1, err
@@ -594,7 +638,7 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 				if errors.Is(err, errBlobNotFound) {
 					return nil, -1, nil
 				}
-				if missForBackendError(err, "cas_fetch") {
+				if missForBackendError(ctx, err, "cas_fetch") {
 					return nil, -1, nil
 				}
 				return nil, -1, err
@@ -612,7 +656,7 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 		stream, err := r.clients.bs.Read(ctx, &req)
 		if err != nil {
 			logResponse(r.errorLogger, "Read", err.Error(), kind, hash)
-			if missForBackendError(err, "cas_read") {
+			if missForBackendError(ctx, err, "cas_read") {
 				return nil, -1, nil
 			}
 			return nil, -1, err
@@ -634,7 +678,7 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 			if status.Code(err) == codes.NotFound {
 				return nil, -1, nil
 			}
-			if missForBackendError(err, "cas_read") {
+			if missForBackendError(ctx, err, "cas_read") {
 				return nil, -1, nil
 			}
 			return nil, -1, err
@@ -673,6 +717,13 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 			digest, err := r.fetchBlobDigest(ctx, hash)
 			if err != nil {
 				logResponse(r.errorLogger, "Contains", err.Error(), kind, hash)
+				// Result is already a miss either way; classify non-miss
+				// errors on the distinct meters so auth/config/transport
+				// trouble on this path is as visible as on Get and the
+				// size-known Contains path.
+				if !errors.Is(err, errBlobNotFound) {
+					_ = missForBackendError(ctx, err, "cas_contains")
+				}
 				return false, -1
 			}
 			logResponse(r.accessLogger, "Contains", "Success", kind, hash)
@@ -690,7 +741,7 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 		if err != nil {
 			logResponse(r.errorLogger, "Contains", err.Error(), kind, hash)
 			// Result is already a miss; classify for the distinct meters.
-			_ = missForBackendError(err, "cas_contains")
+			_ = missForBackendError(ctx, err, "cas_contains")
 			return false, -1
 		}
 		for range res.MissingBlobDigests {
