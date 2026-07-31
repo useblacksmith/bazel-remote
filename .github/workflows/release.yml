@@ -25,7 +25,7 @@ jobs:
       version: ${{ steps.release_source.outputs.version }}
     steps:
       - name: checkout release tag
-        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v3
         with:
           ref: refs/tags/${{ inputs.release_tag }}
           fetch-depth: 0
@@ -91,7 +91,7 @@ jobs:
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
       - name: checkout code
-        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v3
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
           persist-credentials: false
@@ -135,7 +135,7 @@ jobs:
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
       - name: checkout
-        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v3
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
           persist-credentials: false
