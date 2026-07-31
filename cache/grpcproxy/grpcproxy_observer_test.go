@@ -54,5 +54,15 @@ func TestObserveUploadCarriesEntryKind(t *testing.T) {
 		if outcome.Bytes != 42 {
 			t.Errorf("kind %v: expected 42 bytes, got %d", tc.kind, outcome.Bytes)
 		}
+		// Cross-repo tripwire (Piotr, fork 3/5 review): successful forwards
+		// deliberately carry no reason — both emit sites pass "". The fa
+		// consumer (agent/cache/bazelre/build_cache_metrics.go) maps
+		// forwarded CAS uploads to created and unconditionally overwrites
+		// Reason with l1_forwarded, so any reason the fork attaches to a
+		// successful forward would be silently swallowed there. If this
+		// assertion ever fires, reconcile with that mapping first.
+		if outcome.Reason != "" {
+			t.Errorf("kind %v: successful forwards must carry an empty reason, got %q", tc.kind, outcome.Reason)
+		}
 	}
 }
