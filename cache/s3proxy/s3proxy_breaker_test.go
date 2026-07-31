@@ -3,6 +3,7 @@ package s3proxy
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	stdlog "log"
 	"net/http"
@@ -70,6 +71,7 @@ func breakerCache(t *testing.T, core *minio.Core, breakerName string, errorLogge
 		bucket:       "test-bucket",
 		breaker:      newBreaker(breakerName, errorLogger),
 		objectKey:    objectKeyV1,
+		readDeadline: readDeadline,
 		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
 		errorLogger:  errorLogger,
 	}
@@ -429,6 +431,60 @@ func TestReadDeadlineBoundsHungGet(t *testing.T) {
 	}
 	if got := c.breaker.consecutiveFailures; got != 1 {
 		t.Fatalf("breaker consecutive failures after deadline-exceeded Get = %d, want 1", got)
+	}
+}
+
+// TestSlowBodySurvivesConnectTimeoutLegs pins the deadline split: connection
+// establishment is bounded tight (connectTimeout on the transport), but a
+// healthy backend that answered fast may take its time streaming the body —
+// only the overall readDeadline governs that. A body that dribbles in over
+// several write-flush-sleep rounds must arrive complete, not be guillotined
+// by any handshake-scale timeout.
+func TestSlowBodySurvivesConnectTimeoutLegs(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 64)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for i := 0; i < len(payload); i += 16 {
+			_, _ = w.Write(payload[i : i+16])
+			flusher.Flush()
+			time.Sleep(75 * time.Millisecond)
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	c := breakerCache(t, coreFor(t, ts, 1), "slow-body-test/test-bucket", nil)
+	c.readDeadline = 5 * time.Second // ~300ms of body dribble, generous ceiling
+
+	rc, size, err := c.Get(context.Background(), cache.CAS, testHash, -1)
+	if err != nil || rc == nil {
+		t.Fatalf("slow-body Get = (%v, %d, %v), want streamed success", rc, size, err)
+	}
+	defer func() { _ = rc.Close() }()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("reading slow body: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("slow body arrived corrupted: got %d bytes, want %d", len(got), len(payload))
+	}
+	if failures := c.breaker.consecutiveFailures; failures != 0 {
+		t.Fatalf("healthy slow body counted %d breaker failures, want 0", failures)
+	}
+}
+
+func TestWithReadDeadlineOption(t *testing.T) {
+	c := &s3Cache{readDeadline: readDeadline}
+	WithReadDeadline(30 * time.Second)(c)
+	if c.readDeadline != 30*time.Second {
+		t.Fatalf("WithReadDeadline(30s) left %v", c.readDeadline)
+	}
+	// Non-positive keeps the current value — config passes zero for "unset".
+	WithReadDeadline(0)(c)
+	if c.readDeadline != 30*time.Second {
+		t.Fatalf("WithReadDeadline(0) must be a no-op, left %v", c.readDeadline)
 	}
 }
 
