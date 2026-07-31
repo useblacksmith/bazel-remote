@@ -64,6 +64,12 @@ func main() {
 }
 
 func run(ctx *cli.Context) error {
+	// Raise RLIMIT_NOFILE before parsing config: config.Get asserts the
+	// aggregate upload-queue FD budget against the CURRENT soft limit, so
+	// raising afterwards would fail startup for backend maps that fit
+	// comfortably within the post-raise ceiling.
+	rlimit.Raise()
+
 	c, err := config.Get(ctx)
 	if err != nil {
 		_, _ = fmt.Fprintf(ctx.App.Writer, "%v\n\n", err)
@@ -101,8 +107,6 @@ func run(ctx *cli.Context) error {
 	}
 	log.Printf("bazel-remote built with %s%s%s.",
 		runtime.Version(), maybeGitCommitMsg, maybeGitTagsMsg)
-
-	rlimit.Raise()
 
 	grpcSem := semaphore.NewWeighted(1)
 	var grpcServer *grpc.Server
