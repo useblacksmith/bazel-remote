@@ -6,6 +6,7 @@ import (
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -102,6 +103,38 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
+}
+
+func TestTrustRejectionCounters(t *testing.T) {
+	// The rate-limited journald line points operators at the *_rejected_total
+	// counters; this pins that every rejection cause actually increments one
+	// (drill #2 finding: prefix and secret rejections were counter-less).
+	validPrefix := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, "bazel/staging/us-west/42/9876/v0/bazel/")
+
+	prefixBefore := testutil.ToFloat64(storagePrefixRejected.WithLabelValues("missing")) +
+		testutil.ToFloat64(storagePrefixRejected.WithLabelValues("invalid"))
+	secretBefore := testutil.ToFloat64(authSecretRejected.WithLabelValues("missing")) +
+		testutil.ToFloat64(authSecretRejected.WithLabelValues("mismatch"))
+
+	_, _ = storagePrefixFromIncomingContext(context.Background(), "")
+	md := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, "a//b/")
+	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "")
+
+	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), "hunter2")
+	md = metadata.Join(validPrefix, metadata.Pairs(cache.AuthSecretGRPCMetadataKey, "wrong"))
+	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "hunter2")
+
+	prefixAfter := testutil.ToFloat64(storagePrefixRejected.WithLabelValues("missing")) +
+		testutil.ToFloat64(storagePrefixRejected.WithLabelValues("invalid"))
+	secretAfter := testutil.ToFloat64(authSecretRejected.WithLabelValues("missing")) +
+		testutil.ToFloat64(authSecretRejected.WithLabelValues("mismatch"))
+
+	if prefixAfter != prefixBefore+2 {
+		t.Errorf("storage_prefix_rejected_total: got %v, want %v", prefixAfter, prefixBefore+2)
+	}
+	if secretAfter != secretBefore+2 {
+		t.Errorf("auth_secret_rejected_total: got %v, want %v", secretAfter, secretBefore+2)
+	}
 }
 
 func TestExemptFromTenantMetadata(t *testing.T) {

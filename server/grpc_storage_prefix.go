@@ -6,6 +6,8 @@ import (
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -32,13 +34,49 @@ import (
 // stay unmarked Unauthenticated, which the upstream already degrades via its
 // code-based auth check.
 
+// storagePrefixRejected and authSecretRejected meter the fail-closed
+// rejections below, by cause — symmetric with the selector interceptor's
+// bazel_remote_s3_backend_selector_rejected_total, and the counters the
+// rate-limited trust-rejection log line points operators at. The prefix and
+// secret are minted by the trusted upstream, never by customers, so any
+// nonzero series means upstream drift: FA/L1 version skew, a Doppler secret
+// mismatch, or a forwarding bug.
+var storagePrefixRejected = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_storage_prefix_rejected_total",
+	Help: "Cache RPCs rejected by the storage-prefix trust interceptor, by cause (missing/duplicate/invalid). Nonzero means upstream drift (FA/L1 version skew or a forwarding bug), never customer input.",
+}, []string{"reason"})
+
+var authSecretRejected = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_auth_secret_rejected_total",
+	Help: "Cache RPCs rejected by the shared-secret auth check, by cause (missing/duplicate/mismatch). Nonzero means the upstream's BAZELRE_CACHE_L1_SECRET disagrees with this node's configured secret.",
+}, []string{"reason"})
+
 func storagePrefixFromIncomingContext(ctx context.Context, authSecret string) (context.Context, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 
 	if authSecret != "" {
 		secrets := md.Get(cache.AuthSecretGRPCMetadataKey)
-		if len(secrets) != 1 ||
-			subtle.ConstantTimeCompare([]byte(secrets[0]), []byte(authSecret)) != 1 {
+		// The value count is not secret-dependent, so distinguishing
+		// missing/duplicate from mismatch leaks nothing; only the value
+		// comparison itself must be constant-time.
+		cause := ""
+		switch {
+		case len(secrets) == 0:
+			cause = "missing"
+		case len(secrets) > 1:
+			cause = "duplicate"
+		case subtle.ConstantTimeCompare([]byte(secrets[0]), []byte(authSecret)) != 1:
+			cause = "mismatch"
+		}
+		if cause != "" {
+			authSecretRejected.WithLabelValues(cause).Inc()
+			// Deliberately NOT a trustRejection: auth failures stay
+			// unmarked Unauthenticated (the upstream degrades them via its
+			// code-based auth check, see the package comment), but they
+			// share the rate-limited journald line so a live debugging
+			// session sees the incident on the node at all.
+			logTrustRejection("AUTH_SECRET", cause,
+				cause+" "+cache.AuthSecretGRPCMetadataKey+" metadata")
 			return ctx, status.Errorf(codes.Unauthenticated,
 				"missing or invalid %s metadata", cache.AuthSecretGRPCMetadataKey)
 		}
@@ -46,10 +84,12 @@ func storagePrefixFromIncomingContext(ctx context.Context, authSecret string) (c
 
 	prefix, cause := singleMetadataValue(md, cache.StoragePrefixGRPCMetadataKey)
 	if cause != "" {
+		storagePrefixRejected.WithLabelValues(cause).Inc()
 		return ctx, trustRejection(cache.RejectionReasonStoragePrefix, cause,
 			"%s %s metadata", cause, cache.StoragePrefixGRPCMetadataKey)
 	}
 	if !cache.ValidStoragePrefix(prefix) {
+		storagePrefixRejected.WithLabelValues("invalid").Inc()
 		return ctx, trustRejection(cache.RejectionReasonStoragePrefix, "invalid",
 			"invalid %s metadata value", cache.StoragePrefixGRPCMetadataKey)
 	}
