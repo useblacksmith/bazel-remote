@@ -615,6 +615,63 @@ func TestUploadNeverClaimsHalfOpenProbe(t *testing.T) {
 	}
 }
 
+// TestCorruptCasblobExtractReleasesBody pins the v2mode extract-failure
+// path: a malformed casblob header must close the body (releasing the
+// deadline timer AND the breaker's half-open probe slot) and must not count
+// against the backend — the object is bad, not the backend.
+func TestCorruptCasblobExtractReleasesBody(t *testing.T) {
+	oldTimeout := breakerTimeout
+	breakerTimeout = 50 * time.Millisecond
+	defer func() { breakerTimeout = oldTimeout }()
+
+	backend := s3mem.New()
+	if err := backend.CreateBucket("test-bucket"); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(gofakes3.New(backend).Server())
+	t.Cleanup(ts.Close)
+	core := coreFor(t, ts, 1)
+	c := breakerCache(t, core, "breaker-extract-test", nil)
+	c.v2mode = true
+	c.objectKey = objectKeyV2
+
+	// Store garbage where a casblob header is expected: 32 zero bytes parse
+	// as a full 16-byte header with uncompressedSize=0, so ExtractLogicalSize
+	// fails WITHOUT the body ever seeing EOF — the exact wedge scenario. (A
+	// SHORT object is different: the wrapper sees clean EOF, honestly a
+	// transport-level success, and the probe closes the breaker.)
+	key := objectKeyV2("", testHash, cache.CAS)
+	junk := make([]byte, 32)
+	if _, err := core.PutObject(context.Background(), "test-bucket", key,
+		bytes.NewReader(junk), int64(len(junk)), "", "", minio.PutObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Closed state: the extract failure surfaces as an error and counts
+	// neither way against the breaker.
+	if _, _, err := c.Get(context.Background(), cache.CAS, testHash, -1); err == nil {
+		t.Fatal("Get on a corrupt casblob returned nil error")
+	}
+	if got := c.breaker.consecutiveFailures; got != 0 {
+		t.Fatalf("corrupt casblob counted %d breaker failures, want 0", got)
+	}
+
+	// Half-open state: the extract-failing probe must release the probe
+	// slot on Close, so the NEXT request is still admitted (a wedged slot
+	// would refuse every request forever).
+	tripBreaker(t, c.breaker)
+	time.Sleep(breakerTimeout + 20*time.Millisecond)
+	if _, _, err := c.Get(context.Background(), cache.CAS, testHash, -1); err == nil {
+		t.Fatal("half-open probe on corrupt casblob returned nil error")
+	}
+	if st := c.breaker.State(); st != breakerHalfOpen {
+		t.Fatalf("breaker state after neither-way probe = %v, want still half-open", st)
+	}
+	if _, _, err := c.Get(context.Background(), cache.CAS, testHash, -1); err == nil {
+		t.Fatal("follow-up Get was not admitted as a probe (wedged probe slot?)")
+	}
+}
+
 func TestWithReadDeadlineOption(t *testing.T) {
 	c := &s3Cache{readDeadline: readDeadline}
 	WithReadDeadline(30 * time.Second)(c)
