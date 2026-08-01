@@ -751,7 +751,17 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 	logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, nil)
 
 	if kind == cache.CAS && c.v2mode {
-		return casblob.ExtractLogicalSize(rc)
+		lrc, logicalSize, err := casblob.ExtractLogicalSize(rc)
+		if err != nil {
+			// A malformed casblob header says the stored OBJECT is bad, not
+			// the backend: Close both releases the deadline timer and files
+			// the body's breaker outcome (an un-expired early close counts
+			// neither way), so a half-open probe slot is never wedged by a
+			// corrupt blob.
+			_ = rc.Close()
+			return nil, -1, err
+		}
+		return lrc, logicalSize, nil
 	}
 
 	return rc, info.Size, nil
