@@ -62,9 +62,9 @@ var breakerTimeout = 15 * time.Second
 // Breaker states. The numeric values are the wire contract of the
 // bazel_remote_s3_breaker_state gauge.
 const (
-	breakerClosed int32 = iota // 0
-	breakerHalfOpen            // 1
-	breakerOpen                // 2
+	breakerClosed   int32 = iota // 0
+	breakerHalfOpen              // 1
+	breakerOpen                  // 2
 )
 
 func breakerStateName(state int32) string {
