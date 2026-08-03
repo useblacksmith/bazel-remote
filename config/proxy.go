@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"syscall"
 
 	"github.com/buchgr/bazel-remote/v2/cache/azblobproxy"
@@ -187,7 +188,12 @@ func (c *Config) setProxy() error {
 				c.S3CloudStorage.ConnRecycleInterval,
 				c.StorageMode, c.AccessLogger, c.ErrorLogger, numUploaders, maxQueuedUploads,
 				s3proxy.PrometheusMetrics(),
-				s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout))
+				s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout),
+				// Standalone deployments own durable local storage, so shed
+				// or failed write-throughs become owed uploads (snapshotted
+				// beside the cache) instead of silent losses. See
+				// s3proxy/owed.go for the invariant this preserves.
+				s3proxy.WithOwedLedgerDir(filepath.Join(c.Dir, "s3-owed")))
 			if err != nil {
 				return err
 			}
@@ -220,7 +226,8 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.ConnRecycleInterval,
 			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
 			s3proxy.PrometheusMetrics(),
-			s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout))
+			s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout),
+			s3proxy.WithOwedLedgerDir(filepath.Join(c.Dir, "s3-owed")))
 		return nil
 	}
 

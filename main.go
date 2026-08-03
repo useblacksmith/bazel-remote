@@ -16,6 +16,7 @@ import (
 	auth "github.com/abbot/go-http-auth"
 
 	"github.com/buchgr/bazel-remote/v2/cache/disk"
+	"github.com/buchgr/bazel-remote/v2/cache/s3proxy"
 
 	"github.com/buchgr/bazel-remote/v2/config"
 	"github.com/buchgr/bazel-remote/v2/ldap"
@@ -176,6 +177,16 @@ func run(ctx *cli.Context) error {
 		log.Fatal(err)
 	}
 	diskCache.RegisterMetrics()
+
+	// The owed-upload sweeper (s3proxy/owed.go) reopens local blobs for
+	// deferred backend uploads. The disk cache is constructed after the
+	// proxy (it takes the proxy as an option), so the back-reference is
+	// injected here, which also starts the per-backend sweepers.
+	if setter, ok := c.ProxyBackend.(s3proxy.BlobSourceSetter); ok {
+		if source, ok := diskCache.(s3proxy.BlobSource); ok {
+			setter.SetBlobSource(source)
+		}
+	}
 
 	servers := new(errgroup.Group)
 
