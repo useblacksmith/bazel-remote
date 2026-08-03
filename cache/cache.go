@@ -104,6 +104,14 @@ func TransformActionCacheKey(key, instance string, logger Logger) string {
 	return newKey
 }
 
+// OwedLedgerDirName is the directory (under the disk cache root) holding
+// owed-upload ledger snapshots (see s3proxy/owed.go). Defined here because
+// two packages that must not import each other need to agree on it: the
+// proxy config wires it as the snapshot location, and the disk cache's
+// startup scan must skip it like lost+found rather than fail the boot on
+// an unexpected directory.
+const OwedLedgerDirName = "s3-owed"
+
 func LookupKey(kind EntryKind, hash string) string {
 	return kind.String() + "/" + hash
 }

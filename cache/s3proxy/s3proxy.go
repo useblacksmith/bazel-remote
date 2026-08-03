@@ -691,10 +691,16 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 	// Coalesce duplicate uploads: matrix fan-out delivers the same missing
 	// blob from many hosts at once, MinIO's create-if-absent would 412 all
 	// but one anyway, and every queued duplicate pins an open FD. The
-	// in-flight copy's terminal outcome settles any owed debt for this key.
+	// coalesced-away upload still records its debt: usually the in-flight
+	// copy's success settles it moments later, but the in-flight claim can
+	// also be the SWEEPER holding a blob it just found evicted — about to
+	// settle the debt as void while this Put proves the blob is back. The
+	// seq bump from this add makes that void-settle a no-op (settleVoid),
+	// and the next sweep pass repays it for real.
 	key := c.resolveUploadIdentity(item)
 	if !c.inflight.tryAdd(key) {
 		uploadQueueCoalesced.WithLabelValues(c.key).Inc()
+		c.owed.add(c.owedEntryForItem(key, item))
 		_ = rc.Close()
 		return
 	}
