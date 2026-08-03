@@ -689,6 +689,22 @@ func (c *diskCache) GetZstd(ctx context.Context, hash string, size int64, offset
 	return c.get(ctx, cache.CAS, hash, size, offset, true)
 }
 
+// writeErrTagger remembers whether a copy failure originated on the WRITE
+// side (our local temp file) rather than the read side (the proxy stream),
+// so the proxy-fill path can tell a broken local disk from a broken backend.
+type writeErrTagger struct {
+	w        io.Writer
+	writeErr error
+}
+
+func (t *writeErrTagger) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if err != nil {
+		t.writeErr = err
+	}
+	return n, err
+}
+
 func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (rc io.ReadCloser, s int64, rErr error) {
 	// The hash format is checked properly in the http/grpc code.
 	// Just perform a simple/fast check here, to catch bad tests.
@@ -814,19 +830,52 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	blobFile = tf.Name()
 
+	uncompressedOnDisk := (kind != cache.CAS) || (c.storageMode == casblob.Identity)
+
 	var sizeOnDisk int64
-	sizeOnDisk, err = io.Copy(tf, r)
-	_ = tf.Close()
-	if err != nil {
-		return nil, -1, internalErr(err)
+	sink := &writeErrTagger{w: tf}
+	sizeOnDisk, err = io.Copy(sink, r)
+	closeErr := tf.Close()
+	if err != nil || closeErr != nil {
+		// Distinguish the two ends of the copy. A LOCAL write failure
+		// (disk-full, I/O error on the temp file) is our storage breaking,
+		// not the backend's: masking it as a miss would hide the real
+		// problem behind silent rebuild storms, so it surfaces as an error.
+		if sink.writeErr != nil || (err == nil && closeErr != nil) {
+			localErr := sink.writeErr
+			if localErr == nil {
+				localErr = closeErr
+			}
+			log.Printf("Proxy fill for %s %s failed writing to local storage: %v", kind, hash, localErr)
+			return nil, -1, internalErr(localErr)
+		}
+		// The proxy stream died mid-fill. Nothing has been sent to the client
+		// yet (the fill lands in a temp file first, discarded by the deferred
+		// cleanup), so degrade to a cache miss instead of failing the request:
+		// a backend that disappears mid-read must cost a rebuild, not a build.
+		log.Printf("Proxy fill for %s %s failed mid-stream, treating as miss: %v", kind, hash, err)
+		return nil, -1, nil
+	}
+	if uncompressedOnDisk && sizeOnDisk != foundSize {
+		// A clean early EOF (io.Copy returns nil) must not commit a
+		// truncated blob: unlike client Puts, which run through the sha256
+		// verifier, the fill path trusts the backend's byte count.
+		// Transports normally surface truncation as an error (short HTTP
+		// body → ErrUnexpectedEOF, broken gRPC stream → Recv error), so
+		// this guards against a buggy backend, same posture as the
+		// mid-stream branch above. For the uncompressed representation the
+		// on-disk size is exactly foundSize; the compressed representation
+		// is covered below — casblob reader construction parses the
+		// container header before anything is committed.
+		log.Printf("Proxy fill for %s %s returned %d bytes where the on-disk representation requires %d, treating as miss",
+			kind, hash, sizeOnDisk, foundSize)
+		return nil, -1, nil
 	}
 
 	rcf, err := os.Open(blobFile)
 	if err != nil {
 		return nil, -1, internalErr(err)
 	}
-
-	uncompressedOnDisk := (kind != cache.CAS) || (c.storageMode == casblob.Identity)
 	if uncompressedOnDisk {
 		if offset > 0 {
 			_, err = rcf.Seek(offset, io.SeekStart)

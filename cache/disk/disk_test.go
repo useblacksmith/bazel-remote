@@ -464,6 +464,60 @@ func TestCacheGetContainsWrongSizeWithProxy(t *testing.T) {
 	}
 }
 
+func TestCacheProxyFillTruncatedCleanEOFIsAMiss(t *testing.T) {
+	// A proxy backend that returns fewer bytes than it claims, with a clean
+	// EOF (io.Copy succeeds), must degrade to a miss — never commit and
+	// serve a truncated blob. Uses uncompressed storage mode so the on-disk
+	// representation is raw bytes with an exactly-known expected size.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cacheDir := tempDir(t)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
+	testCacheI, err := New(cacheDir, BlockSize,
+		WithProxyBackend(new(truncatingProxyStub)),
+		WithStorageMode("uncompressed"),
+		WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testCache := testCacheI.(*diskCache)
+
+	rdr, _, getErr := testCache.Get(ctx, cache.CAS, contentsHash, contentsLength, 0)
+	if getErr != nil {
+		t.Fatalf("Expected a miss, not an error: %v", getErr)
+	}
+	if rdr != nil {
+		t.Fatal("Expected a miss: the truncated proxy fill must not be served")
+	}
+	if testCache.lru.Len() != 0 {
+		t.Fatalf("Expected nothing committed after a truncated fill, found %d items",
+			testCache.lru.Len())
+	}
+}
+
+// truncatingProxyStub claims the full blob {contentsHash, contentsLength} but
+// returns only half of its bytes, ending with a clean EOF.
+type truncatingProxyStub struct{}
+
+func (d truncatingProxyStub) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
+	// Not implemented.
+}
+
+func (d truncatingProxyStub) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (io.ReadCloser, int64, error) {
+	if hash != contentsHash || kind != cache.CAS {
+		return nil, -1, nil
+	}
+	return io.NopCloser(strings.NewReader(contents[:contentsLength/2])), contentsLength, nil
+}
+
+func (d truncatingProxyStub) Contains(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (bool, int64) {
+	if hash != contentsHash || kind != cache.CAS {
+		return false, -1
+	}
+	return true, contentsLength
+}
+
 // proxyStub implements the cache.Proxy interface for a single blob with
 // digest {contentsHash, contentsLength}.
 type proxyStub struct{}

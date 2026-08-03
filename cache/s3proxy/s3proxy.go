@@ -62,6 +62,17 @@ var (
 		Name: "bazel_remote_s3_cache_misses",
 		Help: "The total number of s3 backend cache misses",
 	})
+	// uploadOutcomes is the native terminal-outcome counter for write-through
+	// uploads, independent of any installed OperationObserver: standalone
+	// (L1-node) deployments install no observer, and without this series a
+	// sustained run of failed PUTs drains the queue while every queue-drop
+	// alert stays green. Labels are bounded: status/reason come from
+	// classifyUploadOutcome (created | already_exists/precondition_failed |
+	// error/s3_put_failed).
+	uploadOutcomes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "bazel_remote_s3_upload_outcomes_total",
+		Help: "Terminal S3 write-through upload outcomes per backend (created, already_exists, error).",
+	}, []string{"backend", "status", "reason"})
 )
 
 // Used in place of minio's verbose "NoSuchKey" error.
@@ -257,6 +268,7 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	logResponse(c.accessLogger, "UPLOAD", c.bucket, objectKey, err)
 
 	status, reason := classifyUploadOutcome(err)
+	uploadOutcomes.WithLabelValues(c.bucket, status, reason).Inc()
 	c.observeUpload(context.Background(), item, status, reason)
 
 	_ = item.Rc.Close()
@@ -310,6 +322,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		c.errorLogger.Printf("too many uploads queued\n")
 		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
 			Method: "backend_upload",
+			Kind:   kind.String(),
 			Status: "dropped",
 			Reason: "upload_queue_full",
 			Ops:    1,
@@ -418,6 +431,7 @@ func (c *s3Cache) observeUpload(ctx context.Context, item backendproxy.UploadReq
 	// persists; the footprint accumulator and the MinIO drift scan share this unit.
 	cache.ObserveOperation(cache.WithMetricsLabels(ctx, item.MetricsLabels), c.observer, cache.OperationOutcome{
 		Method: "backend_upload",
+		Kind:   item.Kind.String(),
 		Status: status,
 		Reason: reason,
 		Ops:    1,
