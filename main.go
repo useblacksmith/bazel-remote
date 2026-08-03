@@ -64,10 +64,24 @@ func main() {
 }
 
 func run(ctx *cli.Context) error {
+	// Raise RLIMIT_NOFILE before parsing config: config.Get asserts the
+	// aggregate upload-queue FD budget against the CURRENT soft limit, so
+	// raising afterwards would fail startup for backend maps that fit
+	// comfortably within the post-raise ceiling.
+	rlimit.Raise()
+
 	c, err := config.Get(ctx)
 	if err != nil {
 		_, _ = fmt.Fprintf(ctx.App.Writer, "%v\n\n", err)
 		_ = cli.ShowAppHelp(ctx)
+		return cli.Exit(err.Error(), 1)
+	}
+
+	err = validateMultiBackendTrust(c,
+		os.Getenv("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER") == "1",
+		os.Getenv("BAZEL_REMOTE_L1_AUTH_SECRET"))
+	if err != nil {
+		_, _ = fmt.Fprintf(ctx.App.Writer, "%v\n\n", err)
 		return cli.Exit(err.Error(), 1)
 	}
 
@@ -93,8 +107,6 @@ func run(ctx *cli.Context) error {
 	}
 	log.Printf("bazel-remote built with %s%s%s.",
 		runtime.Version(), maybeGitCommitMsg, maybeGitTagsMsg)
-
-	rlimit.Raise()
 
 	grpcSem := semaphore.NewWeighted(1)
 	var grpcServer *grpc.Server
@@ -231,6 +243,26 @@ func run(ctx *cli.Context) error {
 	}
 
 	return servers.Wait()
+}
+
+// validateMultiBackendTrust refuses to start a multi-backend (s3_proxy
+// backends map) node whose companion trust toggles are off. The backends map
+// only makes sense on an L1 that routes per-tenant traffic, and that routing
+// is only safe when the storage-prefix trust interceptor partitions tenant
+// keyspaces AND the shared auth secret gates who may forward tenant
+// metadata. A map without them would serve every unauthenticated caller
+// from tenant-selected backends.
+func validateMultiBackendTrust(c *config.Config, trustStoragePrefix bool, authSecret string) error {
+	if c.S3CloudStorage == nil || len(c.S3CloudStorage.Backends) == 0 {
+		return nil
+	}
+	if !trustStoragePrefix || authSecret == "" {
+		return fmt.Errorf("the s3_proxy 'backends' map requires the companion trust toggles: " +
+			"set BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER=1 (storage-prefix trust, fail-closed) " +
+			"and a non-empty BAZEL_REMOTE_L1_AUTH_SECRET (shared upstream auth secret), " +
+			"or remove 's3_proxy.backends'")
+	}
+	return nil
 }
 
 func startHttpServer(c *config.Config, httpServer **http.Server,
@@ -426,6 +458,23 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 		log.Println("Trusting forwarded storage-prefix gRPC metadata, fail-closed (BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER=1)")
 		streamInterceptors = append(streamInterceptors, server.GRPCStoragePrefixStreamServerInterceptor(authSecret))
 		unaryInterceptors = append(unaryInterceptors, server.GRPCStoragePrefixUnaryServerInterceptor(authSecret))
+	}
+
+	// Multi-backend S3 mode: every cache RPC must carry exactly one
+	// allowlisted (endpoint, bucket) pair (the tenant's pinned backing-store
+	// endpoint and bucket, forwarded by the trusted upstream) or it is
+	// rejected fail-closed — same trust model as the storage prefix above.
+	// Health and capabilities RPCs are exempt. Only installed when a
+	// backends map is configured; single-backend deployments ignore both
+	// metadata keys.
+	if c.S3CloudStorage != nil && len(c.S3CloudStorage.Backends) > 0 {
+		allowed, err := c.S3CloudStorage.AllowedBackends()
+		if err != nil {
+			return err
+		}
+		log.Printf("Routing S3 operations by forwarded (endpoint, bucket) gRPC metadata, fail-closed (%d allowlisted backends)", len(allowed))
+		streamInterceptors = append(streamInterceptors, server.GRPCS3BackendStreamServerInterceptor(allowed))
+		unaryInterceptors = append(unaryInterceptors, server.GRPCS3BackendUnaryServerInterceptor(allowed))
 	}
 
 	if c.TLSConfig != nil {

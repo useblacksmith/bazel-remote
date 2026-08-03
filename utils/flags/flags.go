@@ -413,8 +413,8 @@ func GetCliFlags() []cli.Flag {
 		},
 		&cli.IntFlag{
 			Name:        "s3.max_idle_conns",
-			Usage:       "The maximum number of idle connections to use when using the S3 proxy backend.",
-			DefaultText: "1024",
+			Usage:       "The maximum number of idle connections to use when using the S3 proxy backend. Applied to both the transport total and the per-host limit.",
+			DefaultText: "64 total / 32 per host",
 			EnvVars:     []string{"BAZEL_REMOTE_S3_MAX_IDLE_CONNS"},
 		},
 		&cli.StringFlag{

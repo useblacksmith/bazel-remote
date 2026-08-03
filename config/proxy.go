@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"syscall"
 
 	"github.com/buchgr/bazel-remote/v2/cache/azblobproxy"
 	"github.com/buchgr/bazel-remote/v2/cache/gcsproxy"
@@ -23,6 +24,33 @@ import (
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	prom "github.com/prometheus/client_golang/prometheus"
 )
+
+// aggregateUploadFDBudgetFraction caps how much of the process's soft
+// RLIMIT_NOFILE the multi-backend upload queues may collectively pin in the
+// worst case. Half is deliberately conservative: the other half must stay
+// free for the serving path (client connections, disk cache FDs), which is
+// the tier that must never lose to background write-through.
+const aggregateUploadFDBudgetFraction = 0.5
+
+// assertAggregateUploadFDBudget fails startup when the worst-case FD
+// consumption of the per-backend upload queues (backends × queue slots, one
+// open reader each) exceeds the budget fraction of the soft NOFILE limit.
+func assertAggregateUploadFDBudget(backendCount, maxQueuedUploadsPerBackend int) error {
+	var rlimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlimit); err != nil {
+		// No limit visible (unusual platform) — nothing to assert against.
+		return nil
+	}
+	budget := uint64(float64(rlimit.Cur) * aggregateUploadFDBudgetFraction)
+	aggregate := uint64(backendCount) * uint64(maxQueuedUploadsPerBackend)
+	if aggregate > budget {
+		return fmt.Errorf(
+			"aggregate upload-queue FD budget exceeded: %d backends × %d max_queued_uploads = %d worst-case open readers, over %d (%.0f%% of soft RLIMIT_NOFILE %d); lower max_queued_uploads (it applies PER backend) or raise LimitNOFILE",
+			backendCount, maxQueuedUploadsPerBackend, aggregate,
+			budget, aggregateUploadFDBudgetFraction*100, rlimit.Cur)
+	}
+	return nil
+}
 
 func getTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	config := &tls.Config{}
@@ -132,6 +160,40 @@ func (c *Config) setProxy() error {
 	}
 
 	if c.S3CloudStorage != nil {
+		// Multi-backend mode: an allowlisted selector → backend map, one
+		// s3proxy backend (own minio client, transport, upload queue) per
+		// entry, routed per-request from the validated gRPC metadata
+		// selector on the context.
+		if len(c.S3CloudStorage.Backends) > 0 {
+			specs, err := c.S3CloudStorage.backendSpecs()
+			if err != nil {
+				return err
+			}
+			// Upload pools are per backend; resolve the (lower) multi-backend
+			// defaults unless explicitly overridden at the top level.
+			numUploaders, maxQueuedUploads := c.perBackendUploadLimits()
+			// The queue limits are PER BACKEND and every queued upload holds
+			// an open file descriptor (the reader is opened before enqueue),
+			// so the process-wide worst case is len(backends) × queue size.
+			// Assert that aggregate against the process's actual FD budget at
+			// startup — a config that could exhaust NOFILE under write
+			// pressure must fail the converge, not the serving path later.
+			if err := assertAggregateUploadFDBudget(len(specs), maxQueuedUploads); err != nil {
+				return err
+			}
+			proxy, err := s3proxy.NewMulti(
+				specs,
+				c.S3CloudStorage.UpdateTimestamps,
+				c.S3CloudStorage.ConnRecycleInterval,
+				c.StorageMode, c.AccessLogger, c.ErrorLogger, numUploaders, maxQueuedUploads,
+				s3proxy.PrometheusMetrics())
+			if err != nil {
+				return err
+			}
+			c.ProxyBackend = proxy
+			return nil
+		}
+
 		creds, err := c.S3CloudStorage.GetCredentials()
 		if err != nil {
 			return err
@@ -141,6 +203,9 @@ func (c *Config) setProxy() error {
 		if err != nil {
 			return err
 		}
+		// Standalone deployments (e.g. an L1 node) have no embedder-provided
+		// metrics sink; export the prefix-safety signal via this package's
+		// own Prometheus counters so it is never dark.
 		c.ProxyBackend = s3proxy.New(
 			c.S3CloudStorage.Endpoint,
 			c.S3CloudStorage.Bucket,
@@ -151,8 +216,9 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.UpdateTimestamps,
 			c.S3CloudStorage.Region,
 			c.S3CloudStorage.MaxIdleConns,
+			c.S3CloudStorage.ConnRecycleInterval,
 			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
-			nil)
+			s3proxy.PrometheusMetrics())
 		return nil
 	}
 

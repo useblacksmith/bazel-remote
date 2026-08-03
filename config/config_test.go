@@ -215,6 +215,8 @@ s3_proxy:
 			AuthMethod:      "access_key",
 			AccessKeyID:     "EXAMPLE_ACCESS_KEY",
 			SecretAccessKey: "EXAMPLE_SECRET_KEY",
+			// Unset conn_recycle_interval resolves to the default at load.
+			ConnRecycleInterval: defaultConnRecycleInterval,
 		},
 		NumUploaders:           100,
 		MinTLSVersion:          "1.0",
