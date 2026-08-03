@@ -8,13 +8,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"strings"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
@@ -27,7 +34,148 @@ const (
 	// The maximum chunk size to write back to the client in Send calls.
 	// Inspired by Goma's FileBlob.FILE_CHUNK maxium size.
 	maxChunkSize = 2 * 1024 * 1024 // 2M
+
+	// uploadTimeout bounds a single asynchronous backend upload. Uploads
+	// previously ran on context.Background() with no deadline, so a hung
+	// backend connection could pin an upload worker forever. The bound is
+	// generous (large CAS blobs can be slow on a busy link); it exists to
+	// reclaim workers, not to police latency.
+	uploadTimeout = 10 * time.Minute
 )
+
+var transportMisses = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_transport_miss_total",
+	Help: "Proxy backend requests degraded to cache misses by transport-level failures (fail-open). Excludes caller-induced cancellations (see client_canceled_miss_total) so this series stays a clean L1-health signal.",
+}, []string{"method"})
+
+var clientCanceledMisses = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_client_canceled_miss_total",
+	Help: "Proxy backend requests degraded to cache misses because the caller's own context ended first (build canceled / client-side deadline). Deliberately separate from transport_miss_total: these say nothing about L1 health and must not feed its alerts.",
+}, []string{"method"})
+
+var authMisses = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_auth_miss_total",
+	Help: "Proxy backend requests rejected as unauthenticated/permission-denied, degraded to cache misses. Nonzero means the backend auth secret is misconfigured — alertable.",
+}, []string{"method"})
+
+var configRejectMisses = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_config_reject_miss_total",
+	Help: "Proxy backend requests rejected by the backend's own trust interceptors (marked with the cache.blacksmith.sh ErrorInfo domain), degraded to cache misses. Nonzero means FA/L1 config skew (backend allowlist or prefix trust drift) — alertable.",
+}, []string{"method"})
+
+var uploadsDropped = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_upload_dropped_total",
+	Help: "Backend uploads dropped before forwarding (queue overflow, missing tenant prefix).",
+}, []string{"reason"})
+
+var uploadsForwarded = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_upload_forwarded_total",
+	Help: "Backend uploads forwarded to the gRPC proxy backend successfully.",
+})
+
+var uploadsFailed = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "bazel_remote_grpcproxy_upload_failed_total",
+	Help: "Backend uploads that reached the gRPC proxy backend but failed.",
+})
+
+var uploadQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "bazel_remote_grpcproxy_upload_queue_depth",
+	Help: "Queued backend uploads awaiting a gRPC proxy upload worker.",
+})
+
+// errBlobNotFound is fetchBlobDigest's not-found sentinel; callers treat it
+// as a cache miss, never a request-failing error.
+var errBlobNotFound = errors.New("blob not found")
+
+// isTransportFailure reports whether err is a transport-level failure
+// reaching the proxy backend (unreachable node, refused/reset connection,
+// missed deadline) rather than an application-level response. The fail-open
+// contract maps these to cache misses on the read path: the disk layer wraps
+// any error returned from a proxy Get as INTERNAL and surfaces it to the
+// build, and an unreachable L1 must never fail a build.
+func isTransportFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	s, ok := status.FromError(err)
+	if !ok {
+		// Non-status errors degrade only when they are unambiguously
+		// transport-class (context expiry, network stack). A plain
+		// application error (e.g. a FetchBlob response status stringified
+		// upstream, a hex-decode failure) must keep failing strictly —
+		// blanket-classifying every non-status error as transport would
+		// silently convert application failures into metered misses.
+		var netErr net.Error
+		return errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, context.Canceled) ||
+			errors.As(err, &netErr)
+	}
+	switch s.Code() {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+		return true
+	}
+	return false
+}
+
+// isAuthFailure reports whether err is the backend rejecting this client's
+// credentials. Defense in depth for the read path: auth misconfiguration
+// discovered mid-flight degrades to cache-off (misses) with a distinct,
+// alertable counter — never failed builds. The startup probe is the loud
+// path for catching this at boot.
+func isAuthFailure(err error) bool {
+	s, ok := status.FromError(err)
+	return ok && (s.Code() == codes.Unauthenticated || s.Code() == codes.PermissionDenied)
+}
+
+// isConfigRejection reports whether err was minted by the backend's own
+// trust interceptors: it carries the typed google.rpc.ErrorInfo detail with
+// cache.TrustRejectionErrorDomain. These are config-race rejections
+// (backend-selector allowlist drift, storage-prefix trust drift, FA/L1
+// version skew), never customer input, so they degrade to metered misses.
+// The check is deliberately marker-based, not error-class based: an
+// unmarked InvalidArgument (or Internal, Unknown, ...) from any other origin
+// keeps failing strictly.
+func isConfigRejection(err error) bool {
+	s, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	for _, detail := range s.Details() {
+		if info, ok := detail.(*errdetails.ErrorInfo); ok &&
+			info.GetDomain() == cache.TrustRejectionErrorDomain {
+			return true
+		}
+	}
+	return false
+}
+
+// missForBackendError applies the fail-open read contract to a backend
+// error: auth rejections, marked trust-interceptor rejections, and transport
+// failures are counted on their distinct meters and degraded to misses;
+// anything else stays an error. ctx is the caller's request context: a
+// transport-class failure observed after the caller's own context died
+// (build canceled, client deadline) still degrades — the caller is gone
+// either way — but is metered separately, because it says nothing about L1
+// health and must not inflate the alertable transport-miss series.
+func missForBackendError(ctx context.Context, err error, method string) bool {
+	if isAuthFailure(err) {
+		authMisses.WithLabelValues(method).Inc()
+		return true
+	}
+	if isConfigRejection(err) {
+		configRejectMisses.WithLabelValues(method).Inc()
+		return true
+	}
+	if isTransportFailure(err) {
+		if ctx.Err() != nil {
+			clientCanceledMisses.WithLabelValues(method).Inc()
+		} else {
+			transportMisses.WithLabelValues(method).Inc()
+		}
+		return true
+	}
+	return false
+}
 
 type GrpcClients struct {
 	asset asset.FetchClient
@@ -56,8 +204,8 @@ func NewGrpcClients(cc *grpc.ClientConn) *GrpcClients {
 	}
 }
 
-func (c *GrpcClients) CheckCapabilities(zstd bool) error {
-	resp, err := c.cap.GetCapabilities(context.Background(), &pb.GetCapabilitiesRequest{})
+func (c *GrpcClients) CheckCapabilities(ctx context.Context, zstd bool) error {
+	resp, err := c.cap.GetCapabilities(ctx, &pb.GetCapabilitiesRequest{})
 	if err != nil {
 		return err
 	}
@@ -78,12 +226,27 @@ type remoteGrpcProxyCache struct {
 	uploadQueue  chan<- backendproxy.UploadReq
 	accessLogger cache.Logger
 	errorLogger  cache.Logger
+	observer     cache.OperationObserver
 	v2mode       bool
+}
+
+type Option func(*remoteGrpcProxyCache)
+
+// WithOperationObserver wires a best-effort outcome observer (the same seam
+// s3proxy exposes), so an embedder keeps its operation-accounting rows when
+// the backend swaps from s3proxy to a gRPC L1. Forwarded uploads are reported
+// with status "forwarded", never "created": the L1's own conditional PUT
+// remains the storage-growth source of truth, so these rows can never double
+// count against it.
+func WithOperationObserver(observer cache.OperationObserver) Option {
+	return func(r *remoteGrpcProxyCache) {
+		r.observer = observer
+	}
 }
 
 func New(clients *GrpcClients, storageMode string,
 	accessLogger cache.Logger, errorLogger cache.Logger,
-	numUploaders, maxQueuedUploads int) cache.Proxy {
+	numUploaders, maxQueuedUploads int, options ...Option) cache.Proxy {
 
 	proxy := &remoteGrpcProxyCache{
 		clients:      clients,
@@ -91,10 +254,60 @@ func New(clients *GrpcClients, storageMode string,
 		errorLogger:  errorLogger,
 		v2mode:       storageMode == "zstd",
 	}
+	for _, opt := range options {
+		opt(proxy)
+	}
 
 	proxy.uploadQueue = backendproxy.StartUploaders(proxy, numUploaders, maxQueuedUploads)
 
 	return proxy
+}
+
+// StopUploaders terminates the upload worker pool by closing the queue.
+// Only safe when no further Put calls can occur — intended for an embedder
+// tearing down a backend that never served traffic (e.g. startup failure
+// after construction); a Put after StopUploaders panics on the closed
+// channel.
+func (r *remoteGrpcProxyCache) StopUploaders() {
+	if r.uploadQueue != nil {
+		close(r.uploadQueue)
+		r.uploadQueue = nil
+	}
+}
+
+// observeUpload reports one terminal backend-upload outcome. Failure statuses
+// ("error", "dropped") match the shared build-cache status taxonomy so
+// downstream failure counting keeps working; success is "forwarded" (see
+// WithOperationObserver). The entry kind is carried on the outcome because a
+// "forwarded" CAS write and a "forwarded" AC write mean different things to a
+// storage accountant: CAS writes are deduplicated by FindMissingBlobs before
+// upload, while AC updates unconditionally rewrite the same action digest on
+// every build, so observers must be able to tell them apart.
+func (r *remoteGrpcProxyCache) observeUpload(item backendproxy.UploadReq, status, reason string) {
+	switch status {
+	case "forwarded":
+		uploadsForwarded.Inc()
+	case "error":
+		uploadsFailed.Inc()
+	case "dropped":
+		uploadsDropped.WithLabelValues(reason).Inc()
+	}
+	uploadQueueDepth.Set(float64(len(r.uploadQueue)))
+	cache.ObserveOperation(cache.WithMetricsLabels(context.Background(), item.MetricsLabels), r.observer, cache.OperationOutcome{
+		Method: "backend_upload",
+		Kind:   item.Kind.String(),
+		Status: status,
+		Reason: reason,
+		Ops:    1,
+		Bytes:  nonNegativeUint64(item.SizeOnDisk),
+	})
+}
+
+func nonNegativeUint64(value int64) uint64 {
+	if value < 0 {
+		return 0
+	}
+	return uint64(value)
 }
 
 // Helper function for logging responses
@@ -102,8 +315,96 @@ func logResponse(logger cache.Logger, method string, msg string, kind cache.Entr
 	logger.Printf("GRPC PROXY %s %s %s: %s", strings.ToUpper(method), strings.ToUpper(kind.String()), hash, msg)
 }
 
+// ensureOutgoingMetadataValue attaches key=value to the outgoing metadata,
+// idempotently by VALUE, not mere key presence. Re-entrant call paths
+// (Contains(RAW/AC) delegating to Get) share one context and must not attach
+// twice — but "the key is already set" is only trustworthy when it carries
+// the same value. If an outer layer ever attached a *different* value, the
+// request-scoped one wins: silently deferring to a foreign value could route
+// a tenant's data to the wrong keyspace or shard, which is exactly what the
+// downstream's fail-closed duplicate rejection exists to prevent. No
+// legitimate layering produces a conflict today, so it is also logged.
+func ensureOutgoingMetadataValue(ctx context.Context, key, value string) context.Context {
+	md, ok := metadata.FromOutgoingContext(ctx)
+	if !ok || len(md.Get(key)) == 0 {
+		return metadata.AppendToOutgoingContext(ctx, key, value)
+	}
+	existing := md.Get(key)
+	if len(existing) == 1 && existing[0] == value {
+		return ctx
+	}
+	log.Printf("GRPC PROXY: outgoing metadata %s already set to %q, overriding with request-scoped %q",
+		key, strings.Join(existing, ","), value)
+	md = md.Copy()
+	md.Set(key, value)
+	return metadata.NewOutgoingContext(ctx, md)
+}
+
+// withOutgoingStoragePrefix forwards the request-scoped storage prefix (when
+// one is attached to ctx) to the downstream bazel-remote as gRPC metadata, so
+// the downstream node can preserve tenant isolation on its local disk and its
+// own storage backend. Attachment is idempotent by value (see
+// ensureOutgoingMetadataValue): the downstream rejects duplicate prefix
+// values as a fail-closed isolation guard, so a call path that layers this
+// twice (e.g. Contains(AC) delegating to Get) must not produce two copies.
+func withOutgoingStoragePrefix(ctx context.Context) context.Context {
+	prefix, ok := cache.StoragePrefixFromContext(ctx)
+	if !ok {
+		return ctx
+	}
+	return ensureOutgoingMetadataValue(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
+}
+
+// withOutgoingS3Backend forwards the request-scoped (endpoint, bucket)
+// selection (when one is attached to ctx) to the downstream bazel-remote as
+// gRPC metadata, so a multi-backend L1 routes the operation to the right
+// storage cluster and bucket. The bucket key is attached only when the
+// selection carries one (a context minted before the bucket contract may
+// not). Idempotent by value per key, same as withOutgoingStoragePrefix.
+func withOutgoingS3Backend(ctx context.Context) context.Context {
+	selection, ok := cache.S3BackendFromContext(ctx)
+	if !ok {
+		return ctx
+	}
+	ctx = ensureOutgoingMetadataValue(ctx, cache.S3BackendGRPCMetadataKey, selection.Endpoint)
+	if selection.Bucket != "" {
+		ctx = ensureOutgoingMetadataValue(ctx, cache.S3BucketGRPCMetadataKey, selection.Bucket)
+	}
+	return ctx
+}
+
+// uploadContext rebuilds an outgoing context for an asynchronous upload from
+// the prefix captured at enqueue time (the original request context is long
+// gone by the time upload workers run). The context carries a deadline so a
+// hung backend cannot pin an upload worker indefinitely; callers must call
+// the returned cancel func.
+func uploadContext(item backendproxy.UploadReq) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	if item.RequestScopedStoragePrefix && item.StoragePrefix != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, item.StoragePrefix)
+	}
+	if item.S3Backend.Endpoint != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BackendGRPCMetadataKey, item.S3Backend.Endpoint)
+	}
+	if item.S3Backend.Bucket != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BucketGRPCMetadataKey, item.S3Backend.Bucket)
+	}
+	return ctx, cancel
+}
+
 func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 	defer func() { _ = item.Rc.Close() }()
+
+	// A required-but-missing prefix means the tenant attribution was lost
+	// between the auth interceptor and this queue. Forwarding the upload
+	// unscoped would let the downstream land it in a shared or wrong
+	// keyspace, so drop it instead: the cost is one lost warmup, never a
+	// cross-tenant write.
+	if item.RequireStoragePrefix && !item.RequestScopedStoragePrefix {
+		logResponse(r.errorLogger, "Upload", "missing request-scoped storage prefix; dropping upload", item.Kind, item.Hash)
+		r.observeUpload(item, "dropped", "missing_prefix")
+		return
+	}
 
 	switch item.Kind {
 	case cache.RAW:
@@ -124,12 +425,14 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 		}
 		if read != item.SizeOnDisk {
 			logResponse(r.errorLogger, "Update", "Unexpected short read", item.Kind, item.Hash)
+			r.observeUpload(item, "error", "short_read")
 			return
 		}
 		ar := &pb.ActionResult{}
 		err := proto.Unmarshal(data, ar)
 		if err != nil {
 			logResponse(r.errorLogger, "Update", err.Error(), item.Kind, item.Hash)
+			r.observeUpload(item, "error", "unmarshal_failed")
 			return
 		}
 		digest := &pb.Digest{
@@ -141,15 +444,23 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 			ActionDigest: digest,
 			ActionResult: ar,
 		}
-		_, err = r.clients.ac.UpdateActionResult(context.Background(), req)
+		ctx, cancel := uploadContext(item)
+		defer cancel()
+		_, err = r.clients.ac.UpdateActionResult(ctx, req)
 		if err != nil {
 			logResponse(r.errorLogger, "Update", err.Error(), item.Kind, item.Hash)
+			r.observeUpload(item, "error", "backend_update_failed")
+			return
 		}
+		r.observeUpload(item, "forwarded", "")
 		return
 	case cache.CAS:
-		stream, err := r.clients.bs.Write(context.Background())
+		ctx, cancel := uploadContext(item)
+		defer cancel()
+		stream, err := r.clients.bs.Write(ctx)
 		if err != nil {
 			logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
+			r.observeUpload(item, "error", "backend_write_failed")
 			return
 		}
 
@@ -174,6 +485,7 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 				if err != nil {
 					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
 				}
+				r.observeUpload(item, "error", "local_read_failed")
 				return
 			}
 			if n > 0 {
@@ -189,20 +501,24 @@ func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
 				err := stream.Send(req)
 				if err != nil {
 					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
+					r.observeUpload(item, "error", "backend_write_failed")
 					return
 				}
 			} else {
 				_, err = stream.CloseAndRecv()
 				if err != nil {
 					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
+					r.observeUpload(item, "error", "backend_write_failed")
 					return
 				}
 				logResponse(r.accessLogger, "Write", "Success", item.Kind, item.Hash)
+				r.observeUpload(item, "forwarded", "")
 				return
 			}
 		}
 	default:
 		logResponse(r.errorLogger, "Write", "Unexpected kind", item.Kind, item.Hash)
+		r.observeUpload(item, "error", "unexpected_kind")
 		return
 	}
 }
@@ -213,18 +529,32 @@ func (r *remoteGrpcProxyCache) Put(ctx context.Context, kind cache.EntryKind, ha
 		return
 	}
 
+	// Capture the request-scoped storage prefix, backend selection and
+	// metrics labels at enqueue time; uploads are asynchronous and the
+	// request context is gone when workers run.
+	prefix, requestScoped := cache.StoragePrefixFromContext(ctx)
+	s3Backend, _ := cache.S3BackendFromContext(ctx)
+	labels, _ := cache.MetricsLabelsFromContext(ctx)
+
 	item := backendproxy.UploadReq{
-		Hash:        hash,
-		LogicalSize: logicalSize,
-		SizeOnDisk:  sizeOnDisk,
-		Kind:        kind,
-		Rc:          rc,
+		Hash:                       hash,
+		LogicalSize:                logicalSize,
+		SizeOnDisk:                 sizeOnDisk,
+		Kind:                       kind,
+		Rc:                         rc,
+		StoragePrefix:              prefix,
+		RequestScopedStoragePrefix: requestScoped,
+		RequireStoragePrefix:       cache.StoragePrefixRequiredFromContext(ctx),
+		S3Backend:                  s3Backend,
+		MetricsLabels:              labels,
 	}
 
 	select {
 	case r.uploadQueue <- item:
+		uploadQueueDepth.Set(float64(len(r.uploadQueue)))
 	default:
 		r.errorLogger.Printf("too many uploads queued")
+		r.observeUpload(item, "dropped", "upload_queue_full")
 		_ = rc.Close()
 	}
 }
@@ -249,15 +579,21 @@ func (r *remoteGrpcProxyCache) fetchBlobDigest(ctx context.Context, hash string)
 	}
 
 	if res.Status.GetCode() == int32(codes.NotFound) {
-		return nil, errors.New("not found")
+		return nil, errBlobNotFound
 	}
 	if res.Status.GetCode() != int32(codes.OK) {
-		return nil, errors.New(res.Status.Message)
+		// Preserve the application status code instead of flattening to a
+		// plain error: callers classify errors by code (a ResourceExhausted
+		// from the asset API must fail strictly, not degrade as a
+		// transport-class miss).
+		return nil, status.Error(codes.Code(res.Status.GetCode()), res.Status.GetMessage())
 	}
 	return res.BlobDigest, nil
 }
 
 func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64) (io.ReadCloser, int64, error) {
+	ctx = withOutgoingStoragePrefix(ctx)
+	ctx = withOutgoingS3Backend(ctx)
 	switch kind {
 	case cache.RAW:
 		// RAW cache entries are a special case of AC, used when --disable_http_ac_validation
@@ -279,6 +615,9 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 
 		if err != nil {
 			logResponse(r.errorLogger, "Get", err.Error(), kind, hash)
+			if missForBackendError(ctx, err, "ac_get") {
+				return nil, -1, nil
+			}
 			return nil, -1, err
 		}
 		data, err := proto.Marshal(res)
@@ -296,6 +635,12 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 			digest, err := r.fetchBlobDigest(ctx, hash)
 			if err != nil {
 				logResponse(r.errorLogger, "Fetch", err.Error(), kind, hash)
+				if errors.Is(err, errBlobNotFound) {
+					return nil, -1, nil
+				}
+				if missForBackendError(ctx, err, "cas_fetch") {
+					return nil, -1, nil
+				}
 				return nil, -1, err
 			}
 			size = digest.SizeBytes
@@ -311,10 +656,35 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 		stream, err := r.clients.bs.Read(ctx, &req)
 		if err != nil {
 			logResponse(r.errorLogger, "Read", err.Error(), kind, hash)
+			if missForBackendError(ctx, err, "cas_read") {
+				return nil, -1, nil
+			}
+			return nil, -1, err
+		}
+
+		// gRPC surfaces almost every backend rejection of a server-streaming
+		// call on the first Recv, not at stream creation, so the check above
+		// rarely fires. Pull the first message eagerly so a deferred
+		// rejection — the backend trust interceptors' marked config
+		// rejections, auth failures, transport errors — degrades to a
+		// metered miss right here, identically to the unary paths, instead
+		// of becoming an unmetered, unclassified mid-fill miss in the disk
+		// layer's catch-all. A deferred NotFound is the plain miss it always was;
+		// unmarked errors keep failing strictly, matching the unary
+		// contract.
+		first, err := stream.Recv()
+		if err != nil && err != io.EOF {
+			logResponse(r.errorLogger, "Read", err.Error(), kind, hash)
+			if status.Code(err) == codes.NotFound {
+				return nil, -1, nil
+			}
+			if missForBackendError(ctx, err, "cas_read") {
+				return nil, -1, nil
+			}
 			return nil, -1, err
 		}
 		logResponse(r.errorLogger, "Read", "Completed", kind, hash)
-		rc := StreamReadCloser[*bs.ReadResponse]{Stream: stream}
+		rc := StreamReadCloser[*bs.ReadResponse]{Stream: stream, buf: first.GetData()}
 		return &rc, size, nil
 	default:
 		return nil, -1, fmt.Errorf("unexpected kind %s", kind)
@@ -322,6 +692,8 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 }
 
 func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64) {
+	ctx = withOutgoingStoragePrefix(ctx)
+	ctx = withOutgoingS3Backend(ctx)
 	switch kind {
 	case cache.RAW:
 		// RAW cache entries are a special case of AC, used when --disable_http_ac_validation
@@ -332,7 +704,9 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 		// is to get the object and discard the result
 		// We don't expect this to ever be called anyways since it is not part of the grpc protocol
 		rc, size, err := r.Get(ctx, kind, hash, size)
-		_ = rc.Close()
+		if rc != nil {
+			_ = rc.Close()
+		}
 		if err != nil || size < 0 {
 			return false, -1
 		}
@@ -343,6 +717,13 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 			digest, err := r.fetchBlobDigest(ctx, hash)
 			if err != nil {
 				logResponse(r.errorLogger, "Contains", err.Error(), kind, hash)
+				// Result is already a miss either way; classify non-miss
+				// errors on the distinct meters so auth/config/transport
+				// trouble on this path is as visible as on Get and the
+				// size-known Contains path.
+				if !errors.Is(err, errBlobNotFound) {
+					_ = missForBackendError(ctx, err, "cas_contains")
+				}
 				return false, -1
 			}
 			logResponse(r.accessLogger, "Contains", "Success", kind, hash)
@@ -359,6 +740,8 @@ func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKin
 		res, err := r.clients.cas.FindMissingBlobs(ctx, req)
 		if err != nil {
 			logResponse(r.errorLogger, "Contains", err.Error(), kind, hash)
+			// Result is already a miss; classify for the distinct meters.
+			_ = missForBackendError(ctx, err, "cas_contains")
 			return false, -1
 		}
 		for range res.MissingBlobDigests {
