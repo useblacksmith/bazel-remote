@@ -441,6 +441,7 @@ func TestUploadFileDeadlineReclaimsWorkerFromHungBackend(t *testing.T) {
 		key:          backendKeyA,
 		mcore:        core,
 		bucket:       "test-bucket",
+		breaker:      newBreaker("test-upload-deadline", nil),
 		objectKey:    objectKeyV2,
 		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
 		observer:     observer,
@@ -621,6 +622,7 @@ func fakeS3Backend(t *testing.T, buckets ...string) *s3Cache {
 		key:          backendKeyA,
 		mcore:        core,
 		bucket:       "default-bucket",
+		breaker:      newBreaker("test-fake-s3", nil),
 		objectKey:    objectKeyV1,
 		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
 	}

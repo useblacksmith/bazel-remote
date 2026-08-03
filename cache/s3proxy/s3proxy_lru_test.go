@@ -53,6 +53,7 @@ func TestContainsRecordsStoredSizeIntoSink(t *testing.T) {
 	c := &s3Cache{
 		mcore:        core,
 		bucket:       "test-bucket",
+		breaker:      newBreaker("test-lru-sink", nil),
 		v2mode:       true,
 		objectKey:    objectKeyV2,
 		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
@@ -107,6 +108,7 @@ func TestContainsWithoutSinkIsNoop(t *testing.T) {
 	c := &s3Cache{
 		mcore:        core,
 		bucket:       "test-bucket",
+		breaker:      newBreaker("test-lru-noop", nil),
 		v2mode:       true,
 		objectKey:    objectKeyV2,
 		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
