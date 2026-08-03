@@ -32,9 +32,14 @@ func (c *diskCache) OpenOwedBlob(ctx context.Context, kind cache.EntryKind, hash
 		return nil, -1, errOwedBlobUnavailable
 	}
 	blobPath := path.Join(c.dir, c.FileLocationForContext(ctx, kind, item.legacy, hash, item.size, item.random))
-	f, err := os.Open(blobPath)
 	c.mu.Unlock()
 
+	// Open outside the global cache mutex, like the rest of this package:
+	// c.mu serializes every Get/Put/eviction on the node, and a sweep batch
+	// is hundreds of opens that may block on disk I/O. Losing the race with
+	// eviction surfaces as an open error, which callers already treat as
+	// debt-settled-void.
+	f, err := os.Open(blobPath)
 	if err != nil {
 		return nil, -1, errOwedBlobUnavailable
 	}

@@ -8,7 +8,6 @@ import (
 	stdlog "log"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -208,17 +207,54 @@ func TestOwedLedgerSnapshotRoundtrip(t *testing.T) {
 
 	reloaded := newOwedLedger(dir, "snap-test", logger)
 	got := reloaded.batch(10)
-	if len(got) != 1 || got[0] != entry {
+	if len(got) != 1 || got[0].Key != entry.Key || got[0].LogicalSize != entry.LogicalSize ||
+		got[0].RequestScopedStoragePrefix != entry.RequestScopedStoragePrefix ||
+		got[0].RequireStoragePrefix != entry.RequireStoragePrefix {
 		t.Fatalf("reloaded ledger = %+v, want [%+v]", got, entry)
 	}
 
 	// A corrupt snapshot must start empty without failing.
-	if err := os.WriteFile(filepath.Join(dir, "owed-uploads-snap-test.json"), []byte("{not json"), 0o644); err != nil {
+	if err := os.WriteFile(reloaded.path, []byte("{not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	corrupt := newOwedLedger(dir, "snap-test", logger)
 	if got := corrupt.batch(10); len(got) != 0 {
 		t.Fatalf("ledger from corrupt snapshot = %+v, want empty", got)
+	}
+}
+
+// TestVoidSettleYieldsToConcurrentReAdd pins the coalesce/void race: the
+// sweeper batches an entry, finds the blob evicted, and — before it settles —
+// a client re-Puts the blob, whose upload coalesces against the sweeper's own
+// in-flight claim and re-records the debt. The stale void-settle must no-op.
+func TestVoidSettleYieldsToConcurrentReAdd(t *testing.T) {
+	c, queue := owedTestCache(t, "owed-void-race-test", 8)
+	key := uploadKey{Kind: cache.CAS, Hash: testHash, Bucket: "test-bucket"}
+	c.owed.add(owedEntry{Key: key})
+
+	batched := c.owed.batch(1)[0]
+
+	// The re-Put arrives between batch and settle: coalesced (the sweeper
+	// would hold the in-flight claim), debt re-recorded with a bumped seq.
+	if !c.inflight.tryAdd(key) {
+		t.Fatal("test setup: in-flight claim failed")
+	}
+	c.Put(context.Background(), cache.CAS, testHash, 4, 4, io.NopCloser(strings.NewReader("blob")))
+	if got := len(queue); got != 0 {
+		t.Fatalf("re-Put was not coalesced: queue depth %d, want 0", got)
+	}
+
+	if c.owed.settleVoid(key, batched.seq) {
+		t.Fatal("stale void-settle succeeded, want no-op after re-add")
+	}
+	if got := testutil.ToFloat64(owedBacklog.WithLabelValues(c.key)); got != 1 {
+		t.Fatalf("owed backlog after raced void-settle = %v, want 1 (debt live)", got)
+	}
+
+	// With no interleaving re-add, void settlement works.
+	fresh := c.owed.batch(1)[0]
+	if !c.owed.settleVoid(key, fresh.seq) {
+		t.Fatal("clean void-settle failed, want success")
 	}
 }
 

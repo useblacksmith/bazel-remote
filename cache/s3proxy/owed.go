@@ -27,7 +27,9 @@ package s3proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -117,6 +119,15 @@ type owedEntry struct {
 	LogicalSize                int64     `json:"logical_size"`
 	RequestScopedStoragePrefix bool      `json:"request_scoped_prefix"`
 	RequireStoragePrefix       bool      `json:"require_prefix"`
+
+	// seq is bumped on every add for this key. The sweeper's evicted-blob
+	// settlement is conditional on it (see settleVoid): between the sweeper
+	// observing "not on disk" and settling, a client can re-Put the blob —
+	// whose upload the sweeper's own in-flight claim then coalesces away —
+	// so an unconditional settle would erase the only record that MinIO
+	// still lacks the object. Not persisted: within one process lifetime is
+	// the only window the race exists in.
+	seq uint64
 }
 
 // inflightSet tracks uploads that are queued or being uploaded right now.
@@ -163,16 +174,23 @@ type owedLedger struct {
 	mu      sync.Mutex
 	entries map[uploadKey]owedEntry
 	dirty   bool
+	nextSeq uint64
 }
 
 // newOwedLedger loads any snapshot left by a previous process. A corrupt or
 // unreadable snapshot starts empty and logs: the ledger is a convergence
 // accelerator, never a correctness gate worth failing startup for.
 func newOwedLedger(dir, backendKey string, errorLogger cache.Logger) *owedLedger {
+	// The filename carries a hash of the RAW key alongside the sanitized
+	// form: sanitization is lossy (everything outside [a-zA-Z0-9.-] maps
+	// to '_'), and two backend keys colliding onto one snapshot file would
+	// clobber each other's debts and load the union on restart.
+	keyDigest := sha256.Sum256([]byte(backendKey))
 	l := &owedLedger{
 		backendKey: backendKey,
-		path:       filepath.Join(dir, "owed-uploads-"+sanitizeForFilename(backendKey)+".json"),
-		entries:    make(map[uploadKey]owedEntry),
+		path: filepath.Join(dir, fmt.Sprintf("owed-uploads-%s-%x.json",
+			sanitizeForFilename(backendKey), keyDigest[:4])),
+		entries: make(map[uploadKey]owedEntry),
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		errorLogger.Printf("owed ledger: cannot create %s (%v); continuing without restart persistence", dir, err)
@@ -207,11 +225,16 @@ func (l *owedLedger) add(e owedEntry) {
 		owedRejected.WithLabelValues(l.backendKey).Inc()
 		return
 	}
+	l.nextSeq++
+	e.seq = l.nextSeq
 	l.entries[e.Key] = e
 	l.dirty = true
 	owedBacklog.WithLabelValues(l.backendKey).Set(float64(len(l.entries)))
 }
 
+// settle removes the debt unconditionally: callers hold proof that the
+// object now exists in the backend (created or already_exists), which
+// discharges the debt no matter how many times it was re-recorded.
 func (l *owedLedger) settle(k uploadKey) {
 	if l == nil {
 		return
@@ -224,6 +247,28 @@ func (l *owedLedger) settle(k uploadKey) {
 	delete(l.entries, k)
 	l.dirty = true
 	owedBacklog.WithLabelValues(l.backendKey).Set(float64(len(l.entries)))
+}
+
+// settleVoid removes the debt only if it has not been re-recorded since the
+// caller observed it (seq match). Used by the sweeper's evicted-blob path,
+// where the proof is "the blob is gone locally" — a fact that a concurrent
+// client re-Put (coalesced away by the sweeper's own in-flight claim) can
+// invalidate between observation and settlement. A bumped seq means the
+// debt is live again; keep it for the next pass. Returns whether it settled.
+func (l *owedLedger) settleVoid(k uploadKey, seq uint64) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e, ok := l.entries[k]
+	if !ok || e.seq != seq {
+		return false
+	}
+	delete(l.entries, k)
+	l.dirty = true
+	owedBacklog.WithLabelValues(l.backendKey).Set(float64(len(l.entries)))
+	return true
 }
 
 // batch returns up to n entries for a sweep pass, in map order (unordered —
@@ -269,12 +314,18 @@ func (l *owedLedger) snapshotIfDirty(errorLogger cache.Logger) {
 		return
 	}
 	tmp := l.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		errorLogger.Printf("owed ledger: snapshot write failed: %v", err)
-		return
+	err = os.WriteFile(tmp, data, 0o644)
+	if err == nil {
+		err = os.Rename(tmp, l.path)
 	}
-	if err := os.Rename(tmp, l.path); err != nil {
-		errorLogger.Printf("owed ledger: snapshot rename failed: %v", err)
+	if err != nil {
+		errorLogger.Printf("owed ledger: snapshot failed: %v", err)
+		// Re-dirty so the next pass retries: without this, a ledger that
+		// goes quiet after a transient write error would never snapshot
+		// again, stretching the documented ≤15s staleness indefinitely.
+		l.mu.Lock()
+		l.dirty = true
+		l.mu.Unlock()
 	}
 }
 
@@ -375,10 +426,15 @@ func (c *s3Cache) sweepOwedOnce() {
 		if err != nil {
 			// Evicted (or unreadable): the blob is honestly absent
 			// everywhere now, so FindMissingBlobs will report it missing
-			// and a future client upload recreates both copies. Debt void.
+			// and a future client upload recreates both copies. Debt void —
+			// but only if it wasn't re-recorded since this batch was taken
+			// (a concurrent re-Put coalesced against OUR in-flight claim
+			// re-adds the debt; see settleVoid). Release the claim first so
+			// a re-add racing this line coalesces at most once.
+			if c.owed.settleVoid(entry.Key, entry.seq) {
+				owedSweep.WithLabelValues(c.key, "blob_evicted").Inc()
+			}
 			c.inflight.remove(entry.Key)
-			c.owed.settle(entry.Key)
-			owedSweep.WithLabelValues(c.key, "blob_evicted").Inc()
 			continue
 		}
 

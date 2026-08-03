@@ -532,7 +532,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 			if name == lostAndFound {
 				continue
 			}
-			if rootRel == "" && storagePrefixDRE.MatchString(name) {
+			if rootRel == "" && (name == cache.OwedLedgerDirName || storagePrefixDRE.MatchString(name)) {
 				continue
 			}
 
@@ -600,7 +600,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 			return scanResult{}, fmt.Errorf("unexpected file: %s", name)
 		}
 
-		if name == lostAndFound {
+		if name == lostAndFound || name == cache.OwedLedgerDirName {
 			continue
 		}
 

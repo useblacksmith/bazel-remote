@@ -65,6 +65,36 @@ func TestOpenOwedBlobReturnsRawOnDiskBytes(t *testing.T) {
 	}
 }
 
+// TestDiskCacheLoadsWithOwedLedgerDirPresent pins the wiring contract: the
+// proxy config creates <cache dir>/s3-owed BEFORE disk.New scans the cache
+// root (setProxy runs during config load), and the startup scan must skip it
+// like lost+found instead of failing the boot with "unexpected dir".
+func TestDiskCacheLoadsWithOwedLedgerDirPresent(t *testing.T) {
+	cacheDir := tempDir(t)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
+
+	if err := os.MkdirAll(cacheDir+"/"+cache.OwedLedgerDirName, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cacheDir+"/"+cache.OwedLedgerDirName+"/owed-uploads-test-deadbeef.json", []byte("[]"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	testCacheI, err := New(cacheDir, 1024*1024, WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatalf("disk.New with %s present: %v", cache.OwedLedgerDirName, err)
+	}
+
+	// And again with content in the cache, exercising the populated-scan path.
+	data, hash := testutils.RandomDataAndHash(64)
+	if err := testCacheI.Put(context.Background(), cache.CAS, hash, 64, io.NopCloser(bytes.NewReader(data))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(cacheDir, 1024*1024, WithAccessLogger(testutils.NewSilentLogger())); err != nil {
+		t.Fatalf("disk.New rescan with %s present: %v", cache.OwedLedgerDirName, err)
+	}
+}
+
 func TestOpenOwedBlobIsStoragePrefixScoped(t *testing.T) {
 	cacheDir := tempDir(t)
 	defer func() { _ = os.RemoveAll(cacheDir) }()
