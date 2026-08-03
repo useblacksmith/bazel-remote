@@ -393,10 +393,39 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 	streamInterceptors := []grpc.StreamServerInterceptor{}
 	unaryInterceptors := []grpc.UnaryServerInterceptor{}
 
+	// grpc_prometheus must be the outermost (first appended) interceptor so
+	// that RPCs rejected by the trust/selector/auth interceptors below still
+	// appear in grpc_server_handled_total with their status code. The
+	// dedicated rejection counters remain the primary alerting signal; this
+	// keeps the generic RPC series in agreement with them.
 	if c.EnableEndpointMetrics {
 		streamInterceptors = append(streamInterceptors, grpc_prometheus.StreamServerInterceptor)
 		unaryInterceptors = append(unaryInterceptors, grpc_prometheus.UnaryServerInterceptor)
 		grpc_prometheus.EnableHandlingTimeHistogram(grpc_prometheus.WithHistogramBuckets(c.MetricsDurationBuckets))
+	}
+
+	// L1 mode: trust upstream bazel-remote instances to forward per-tenant
+	// storage prefixes as request metadata. Trust-on is fail-closed: every
+	// cache RPC must carry exactly one valid prefix (and the shared secret,
+	// when BAZEL_REMOTE_L1_AUTH_SECRET is set) or it is rejected at the
+	// boundary; health and capabilities RPCs are exempt. Env-gated for now;
+	// promote to a proper config flag before production use.
+	if os.Getenv("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER") == "1" {
+		authSecret := os.Getenv("BAZEL_REMOTE_L1_AUTH_SECRET")
+		if authSecret == "" {
+			// Trust mode without the shared secret means anyone who can
+			// reach the port gets prefix-scoped cache access — the only
+			// barrier left is network ACLs, and an ACL slip fails silently.
+			// That posture must be an explicit dev-only choice, never the
+			// result of a secret going missing from the node's env file.
+			if os.Getenv("BAZEL_REMOTE_L1_UNSAFE_NO_AUTH_SECRET") != "1" {
+				return fmt.Errorf("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER=1 requires BAZEL_REMOTE_L1_AUTH_SECRET; refusing to start with network-level access control as the only barrier (set BAZEL_REMOTE_L1_UNSAFE_NO_AUTH_SECRET=1 to accept this for development)")
+			}
+			log.Println("WARNING: storage-prefix trust enabled WITHOUT an auth secret (BAZEL_REMOTE_L1_UNSAFE_NO_AUTH_SECRET=1); relying on network-level access control only — development posture")
+		}
+		log.Println("Trusting forwarded storage-prefix gRPC metadata, fail-closed (BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER=1)")
+		streamInterceptors = append(streamInterceptors, server.GRPCStoragePrefixStreamServerInterceptor(authSecret))
+		unaryInterceptors = append(unaryInterceptors, server.GRPCStoragePrefixUnaryServerInterceptor(authSecret))
 	}
 
 	if c.TLSConfig != nil {
