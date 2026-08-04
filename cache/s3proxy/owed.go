@@ -40,6 +40,8 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 
+	"github.com/minio/minio-go/v7"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -403,17 +405,28 @@ func (m *multiS3Cache) SetBlobSource(src BlobSource) {
 	}
 }
 
-// probeBackendForSweep offers a bucket existence check as the breaker's
-// half-open recovery probe. The call is cheap (one metadata RPC), bounded by
-// sweepProbeTimeout, and classified by breakerReadOutcome — the backend
-// merely answering (even "no such bucket") proves it is reachable again.
-// Success closes the breaker; the next sweep pass drains the ledger.
+// probeBackendForSweep offers a sentinel StatObject as the breaker's
+// half-open recovery probe: the exact call shape of the read path
+// (Contains), so it exercises only permissions the deployed credentials
+// are known to hold — NOT BucketExists/HEAD-bucket, which prefix-scoped
+// MinIO policies reject with 403, a permanent probe failure that would
+// re-open the breaker forever (observed on staging-2, 2026-08-04). The
+// call is cheap, bounded by sweepProbeTimeout, and classified by
+// breakerReadOutcome: the expected NoSuchKey is a success (the backend
+// answered). Success closes the breaker; the next sweep pass drains the
+// ledger. Failures are logged — a probe that fails for a non-connectivity
+// reason (credentials, policy) is otherwise invisible.
 func (c *s3Cache) probeBackendForSweep() {
 	ctx, cancel := context.WithTimeout(context.Background(), sweepProbeTimeout)
 	defer cancel()
 	_ = c.breaker.Execute(func() breakerOutcome {
-		_, err := c.mcore.BucketExists(ctx, c.bucket)
-		return breakerReadOutcome(ctx, err)
+		_, err := c.mcore.StatObject(ctx, c.bucket, "sweep-breaker-probe-sentinel",
+			minio.StatObjectOptions{})
+		outcome := breakerReadOutcome(ctx, err)
+		if outcome == outcomeFailure && c.errorLogger != nil {
+			c.errorLogger.Printf("owed sweeper: breaker recovery probe failed: %v", err)
+		}
+		return outcome
 	})
 }
 
