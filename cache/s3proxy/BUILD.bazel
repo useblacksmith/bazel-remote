@@ -4,6 +4,8 @@ go_library(
     name = "go_default_library",
     srcs = [
         "auth_methods.go",
+        "breaker.go",
+        "multi.go",
         "s3proxy.go",
     ],
     importpath = "github.com/buchgr/bazel-remote/v2/cache/s3proxy",
@@ -22,6 +24,7 @@ go_library(
 go_test(
     name = "go_default_test",
     srcs = [
+        "s3proxy_breaker_test.go",
         "s3proxy_lru_test.go",
         "s3proxy_test.go",
     ],
@@ -33,5 +36,6 @@ go_test(
         "@com_github_johannesboyne_gofakes3//backend/s3mem:go_default_library",
         "@com_github_minio_minio_go_v7//:go_default_library",
         "@com_github_minio_minio_go_v7//pkg/credentials:go_default_library",
+        "@com_github_prometheus_client_golang//prometheus/testutil:go_default_library",
     ],
 )
