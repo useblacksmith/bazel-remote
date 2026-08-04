@@ -7,7 +7,9 @@ go_library(
         "leaf_size_sink.go",
         "lru_observer.go",
         "metrics_context.go",
+        "s3_backend.go",
         "storage_prefix.go",
+        "trust_rejection.go",
     ],
     importpath = "github.com/buchgr/bazel-remote/v2/cache",
     visibility = ["//visibility:public"],
@@ -19,6 +21,7 @@ go_test(
         "cache_test.go",
         "lru_observer_test.go",
         "metrics_context_test.go",
+        "s3_backend_test.go",
     ],
     embed = [":go_default_library"],
 )
