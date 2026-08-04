@@ -63,6 +63,11 @@ const (
 	// queue is under this fraction of capacity, so deferred uploads never
 	// compete with current build traffic for queue slots or workers.
 	sweepQueueHeadroom = 0.5
+
+	// sweepProbeTimeout bounds the sweeper's own breaker probe (a bucket
+	// existence check). Generous enough for a slow-but-alive backend,
+	// bounded so a black-holed one costs at most this per sweep pass.
+	sweepProbeTimeout = 5 * time.Second
 )
 
 var (
@@ -232,6 +237,17 @@ func (l *owedLedger) add(e owedEntry) {
 	owedBacklog.WithLabelValues(l.backendKey).Set(float64(len(l.entries)))
 }
 
+// size reports the current number of owed entries. Nil-safe like every
+// other method (feature disabled -> permanently zero).
+func (l *owedLedger) size() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.entries)
+}
+
 // settle removes the debt unconditionally: callers hold proof that the
 // object now exists in the backend (created or already_exists), which
 // discharges the debt no matter how many times it was re-recorded.
@@ -387,6 +403,20 @@ func (m *multiS3Cache) SetBlobSource(src BlobSource) {
 	}
 }
 
+// probeBackendForSweep offers a bucket existence check as the breaker's
+// half-open recovery probe. The call is cheap (one metadata RPC), bounded by
+// sweepProbeTimeout, and classified by breakerReadOutcome — the backend
+// merely answering (even "no such bucket") proves it is reachable again.
+// Success closes the breaker; the next sweep pass drains the ledger.
+func (c *s3Cache) probeBackendForSweep() {
+	ctx, cancel := context.WithTimeout(context.Background(), sweepProbeTimeout)
+	defer cancel()
+	_ = c.breaker.Execute(func() breakerOutcome {
+		_, err := c.mcore.BucketExists(ctx, c.bucket)
+		return breakerReadOutcome(ctx, err)
+	})
+}
+
 func (c *s3Cache) sweepOwedLoop() {
 	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
@@ -404,6 +434,18 @@ func (c *s3Cache) sweepOwedOnce() {
 		return
 	}
 	if c.breaker != nil && c.breaker.State() != breakerClosed {
+		// The breaker normally recovers through read-path probes (see
+		// ExecuteNoProbe), but that makes ledger convergence traffic-gated:
+		// an idle node has no reads, so after an outage the breaker stays
+		// open forever and the debts never drain (observed on staging,
+		// 2026-08-04 chaos drill). When we hold debts, volunteer a cheap
+		// bounded call as the recovery probe. allow() still enforces the
+		// open-window cooldown, so this is a no-op until the window
+		// elapses and costs at most one RPC per sweep pass while the
+		// backend stays dark.
+		if c.owed.size() > 0 {
+			c.probeBackendForSweep()
+		}
 		return
 	}
 	if len(c.uploadQueue) >= int(sweepQueueHeadroom*float64(cap(c.uploadQueue))) {

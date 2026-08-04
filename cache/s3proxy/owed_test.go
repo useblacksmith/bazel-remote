@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
@@ -153,6 +154,60 @@ func TestUploadFailureRecordsOwedAndBreakerBlocksSweep(t *testing.T) {
 	c.sweepOwedOnce()
 	if src.calls != 0 {
 		t.Fatalf("sweep consulted blob source %d times with breaker open, want 0", src.calls)
+	}
+}
+
+// TestSweepProbesBreakerWhenIdle pins the idle-node recovery contract: with
+// debts on the ledger, an open breaker past its cooldown, and NO read
+// traffic to volunteer as the half-open probe, the sweeper itself must
+// probe the backend and close the breaker, then drain the ledger on the
+// following pass. Without the sweeper probe this deadlocks — the breaker
+// waits for traffic, the sweeper waits for the breaker — and an idle node
+// never repays its debts (observed on staging, 2026-08-04 chaos drill).
+func TestSweepProbesBreakerWhenIdle(t *testing.T) {
+	backend := s3mem.New()
+	if err := backend.CreateBucket("test-bucket"); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(gofakes3.New(backend).Server())
+	t.Cleanup(ts.Close)
+
+	c, queue := owedTestCache(t, "owed-idle-probe-test", 4)
+	c.mcore = coreFor(t, ts, 1)
+
+	content := []byte("idle-owed-blob")
+	src := &fakeBlobSource{blobs: map[string][]byte{testHash: content}}
+	c.blobSource = src
+
+	c.owed.add(owedEntry{Key: uploadKey{Kind: cache.CAS, Hash: testHash}})
+	tripBreaker(t, c.breaker)
+
+	// Inside the cooldown window the probe must be refused: the pass is a
+	// complete no-op (no blob source reads, nothing queued, still open).
+	c.sweepOwedOnce()
+	if c.breaker.State() != breakerOpen || src.calls != 0 || len(queue) != 0 {
+		t.Fatalf("sweep inside cooldown: state=%v srcCalls=%d queued=%d, want open/0/0",
+			c.breaker.State(), src.calls, len(queue))
+	}
+
+	// Past the cooldown the sweeper's probe is admitted as the half-open
+	// probe; the healthy fake closes the breaker. Recovery deliberately
+	// takes one extra pass: this one only probes.
+	c.breaker.mu.Lock()
+	c.breaker.openedAt = time.Now().Add(-2 * breakerTimeout)
+	c.breaker.mu.Unlock()
+	c.sweepOwedOnce()
+	if got := c.breaker.State(); got != breakerClosed {
+		t.Fatalf("breaker state after idle sweep probe = %v, want closed", got)
+	}
+	if src.calls != 0 || len(queue) != 0 {
+		t.Fatalf("probe pass touched work: srcCalls=%d queued=%d, want 0/0", src.calls, len(queue))
+	}
+
+	// Next pass drains the ledger through the normal requeue path.
+	c.sweepOwedOnce()
+	if got := len(queue); got != 1 {
+		t.Fatalf("queue depth after post-recovery sweep = %d, want 1", got)
 	}
 }
 
