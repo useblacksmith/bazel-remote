@@ -66,6 +66,8 @@ type s3Cache struct {
 	readDeadline time.Duration
 	objectKey    func(prefix string, hash string, kind cache.EntryKind) string
 	observer     cache.OperationObserver
+	// inflight coalesces duplicate enqueues (see dedup.go).
+	inflight *inflightSet
 }
 
 type Option func(*s3Cache)
@@ -399,6 +401,7 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 		c.objectKey = objectKeyV1
 	}
 
+	c.inflight = newInflightSet()
 	c.uploadQueue = backendproxy.StartUploaders(c, numUploaders, maxQueuedUploads)
 
 	return c, nil
@@ -596,6 +599,12 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	}
 	uploadOutcomes.WithLabelValues(c.key, status, reason).Inc()
 	c.observeUpload(context.Background(), item, status, reason)
+
+	// The upload is terminal either way — release the identity so a future
+	// Put of the same object is admitted rather than coalesced against a
+	// ghost.
+	c.inflight.remove(c.resolveUploadIdentity(item))
+
 	uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
 
 	_ = item.Rc.Close()
@@ -639,8 +648,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 	// decision — but the pair travels together.)
 	selection, _ := cache.S3BackendFromContext(ctx)
 
-	select {
-	case c.uploadQueue <- backendproxy.UploadReq{
+	item := backendproxy.UploadReq{
 		Hash:                       hash,
 		LogicalSize:                logicalSize,
 		SizeOnDisk:                 sizeOnDisk,
@@ -651,9 +659,22 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		RequireStoragePrefix:       requirePrefix,
 		S3Backend:                  selection,
 		MetricsLabels:              labels,
-	}:
+	}
+
+	// Coalesce duplicate uploads at the door: an identical upload already
+	// queued or in flight makes this one pure waste (see dedup.go).
+	key := c.resolveUploadIdentity(item)
+	if !c.inflight.tryAdd(key) {
+		uploadQueueCoalesced.WithLabelValues(c.key).Inc()
+		_ = rc.Close()
+		return
+	}
+
+	select {
+	case c.uploadQueue <- item:
 		uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
 	default:
+		c.inflight.remove(key)
 		c.errorLogger.Printf("too many uploads queued for S3 backend %s\n", c.key)
 		uploadQueueDropped.WithLabelValues(c.key).Inc()
 		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
