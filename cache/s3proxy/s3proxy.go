@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"path"
+	"sync"
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -45,15 +47,25 @@ type s3Cache struct {
 	// validated (endpoint, bucket) selection use that bucket instead — the
 	// minio client and upload queue are per endpoint, but the bucket is per
 	// request (see cache.S3BucketGRPCMetadataKey).
-	bucket           string
-	uploadQueue      chan<- backendproxy.UploadReq
+	bucket      string
+	uploadQueue chan<- backendproxy.UploadReq
+	// breaker guards every MinIO call this backend makes (read fall-through,
+	// existence checks, write-through PUTs). Per backend by construction: in
+	// multi-backend map mode a sick shard trips only its own breaker and
+	// must not blind the healthy shards.
+	breaker          *breaker
 	accessLogger     cache.Logger
 	errorLogger      cache.Logger
 	metrics          Metrics
 	v2mode           bool
 	updateTimestamps bool
-	objectKey        func(prefix string, hash string, kind cache.EntryKind) string
-	observer         cache.OperationObserver
+	// readDeadline is the overall bound on one read-path call including the
+	// streamed body; defaults to the package-level readDeadline, overridable
+	// via WithReadDeadline. Connection failure is bounded separately and
+	// much tighter by connectTimeout on the transport.
+	readDeadline time.Duration
+	objectKey    func(prefix string, hash string, kind cache.EntryKind) string
+	observer     cache.OperationObserver
 }
 
 type Option func(*s3Cache)
@@ -146,6 +158,153 @@ const (
 // var only so tests can shrink it.
 var uploadTimeout = 10 * time.Minute
 
+// connectTimeout bounds the connection-establishment legs of every MinIO
+// call at the transport layer: TCP dial, TLS handshake, and time to response
+// headers. This — not the overall read deadline — is what makes a dead or
+// black-holed backend fail in seconds: a sick node must ANSWER fast, but a
+// healthy node streaming a large blob may legitimately take much longer than
+// this to finish. 10s is forgiving to a browning-out-but-alive backend while
+// staying well inside a Bazel client's own 60s remote_timeout. Deliberately
+// a constant: raising it toward that client timeout re-introduces the
+// 60-220s miss stalls the catastrophe drills measured pre-deadline.
+const connectTimeout = 10 * time.Second
+
+// readDeadline is the default overall bound on a single read-path MinIO
+// call (the miss fall-through GetObject and the Contains StatObject),
+// INCLUDING the streamed GET body (the deadline context governs it and is
+// canceled when the caller closes the body), so a transfer stalled
+// mid-stream is reclaimed too. Generous by design, mirroring uploadTimeout's
+// reasoning: multi-GB CAS blobs are minutes on a busy link, and guillotining
+// a healthy fill means that blob can never be served through the L1 at all.
+// Connection failure is connectTimeout's job; this only has to reclaim
+// mid-stream stalls. Configurable per deployment via WithReadDeadline
+// (s3_proxy.read_timeout in standalone config). A var so tests can shrink
+// it.
+var readDeadline = 5 * time.Minute
+
+// WithReadDeadline overrides the overall read-path deadline for this
+// backend. Non-positive values keep the default.
+func WithReadDeadline(d time.Duration) Option {
+	return func(c *s3Cache) {
+		if d > 0 {
+			c.readDeadline = d
+		}
+	}
+}
+
+// effectiveReadDeadline returns the configured per-backend deadline, falling
+// back to the package default for s3Cache values built without newBackend
+// (test fixtures) — a zero deadline would expire every read instantly.
+func (c *s3Cache) effectiveReadDeadline() time.Duration {
+	if c.readDeadline > 0 {
+		return c.readDeadline
+	}
+	return readDeadline
+}
+
+// maxRetries caps minio-go's internal per-call retries (library default:
+// MaxRetry = 10 attempts with exponential backoff, ~a minute of retention
+// per failing call). Three attempts ride out a blip; anything worse must
+// surface to the circuit breaker in seconds, which owns backoff across
+// calls.
+const maxRetries = 3
+
+// isNotFound reports whether err is MinIO answering "no such object": a
+// miss is a healthy answer and must count as breaker success, or a burst of
+// legitimate misses would trip the breaker on a perfectly healthy backend.
+func isNotFound(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	return resp.Code == "NoSuchKey" || resp.StatusCode == http.StatusNotFound
+}
+
+// breakerReadOutcome classifies a read-path minio result for the breaker.
+// Not-found is success (see isNotFound). A parent-context cancellation (the
+// client went away mid-request) is not a backend-health signal and is
+// counted neither way; only genuine backend errors — including our own
+// readDeadline expiring — count as failures.
+func breakerReadOutcome(parent context.Context, err error) breakerOutcome {
+	if err == nil || isNotFound(err) {
+		return outcomeSuccess
+	}
+	if parent.Err() != nil {
+		return outcomeIgnore
+	}
+	return outcomeFailure
+}
+
+// breakerUploadOutcome classifies a write-path minio result for the
+// breaker. A precondition failure means the object already exists — MinIO
+// answered, so the backend is healthy (mirrors classifyUploadOutcome's
+// already_exists mapping).
+func breakerUploadOutcome(err error) breakerOutcome {
+	if err == nil {
+		return outcomeSuccess
+	}
+	switch minio.ToErrorResponse(err).StatusCode {
+	case http.StatusPreconditionFailed, http.StatusNotModified:
+		return outcomeSuccess
+	}
+	return outcomeFailure
+}
+
+// bodyOutcomeReadCloser releases the readDeadline timer when the caller
+// finishes with a streamed GET body, and reports the body's TERMINAL state
+// to the breaker — the streamed read's ONLY breaker outcome. Headers alone
+// prove nothing in the dominant brownout mode (connections open fine, bytes
+// don't flow): if time-to-first-byte recorded a success, every brownout
+// read would reset the very failure streak its body failure then increments
+// and the breaker would never trip, with the fleet paying a full deadline
+// per read instead of flipping to fast-miss. Exactly one outcome is
+// reported per body: clean EOF is a success, a mid-stream error with the
+// caller still interested is a failure (including our own deadline
+// expiring), and a caller-side abandonment (parent context dead, or Close
+// before EOF with the deadline unexpired) says nothing about backend
+// health. A late report is a breaker straggler, which record already
+// handles. Callers must Close the body on every path: while half-open, the
+// probe slot is held until this report lands.
+type bodyOutcomeReadCloser struct {
+	io.ReadCloser
+	cancel  context.CancelFunc
+	breaker *breaker
+	// parent is the request context, rctx the deadline-bearing child that
+	// governs the body.
+	parent context.Context
+	rctx   context.Context
+	once   sync.Once
+}
+
+func (c *bodyOutcomeReadCloser) report(outcome breakerOutcome) {
+	c.once.Do(func() { c.breaker.record(outcome) })
+}
+
+func (c *bodyOutcomeReadCloser) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	if err == io.EOF {
+		c.report(outcomeSuccess)
+	} else if err != nil {
+		if c.parent.Err() != nil {
+			c.report(outcomeIgnore)
+		} else {
+			c.report(outcomeFailure)
+		}
+	}
+	return n, err
+}
+
+func (c *bodyOutcomeReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	// Close before any terminal Read: if our own deadline expired while
+	// the caller was still interested, this body stalled out — a failure.
+	// Any other early Close is the caller abandoning a healthy stream.
+	if c.rctx.Err() != nil && c.parent.Err() == nil {
+		c.report(outcomeFailure)
+	} else {
+		c.report(outcomeIgnore)
+	}
+	c.cancel()
+	return err
+}
+
 func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval time.Duration,
 	storageMode string, accessLogger cache.Logger, errorLogger cache.Logger,
 	numUploaders, maxQueuedUploads int, metrics Metrics, options ...Option) (*s3Cache, error) {
@@ -168,6 +327,17 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 		tr.MaxIdleConnsPerHost = defaultMaxIdleConnsPerHost
 	}
 
+	// Fail connection establishment fast, independent of the (generous)
+	// overall read deadline: a black-holed backend must be answered in
+	// seconds by the dialer / TLS / response-header legs, while an
+	// established stream keeps the full readDeadline to move its body.
+	tr.DialContext = (&net.Dialer{
+		Timeout:   connectTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	tr.TLSHandshakeTimeout = connectTimeout
+	tr.ResponseHeaderTimeout = connectTimeout
+
 	// connRecycleInterval arrives fully resolved from config load (the
 	// default is applied there); non-positive disables recycling.
 	if connRecycleInterval > 0 {
@@ -181,6 +351,7 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 	minioOpts := &minio.Options{
 		Creds:        spec.Credentials,
 		BucketLookup: spec.BucketLookupType,
+		MaxRetries:   maxRetries,
 
 		Region:    spec.Region,
 		Secure:    secure,
@@ -202,15 +373,21 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 	}
 
 	c := &s3Cache{
-		key:              key,
-		mcore:            minioCore,
-		prefix:           spec.Prefix,
-		bucket:           spec.Bucket,
+		key:    key,
+		mcore:  minioCore,
+		prefix: spec.Prefix,
+		bucket: spec.Bucket,
+		// Named by the backend key so the breaker series joins the other
+		// backend-labeled metrics (upload outcomes, hits/misses, queue) on
+		// dashboards. Bucket is deliberately absent: since the multi-backend
+		// piece it is per-request state, not backend identity.
+		breaker:          newBreaker(key, errorLogger),
 		accessLogger:     accessLogger,
 		errorLogger:      errorLogger,
 		metrics:          metrics,
 		v2mode:           storageMode == "zstd",
 		updateTimestamps: updateTimestamps,
+		readDeadline:     readDeadline,
 	}
 	for _, opt := range options {
 		opt(c)
@@ -382,24 +559,41 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	opts.SetMatchETagExcept("*")
 
 	// Uploads run on background workers with no request deadline; the
-	// timeout reclaims a worker pinned by a hung MinIO connection.
+	// timeout reclaims a worker pinned by a hung MinIO connection. No
+	// tighter deadline here: large CAS blobs may legitimately take long,
+	// and the breaker covers the sick-MinIO case.
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
 
-	_, err := c.mcore.PutObject(
-		ctx,
-		bucket,          // bucketName
-		objectKey,       // objectName
-		item.Rc,         // reader
-		item.SizeOnDisk, // objectSize
-		"",              // md5base64
-		"",              // sha256
-		opts,            // metadata
-	)
+	// NoProbe: a PutObject bounded only by uploadTimeout must not become
+	// the half-open recovery probe (see ExecuteNoProbe).
+	var putErr error
+	berr := c.breaker.ExecuteNoProbe(func() breakerOutcome {
+		_, err := c.mcore.PutObject(
+			ctx,
+			bucket,          // bucketName
+			objectKey,       // objectName
+			item.Rc,         // reader
+			item.SizeOnDisk, // objectSize
+			"",              // md5base64
+			"",              // sha256
+			opts,            // metadata
+		)
+		putErr = err
+		return breakerUploadOutcome(err)
+	})
 
-	logResponse(c.accessLogger, "UPLOAD", bucket, objectKey, err)
-
-	status, reason := classifyUploadOutcome(err)
+	var status, reason string
+	if berr != nil {
+		// The breaker refused the call without dialing MinIO: fail the item
+		// fast with its own terminal outcome so dashboards can tell a sick
+		// backend (breaker_open) from failing PUTs (s3_put_failed).
+		logResponse(c.accessLogger, "UPLOAD", bucket, objectKey, berr)
+		status, reason = "error", "breaker_open"
+	} else {
+		logResponse(c.accessLogger, "UPLOAD", bucket, objectKey, putErr)
+		status, reason = classifyUploadOutcome(putErr)
+	}
 	uploadOutcomes.WithLabelValues(c.key, status, reason).Inc()
 	c.observeUpload(context.Background(), item, status, reason)
 	uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
@@ -499,22 +693,56 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 	bucket := c.bucketForContext(ctx)
 
-	rc, info, _, err := c.mcore.GetObject(
-		ctx,
+	rctx, cancel := context.WithTimeout(ctx, c.effectiveReadDeadline())
+
+	// The streamed GET defers its breaker outcome to the body's terminal
+	// state, so it uses allow/record directly rather than Execute: healthy
+	// response headers prove nothing in the dominant brownout mode
+	// (connections open fine, bytes don't flow), and recording a success at
+	// time-to-first-byte would reset the failure streak that the body
+	// failures are trying to build. The half-open probe slot is likewise
+	// held until the body terminates — a probe whose headers arrived but
+	// whose body is still streaming has not yet proven the backend healthy.
+	if !c.breaker.allow() {
+		// Breaker open: report a clean miss without dialing MinIO. A miss is
+		// the honest answer the disk cache layer can act on (serve from
+		// elsewhere or rebuild); an error would surface to the client.
+		cancel()
+		cacheMisses.WithLabelValues(c.key).Inc()
+		logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, errBreakerOpen)
+		return nil, -1, nil
+	}
+	rc, info, _, getErr := c.mcore.GetObject(
+		rctx,
 		bucket,                   // bucketName
 		objectKey,                // objectName
 		minio.GetObjectOptions{}, // opts
 	)
-	if err != nil {
+	if getErr != nil {
+		// Terminal at headers: not-found is a healthy answer (success),
+		// everything else classifies as usual.
+		c.breaker.record(breakerReadOutcome(ctx, getErr))
+		cancel()
 		cacheMisses.WithLabelValues(c.key).Inc()
-		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
+		if minio.ToErrorResponse(getErr).Code == "NoSuchKey" {
 			logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, errNotFound)
 			return nil, -1, nil
 		}
-		logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, err)
-		return nil, -1, err
+		logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, getErr)
+		return nil, -1, getErr
 	}
 	cacheHits.WithLabelValues(c.key).Inc()
+
+	// The deadline context governs the streamed body; releasing the timer
+	// belongs to whoever closes the body, and the body's terminal state is
+	// what actually proves this backend healthy (see bodyOutcomeReadCloser).
+	rc = &bodyOutcomeReadCloser{
+		ReadCloser: rc,
+		cancel:     cancel,
+		breaker:    c.breaker,
+		parent:     ctx,
+		rctx:       rctx,
+	}
 
 	if c.updateTimestamps {
 		c.UpdateModificationTimestamp(ctx, bucket, objectKey)
@@ -523,7 +751,17 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 	logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, nil)
 
 	if kind == cache.CAS && c.v2mode {
-		return casblob.ExtractLogicalSize(rc)
+		lrc, logicalSize, err := casblob.ExtractLogicalSize(rc)
+		if err != nil {
+			// A malformed casblob header says the stored OBJECT is bad, not
+			// the backend: Close both releases the deadline timer and files
+			// the body's breaker outcome (an un-expired early close counts
+			// neither way), so a half-open probe slot is never wedged by a
+			// corrupt blob.
+			_ = rc.Close()
+			return nil, -1, err
+		}
+		return lrc, logicalSize, nil
 	}
 
 	return rc, info.Size, nil
@@ -539,12 +777,26 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 	bucket := c.bucketForContext(ctx)
 
-	s, err := c.mcore.StatObject(
-		ctx,
-		bucket,                    // bucketName
-		objectKey,                 // objectName
-		minio.StatObjectOptions{}, // opts
-	)
+	sctx, cancel := context.WithTimeout(ctx, c.effectiveReadDeadline())
+	defer cancel()
+
+	var s minio.ObjectInfo
+	var err error
+	berr := c.breaker.Execute(func() breakerOutcome {
+		s, err = c.mcore.StatObject(
+			sctx,
+			bucket,                    // bucketName
+			objectKey,                 // objectName
+			minio.StatObjectOptions{}, // opts
+		)
+		return breakerReadOutcome(ctx, err)
+	})
+	if berr != nil {
+		// Breaker open: report "not present" without dialing MinIO — the
+		// existing miss convention of this method.
+		logResponse(c.accessLogger, "CONTAINS", bucket, objectKey, berr)
+		return false, -1
+	}
 
 	exists = (err == nil)
 	if err != nil {
