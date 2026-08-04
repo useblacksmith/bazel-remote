@@ -405,26 +405,40 @@ func (m *multiS3Cache) SetBlobSource(src BlobSource) {
 	}
 }
 
-// probeBackendForSweep offers a sentinel StatObject as the breaker's
-// half-open recovery probe: the exact call shape of the read path
-// (Contains), so it exercises only permissions the deployed credentials
-// are known to hold — NOT BucketExists/HEAD-bucket, which prefix-scoped
-// MinIO policies reject with 403, a permanent probe failure that would
-// re-open the breaker forever (observed on staging-2, 2026-08-04). The
-// call is cheap, bounded by sweepProbeTimeout, and classified by
-// breakerReadOutcome: the expected NoSuchKey is a success (the backend
-// answered). Success closes the breaker; the next sweep pass drains the
-// ledger. Failures are logged — a probe that fails for a non-connectivity
-// reason (credentials, policy) is otherwise invisible.
+// probeBackendForSweep offers a StatObject on a REAL owed entry's object
+// key as the breaker's half-open recovery probe. The key choice is the
+// whole point: prefix-scoped MinIO policies 403 anything outside the
+// tenant paths this node actually serves — BucketExists (HEAD-bucket) and
+// a synthetic sentinel key both probe-failed forever with Access Denied on
+// staging-2 (2026-08-04), re-opening the breaker every sweep pass while
+// the ledger sat frozen. An owed entry's key is by construction a path
+// these credentials can write, and the read path (Contains) HEADs such
+// keys routinely, so the only way this probe fails is genuine backend
+// sickness. It is cheap, bounded by sweepProbeTimeout, and classified by
+// breakerReadOutcome: NoSuchKey (not yet repaid) and found (someone else
+// uploaded it) are both "the backend answered" successes. Success closes
+// the breaker; the next sweep pass drains the ledger. Failures are logged
+// — a probe failing for a non-connectivity reason (credentials, policy)
+// is otherwise invisible.
 func (c *s3Cache) probeBackendForSweep() {
+	entries := c.owed.batch(1)
+	if len(entries) == 0 {
+		return
+	}
+	entry := entries[0]
+	bucket := entry.Key.Bucket
+	if bucket == "" {
+		bucket = c.bucket
+	}
+	objectKey := c.objectKeyForPrefix(entry.Key.Prefix, entry.Key.Hash, entry.Key.Kind)
 	ctx, cancel := context.WithTimeout(context.Background(), sweepProbeTimeout)
 	defer cancel()
 	_ = c.breaker.Execute(func() breakerOutcome {
-		_, err := c.mcore.StatObject(ctx, c.bucket, "sweep-breaker-probe-sentinel",
-			minio.StatObjectOptions{})
+		_, err := c.mcore.StatObject(ctx, bucket, objectKey, minio.StatObjectOptions{})
 		outcome := breakerReadOutcome(ctx, err)
 		if outcome == outcomeFailure && c.errorLogger != nil {
-			c.errorLogger.Printf("owed sweeper: breaker recovery probe failed: %v", err)
+			c.errorLogger.Printf("owed sweeper: breaker recovery probe (HEAD %s/%s) failed: %v",
+				bucket, objectKey, err)
 		}
 		return outcome
 	})
