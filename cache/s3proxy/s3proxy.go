@@ -66,6 +66,14 @@ type s3Cache struct {
 	readDeadline time.Duration
 	objectKey    func(prefix string, hash string, kind cache.EntryKind) string
 	observer     cache.OperationObserver
+	// inflight coalesces duplicate enqueues; owed records shed/failed
+	// uploads for the background sweeper; blobSource reopens local blobs
+	// for deferred uploads. See owed.go.
+	inflight       *inflightSet
+	owed           *owedLedger
+	owedDir        string
+	blobSource     BlobSource
+	blobSourceOnce sync.Once
 }
 
 type Option func(*s3Cache)
@@ -73,6 +81,16 @@ type Option func(*s3Cache)
 func WithOperationObserver(observer cache.OperationObserver) Option {
 	return func(c *s3Cache) {
 		c.observer = observer
+	}
+}
+
+// WithOwedLedgerDir enables the owed-upload ledger (see owed.go), persisting
+// per-backend snapshots under dir. Without this option, shed uploads are
+// dropped exactly as before — embedders that don't own durable storage (the
+// host-side fallback proxy) keep the old best-effort semantics.
+func WithOwedLedgerDir(dir string) Option {
+	return func(c *s3Cache) {
+		c.owedDir = dir
 	}
 }
 
@@ -399,6 +417,11 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 		c.objectKey = objectKeyV1
 	}
 
+	c.inflight = newInflightSet()
+	if c.owedDir != "" {
+		c.owed = newOwedLedger(c.owedDir, key, errorLogger)
+	}
+
 	c.uploadQueue = backendproxy.StartUploaders(c, numUploaders, maxQueuedUploads)
 
 	return c, nil
@@ -596,6 +619,19 @@ func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
 	}
 	uploadOutcomes.WithLabelValues(c.key, status, reason).Inc()
 	c.observeUpload(context.Background(), item, status, reason)
+
+	// Settle or record the owed-ledger debt for this upload identity. Any
+	// success (created, or already_exists — someone else stored it) clears
+	// the debt; any terminal failure (failed PUT, breaker refusal) records
+	// it so the sweeper retries once the backend is healthy again.
+	identity := c.resolveUploadIdentity(item)
+	if status == "error" {
+		c.owed.add(c.owedEntryForItem(identity, item))
+	} else {
+		c.owed.settle(identity)
+	}
+	c.inflight.remove(identity)
+
 	uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
 
 	_ = item.Rc.Close()
@@ -639,8 +675,7 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 	// decision — but the pair travels together.)
 	selection, _ := cache.S3BackendFromContext(ctx)
 
-	select {
-	case c.uploadQueue <- backendproxy.UploadReq{
+	item := backendproxy.UploadReq{
 		Hash:                       hash,
 		LogicalSize:                logicalSize,
 		SizeOnDisk:                 sizeOnDisk,
@@ -651,11 +686,36 @@ func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, lo
 		RequireStoragePrefix:       requirePrefix,
 		S3Backend:                  selection,
 		MetricsLabels:              labels,
-	}:
+	}
+
+	// Coalesce duplicate uploads: matrix fan-out delivers the same missing
+	// blob from many hosts at once, MinIO's create-if-absent would 412 all
+	// but one anyway, and every queued duplicate pins an open FD. The
+	// coalesced-away upload still records its debt: usually the in-flight
+	// copy's success settles it moments later, but the in-flight claim can
+	// also be the SWEEPER holding a blob it just found evicted — about to
+	// settle the debt as void while this Put proves the blob is back. The
+	// seq bump from this add makes that void-settle a no-op (settleVoid),
+	// and the next sweep pass repays it for real.
+	key := c.resolveUploadIdentity(item)
+	if !c.inflight.tryAdd(key) {
+		uploadQueueCoalesced.WithLabelValues(c.key).Inc()
+		c.owed.add(c.owedEntryForItem(key, item))
+		_ = rc.Close()
+		return
+	}
+
+	select {
+	case c.uploadQueue <- item:
 		uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
 	default:
+		c.inflight.remove(key)
 		c.errorLogger.Printf("too many uploads queued for S3 backend %s\n", c.key)
 		uploadQueueDropped.WithLabelValues(c.key).Inc()
+		// Shedding is a deferral, not a loss: FindMissingBlobs answers
+		// local-first, so nothing would ever re-upload this blob. Record
+		// the debt; the sweeper repays it when the queue has headroom.
+		c.owed.add(c.owedEntryForItem(key, item))
 		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
 			Method: "backend_upload",
 			Kind:   kind.String(),
