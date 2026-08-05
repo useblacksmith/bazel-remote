@@ -16,6 +16,7 @@ import (
 	auth "github.com/abbot/go-http-auth"
 
 	"github.com/buchgr/bazel-remote/v2/cache/disk"
+	"github.com/buchgr/bazel-remote/v2/cache/lruflush"
 
 	"github.com/buchgr/bazel-remote/v2/config"
 	"github.com/buchgr/bazel-remote/v2/ldap"
@@ -171,11 +172,32 @@ func run(ctx *cli.Context) error {
 		opts = append(opts, disk.WithEndpointMetrics())
 	}
 
+	// LRU observation artifacts: on trusted (L1) nodes with an S3 proxy,
+	// buffer AC-access closures per tenant prefix and flush them as JSONL
+	// artifacts next to the objects they describe, for the web-side
+	// retention sweep. Advisory only — never affects request behavior.
+	// Requires trust mode because only trusted-mode requests carry the
+	// storage prefix an artifact is keyed under.
+	var lruFlusher *lruflush.Flusher
+	if os.Getenv("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER") == "1" &&
+		os.Getenv("BAZEL_REMOTE_LRU_ARTIFACTS") != "0" {
+		if sink, ok := c.ProxyBackend.(lruflush.Sink); ok {
+			lruFlusher = lruflush.New(sink)
+			opts = append(opts, disk.WithLRUObserver(lruFlusher))
+			log.Println("LRU observation artifacts enabled: buffering AC-access closures per tenant prefix, periodic flush to the tenant's backend (BAZEL_REMOTE_LRU_ARTIFACTS=0 disables)")
+		} else {
+			log.Println("LRU observation artifacts disabled: proxy backend cannot store artifacts (requires the S3 proxy)")
+		}
+	}
+
 	diskCache, err := disk.New(c.Dir, int64(c.MaxSize)*1024*1024*1024, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
 	diskCache.RegisterMetrics()
+	if lruFlusher != nil {
+		lruFlusher.Start()
+	}
 
 	servers := new(errgroup.Group)
 
@@ -242,7 +264,14 @@ func run(ctx *cli.Context) error {
 		idleTimer.Start()
 	}
 
-	return servers.Wait()
+	err = servers.Wait()
+	// Both servers have stopped accepting requests, so no new observations
+	// can arrive: flush what remains and wait for in-flight uploads.
+	if lruFlusher != nil {
+		log.Println("Draining buffered LRU observation artifacts")
+		lruFlusher.Drain()
+	}
+	return err
 }
 
 // validateMultiBackendTrust refuses to start a multi-backend (s3_proxy
