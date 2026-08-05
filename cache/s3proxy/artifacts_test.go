@@ -97,3 +97,44 @@ func TestPutArtifactRefusesWhenBreakerOpen(t *testing.T) {
 		t.Fatal("PutArtifact with open breaker must fail fast")
 	}
 }
+
+// TestArtifactFailuresCannotTripBreaker pins one direction of the
+// failure-isolation contract: artifact-only failures (here, a bucket that
+// does not exist — the shape of a tagging/policy/IAM gap) must never open
+// the data-plane breaker against customer traffic, no matter how many occur.
+func TestArtifactFailuresCannotTripBreaker(t *testing.T) {
+	c := fakeS3Backend(t, "default-bucket")
+	ctxBad := cache.WithS3Backend(context.Background(),
+		cache.S3BackendSelection{Endpoint: backendKeyA, Bucket: "no-such-bucket"})
+	for i := 0; i < 2*breakerConsecutiveFailures; i++ {
+		if err := c.PutArtifact(ctxBad, "t/lru/fail.jsonl", []byte("x\n")); err == nil {
+			t.Fatal("PutArtifact to a missing bucket must fail")
+		}
+	}
+	if got := c.breaker.State(); got != breakerClosed {
+		t.Fatalf("breaker state after %d artifact failures = %v, want closed", 2*breakerConsecutiveFailures, got)
+	}
+	// Customer traffic is unaffected.
+	if err := c.PutArtifact(context.Background(), "t/lru/ok.jsonl", []byte("x\n")); err != nil {
+		t.Fatalf("data plane degraded by artifact failures: %v", err)
+	}
+}
+
+// TestArtifactSuccessCannotHealFailureStreak pins the other direction: a
+// small artifact success must not reset a real data-plane failure streak.
+// Four data-plane failures, one successful artifact PUT, then the fifth
+// failure — the breaker must open, proving the artifact success recorded
+// nothing.
+func TestArtifactSuccessCannotHealFailureStreak(t *testing.T) {
+	c := fakeS3Backend(t, "default-bucket")
+	for i := 0; i < breakerConsecutiveFailures-1; i++ {
+		_ = c.breaker.Execute(func() breakerOutcome { return outcomeFailure })
+	}
+	if err := c.PutArtifact(context.Background(), "t/lru/mid-streak.jsonl", []byte("x\n")); err != nil {
+		t.Fatalf("artifact PUT during a not-yet-open streak should succeed: %v", err)
+	}
+	_ = c.breaker.Execute(func() breakerOutcome { return outcomeFailure })
+	if got := c.breaker.State(); got != breakerOpen {
+		t.Fatalf("breaker state after 4 failures + artifact success + 1 failure = %v, want open (artifact success must not reset the streak)", got)
+	}
+}

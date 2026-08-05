@@ -42,6 +42,13 @@ const (
 	// goroutine, so this bounds how long one slow tenant backend can delay
 	// the other tenants' artifacts within a window, not a request.
 	uploadTimeout = 30 * time.Second
+	// defaultPassTimeout is the wall-clock bound on one WHOLE flush pass,
+	// including the shutdown drain. Without it, N prefixes against a
+	// stalled artifact backend cost N x uploadTimeout — and at shutdown no
+	// customer traffic remains to open the data-plane breaker, so a node
+	// roll could wait through timeout after timeout. LRU data is
+	// disposable; the pass is not allowed to hold a roll hostage.
+	defaultPassTimeout = 2 * time.Minute
 
 	// capObjects is the process-wide bound on buffered object REFERENCES
 	// (AC entries + CAS leaf references; a leaf under two ACs counts
@@ -80,6 +87,18 @@ const (
 	dropReasonMissingPrefix   = "missing_prefix"
 	dropReasonBufferFull      = "buffer_full"
 	dropReasonClosureTooLarge = "closure_too_large"
+	dropReasonContention      = "contention"
+)
+
+// Loss reasons (label values for
+// bazel_remote_lru_flush_closures_lost_total): why buffered closures were
+// discarded at flush time, counted per closure so observation-loss ratios
+// stay meaningful.
+const (
+	lossReasonUploadFailed    = "upload_failed"
+	lossReasonSerializeFailed = "serialize_failed"
+	lossReasonPassDeadline    = "pass_deadline"
+	lossReasonBackendSuppress = "backend_suppressed"
 )
 
 var (
@@ -95,9 +114,28 @@ var (
 		Name: "bazel_remote_lru_flush_observations_dropped_total",
 		Help: "Emitted AC-access observations dropped before buffering (advisory recency loss, never a cache error).",
 	}, []string{"reason"})
+	// closuresLost counts buffered AC closures discarded at flush time
+	// (per closure, not per artifact, so loss ratios are computable
+	// against flushEntries).
+	closuresLost = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "bazel_remote_lru_flush_closures_lost_total",
+		Help: "Buffered AC closures discarded at flush time (upload failure, pass deadline, or same-backend suppression). Advisory recency loss, never a cache error.",
+	}, []string{"reason"})
 	bufferedObjects = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "bazel_remote_lru_flush_buffered_objects",
 		Help: "Object references (AC entries + CAS leaves) currently buffered awaiting the next flush.",
+	})
+	// detachedObjects makes memory during a flush pass visible:
+	// buffered_objects resets at detach, but the detached window stays
+	// resident until its artifacts are uploaded or abandoned.
+	detachedObjects = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "bazel_remote_lru_flush_detached_objects",
+		Help: "Object references detached from the buffers and held by the in-progress flush pass.",
+	})
+	passDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "bazel_remote_lru_flush_pass_duration_seconds",
+		Help:    "Wall-clock duration of one flush pass (all prefixes, serial).",
+		Buckets: prometheus.ExponentialBuckets(0.01, 4, 10),
 	})
 	flushBytes = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "bazel_remote_lru_artifact_flush_bytes",
@@ -149,11 +187,12 @@ type prefixBuffer struct {
 // JSONL artifact per prefix through the Sink on a periodic ticker and at
 // shutdown.
 type Flusher struct {
-	sink      Sink
-	interval  time.Duration
-	host      string
-	processID string
-	uniqSeq   atomic.Uint64
+	sink        Sink
+	interval    time.Duration
+	passTimeout time.Duration
+	host        string
+	processID   string
+	uniqSeq     atomic.Uint64
 
 	mu      sync.Mutex
 	buffers map[string]*prefixBuffer
@@ -172,6 +211,11 @@ func WithFlushInterval(d time.Duration) Option {
 	return func(f *Flusher) { f.interval = d }
 }
 
+// WithPassTimeout overrides the whole-pass wall-clock bound.
+func WithPassTimeout(d time.Duration) Option {
+	return func(f *Flusher) { f.passTimeout = d }
+}
+
 // New returns a Flusher writing through sink. Call Start to begin the
 // periodic flush loop and Drain exactly once at shutdown.
 func New(sink Sink, options ...Option) *Flusher {
@@ -180,13 +224,14 @@ func New(sink Sink, options ...Option) *Flusher {
 		host = ""
 	}
 	f := &Flusher{
-		sink:      sink,
-		interval:  defaultFlushInterval,
-		host:      host,
-		processID: uuid.NewString(),
-		buffers:   map[string]*prefixBuffer{},
-		stop:      make(chan struct{}),
-		loopDone:  make(chan struct{}),
+		sink:        sink,
+		interval:    defaultFlushInterval,
+		passTimeout: defaultPassTimeout,
+		host:        host,
+		processID:   uuid.NewString(),
+		buffers:     map[string]*prefixBuffer{},
+		stop:        make(chan struct{}),
+		loopDone:    make(chan struct{}),
 	}
 	for _, opt := range options {
 		opt(f)
@@ -217,7 +262,15 @@ func (f *Flusher) RecordACAccess(ctx context.Context, closure cache.ACClosure) {
 	}
 	selection, _ := cache.S3BackendFromContext(ctx)
 
-	f.mu.Lock()
+	// Nonblocking admission: this runs synchronously on the cache hit path,
+	// and a concurrent observation may be holding the lock through a wide
+	// (up to capClosureLeaves) merge. Advisory bookkeeping must never queue
+	// a cache request behind it, so contention is a metered drop — the
+	// recency signal re-establishes itself on the next access.
+	if !f.mu.TryLock() {
+		droppedTotal.WithLabelValues(dropReasonContention).Inc()
+		return
+	}
 	defer f.mu.Unlock()
 	// Full-buffer policy is drop, not flush: an emergency flush under
 	// pressure is exactly when the backend is least likely to absorb it,
@@ -298,30 +351,59 @@ func (f *Flusher) Drain() {
 // the request path, so no serialization or upload work ever happens while
 // holding f.mu — then serially uploads one artifact per prefix. Serial and
 // direct on purpose: this is the degenerate, sufficient form of a bounded
-// upload pipeline at one small artifact per tenant per window. A slow
-// backend delays only later artifacts in the same pass; buffered memory
-// stays bounded because new observations accumulate against a fresh map
-// under the same global cap.
+// upload pipeline at one small artifact per tenant per window.
+//
+// The pass is bounded two ways, because LRU data is disposable and a flush
+// must never hold anything hostage: a whole-pass wall-clock deadline
+// (remaining prefixes are abandoned, closures counted as lost), and
+// per-backend failure suppression (after one failed PUT to an
+// (endpoint, bucket), remaining prefixes routed to it are skipped this pass
+// rather than paying the same timeout again). Buffered memory stays bounded
+// because new observations accumulate against a fresh map under the same
+// global cap.
 func (f *Flusher) flush(trigger string) {
 	windowEndMs := nowMs()
 	f.mu.Lock()
 	detached := f.buffers
+	detachedCount := f.objects
 	f.buffers = map[string]*prefixBuffer{}
 	f.objects = 0
 	bufferedObjects.Set(0)
 	f.mu.Unlock()
+	if len(detached) == 0 {
+		return
+	}
+	detachedObjects.Set(float64(detachedCount))
+	defer detachedObjects.Set(0)
+	start := time.Now()
+	defer func() { passDuration.Observe(time.Since(start).Seconds()) }()
 
+	passCtx, cancel := context.WithTimeout(context.Background(), f.passTimeout)
+	defer cancel()
+	failedBackends := map[cache.S3BackendSelection]bool{}
 	for prefix, buf := range detached {
 		if len(buf.entries) == 0 {
 			continue
 		}
-		f.writeArtifact(prefix, buf, windowEndMs, trigger)
+		if passCtx.Err() != nil {
+			closuresLost.WithLabelValues(lossReasonPassDeadline).Add(float64(len(buf.entries)))
+			continue
+		}
+		if failedBackends[buf.selection] {
+			closuresLost.WithLabelValues(lossReasonBackendSuppress).Add(float64(len(buf.entries)))
+			continue
+		}
+		if !f.writeArtifact(passCtx, prefix, buf, windowEndMs, trigger) {
+			failedBackends[buf.selection] = true
+		}
 	}
 }
 
 // writeArtifact serializes one prefix's window and uploads it, once. A failed
-// upload drops the window's observations (advisory; counted).
-func (f *Flusher) writeArtifact(prefix string, buf *prefixBuffer, windowEndMs int64, trigger string) {
+// upload drops the window's observations (advisory; counted per closure).
+// Returns false when the backend refused or timed out, so the pass can
+// suppress further artifacts to the same backend.
+func (f *Flusher) writeArtifact(passCtx context.Context, prefix string, buf *prefixBuffer, windowEndMs int64, trigger string) bool {
 	closures := make([]cache.ACClosure, 0, len(buf.entries))
 	for _, acHash := range buf.order {
 		entry := buf.entries[acHash]
@@ -355,22 +437,28 @@ func (f *Flusher) writeArtifact(prefix string, buf *prefixBuffer, windowEndMs in
 	var body bytes.Buffer
 	if err := cache.WriteLRUArtifact(&body, header, closures); err != nil {
 		flushTotal.WithLabelValues(trigger, resultFailure).Inc()
-		return
+		closuresLost.WithLabelValues(lossReasonSerializeFailed).Add(float64(len(closures)))
+		// A serialization failure says nothing about the backend.
+		return true
 	}
 	key := cache.LRUArtifactKey(normalizePrefix(prefix), windowEndMs, f.nextUniq())
-	ctx := context.Background()
+	ctx := passCtx
 	if buf.selection.Endpoint != "" {
 		ctx = cache.WithS3Backend(ctx, buf.selection)
 	}
+	// Per-PUT timeout nested inside the pass deadline: whichever is sooner
+	// wins.
 	putCtx, cancel := context.WithTimeout(ctx, uploadTimeout)
 	defer cancel()
 	if err := f.sink.PutArtifact(putCtx, key, body.Bytes()); err != nil {
 		flushTotal.WithLabelValues(trigger, resultFailure).Inc()
-		return
+		closuresLost.WithLabelValues(lossReasonUploadFailed).Add(float64(len(closures)))
+		return false
 	}
 	flushTotal.WithLabelValues(trigger, resultSuccess).Inc()
 	flushBytes.Observe(float64(body.Len()))
 	flushEntries.Observe(float64(len(closures)))
+	return true
 }
 
 // nextUniq returns a process-scoped discriminator so two flushes of the same

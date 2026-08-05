@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type recordedPut struct {
@@ -23,12 +25,14 @@ type recordedPut struct {
 type fakeSink struct {
 	mu       sync.Mutex
 	puts     []recordedPut
+	attempts int
 	failures int // fail the first N puts
 }
 
 func (s *fakeSink) PutArtifact(ctx context.Context, key string, body []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.attempts++
 	if s.failures > 0 {
 		s.failures--
 		return errors.New("injected put failure")
@@ -47,6 +51,12 @@ func (s *fakeSink) recorded() []recordedPut {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]recordedPut(nil), s.puts...)
+}
+
+func (s *fakeSink) attemptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
 }
 
 func obsCtx(prefix string, sel *cache.S3BackendSelection) context.Context {
@@ -267,6 +277,97 @@ func TestFailedUploadDropsWindow(t *testing.T) {
 	}
 }
 
+// TestContentionDropsInsteadOfBlocking pins the nonblocking-admission
+// contract: RecordACAccess runs synchronously on the cache hit path, so when
+// the aggregation lock is held (a concurrent wide merge), the observation is
+// dropped immediately rather than queueing the cache request behind advisory
+// bookkeeping.
+func TestContentionDropsInsteadOfBlocking(t *testing.T) {
+	sink := &fakeSink{}
+	f := newTestFlusher(sink)
+	ctx := obsCtx("tenant/v1/", nil)
+
+	f.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		f.RecordACAccess(ctx, closure("ac-a", 1, "leaf-a"))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		f.mu.Unlock()
+		t.Fatal("RecordACAccess blocked on a held aggregation lock")
+	}
+	f.mu.Unlock()
+	f.Drain()
+	if got := len(sink.recorded()); got != 0 {
+		t.Fatalf("contended observation was buffered anyway: %d artifacts", got)
+	}
+}
+
+// ctxSink parks every PutArtifact until its context expires, simulating a
+// backend that never answers within any deadline.
+type ctxSink struct {
+	fakeSink
+}
+
+func (s *ctxSink) PutArtifact(ctx context.Context, key string, body []byte) error {
+	s.mu.Lock()
+	s.attempts++
+	s.mu.Unlock()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestPassDeadlineAbandonsRemainingPrefixes pins the whole-pass wall-clock
+// bound: a stalled backend costs one put deadline, not N of them — remaining
+// prefixes are abandoned and their closures counted as lost.
+func TestPassDeadlineAbandonsRemainingPrefixes(t *testing.T) {
+	sink := &ctxSink{}
+	f := New(sink, WithFlushInterval(time.Hour), WithPassTimeout(50*time.Millisecond))
+	f.Start()
+
+	// Distinct selections per prefix so backend suppression cannot mask the
+	// deadline path.
+	for i := 0; i < 4; i++ {
+		sel := cache.S3BackendSelection{Endpoint: fmt.Sprintf("http://minio-%d:9000", i), Bucket: "b"}
+		f.RecordACAccess(obsCtx(fmt.Sprintf("tenant-%d/v1/", i), &sel), closure(fmt.Sprintf("ac-%d", i), int64(i+1), "leaf"))
+	}
+	start := time.Now()
+	f.flush(triggerPeriodic)
+	elapsed := time.Since(start)
+	if elapsed > 5*time.Second {
+		t.Fatalf("flush pass ran %v, want ~the 50ms pass deadline", elapsed)
+	}
+	if got := sink.attemptCount(); got != 1 {
+		t.Fatalf("stalled backend received %d put attempts in one pass, want 1", got)
+	}
+	f.Drain()
+}
+
+// TestBackendSuppressionSkipsSameBackendPrefixes pins per-backend failure
+// suppression: after one failed PUT to an (endpoint, bucket), remaining
+// prefixes routed to it are skipped this pass, while other backends still
+// get their artifacts.
+func TestBackendSuppressionSkipsSameBackendPrefixes(t *testing.T) {
+	sink := &fakeSink{failures: 1 << 30}
+	f := newTestFlusher(sink)
+	selSick := cache.S3BackendSelection{Endpoint: "http://minio-sick:9000", Bucket: "b"}
+	for i := 0; i < 3; i++ {
+		f.RecordACAccess(obsCtx(fmt.Sprintf("sick-%d/v1/", i), &selSick), closure(fmt.Sprintf("ac-%d", i), int64(i+1), "leaf"))
+	}
+	selOther := cache.S3BackendSelection{Endpoint: "http://minio-ok:9000", Bucket: "b"}
+	f.RecordACAccess(obsCtx("other/v1/", &selOther), closure("ac-other", 9, "leaf"))
+
+	f.flush(triggerPeriodic)
+	// One attempt for the sick backend (then suppressed), one for the other.
+	if got := sink.attemptCount(); got != 2 {
+		t.Fatalf("put attempts = %d, want 2 (1 sick + 1 other)", got)
+	}
+	f.Drain()
+}
+
 // blockingSink parks every PutArtifact until gate closes, simulating a
 // wedged MinIO.
 type blockingSink struct {
@@ -352,9 +453,14 @@ func TestPeriodicTickerFlushes(t *testing.T) {
 	}
 }
 
+// TestConcurrentObservationsAreSafe proves race-freedom under concurrent
+// observers and conservation under the nonblocking-admission policy: every
+// observation is either buffered (and lands in an artifact) or counted as a
+// contention drop — none silently vanish.
 func TestConcurrentObservationsAreSafe(t *testing.T) {
 	sink := &fakeSink{}
 	f := newTestFlusher(sink)
+	droppedBefore := testutil.ToFloat64(droppedTotal.WithLabelValues(dropReasonContention))
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
 		wg.Add(1)
@@ -369,16 +475,20 @@ func TestConcurrentObservationsAreSafe(t *testing.T) {
 	wg.Wait()
 	f.Drain()
 
-	total := 0
+	flushed := 0
 	for _, p := range sink.recorded() {
 		_, closures, err := cache.ReadLRUArtifact(bytes.NewReader(p.body))
 		if err != nil {
 			t.Fatal(err)
 		}
-		total += len(closures)
+		flushed += len(closures)
 	}
-	if total != 8*500 {
-		t.Fatalf("closures across artifacts = %d, want %d", total, 8*500)
+	dropped := int(testutil.ToFloat64(droppedTotal.WithLabelValues(dropReasonContention)) - droppedBefore)
+	if flushed+dropped != 8*500 {
+		t.Fatalf("flushed %d + contention-dropped %d != %d observations", flushed, dropped, 8*500)
+	}
+	if flushed == 0 {
+		t.Fatal("every observation was dropped; admission is broken, not contended")
 	}
 }
 

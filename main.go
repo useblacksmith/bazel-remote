@@ -177,16 +177,23 @@ func run(ctx *cli.Context) error {
 	// artifacts next to the objects they describe, for the web-side
 	// retention sweep. Advisory only — never affects request behavior.
 	// Requires trust mode because only trusted-mode requests carry the
-	// storage prefix an artifact is keyed under.
+	// storage prefix an artifact is keyed under. Dark by default: the
+	// feature is explicitly opt-in (=1) so a routine binary roll can never
+	// activate it fleet-wide; rollout enables it per node and widens with
+	// evidence.
 	var lruFlusher *lruflush.Flusher
-	if os.Getenv("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER") == "1" &&
-		os.Getenv("BAZEL_REMOTE_LRU_ARTIFACTS") != "0" {
-		if sink, ok := c.ProxyBackend.(lruflush.Sink); ok {
-			lruFlusher = lruflush.New(sink)
-			opts = append(opts, disk.WithLRUObserver(lruFlusher))
-			log.Println("LRU observation artifacts enabled: buffering AC-access closures per tenant prefix, periodic flush to the tenant's backend (BAZEL_REMOTE_LRU_ARTIFACTS=0 disables)")
-		} else {
-			log.Println("LRU observation artifacts disabled: proxy backend cannot store artifacts (requires the S3 proxy)")
+	if os.Getenv("BAZEL_REMOTE_TRUST_STORAGE_PREFIX_HEADER") == "1" {
+		switch {
+		case os.Getenv("BAZEL_REMOTE_LRU_ARTIFACTS") != "1":
+			log.Println("LRU observation artifacts disabled (BAZEL_REMOTE_LRU_ARTIFACTS=1 enables)")
+		default:
+			if sink, ok := c.ProxyBackend.(lruflush.Sink); ok {
+				lruFlusher = lruflush.New(sink)
+				opts = append(opts, disk.WithLRUObserver(lruFlusher))
+				log.Println("LRU observation artifacts enabled: buffering AC-access closures per tenant prefix, periodic flush to the tenant's backend")
+			} else {
+				log.Println("LRU observation artifacts disabled: proxy backend cannot store artifacts (requires the S3 proxy)")
+			}
 		}
 	}
 
