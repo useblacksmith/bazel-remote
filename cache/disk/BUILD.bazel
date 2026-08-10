@@ -40,6 +40,8 @@ go_test(
         "findmissing_test.go",
         "lru_capture_bench_test.go",
         "lru_capture_test.go",
+        "lru_maxentries_test.go",
+        "lru_mem_test.go",
         "lru_test.go",
         "operation_observer_test.go",
     ],
