@@ -97,6 +97,7 @@ type Config struct {
 	Dir                         string                    `yaml:"dir"`
 	MaxSize                     int                       `yaml:"max_size"`
 	MaxSizeHardLimit            int                       `yaml:"max_size_hard_limit"`
+	MaxEntries                  int64                     `yaml:"max_entries"`
 	StorageMode                 string                    `yaml:"storage_mode"`
 	ZstdImplementation          string                    `yaml:"zstd_implementation"`
 	HtpasswdFile                string                    `yaml:"htpasswd_file"`
@@ -207,6 +208,7 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 	accessLogLevel string,
 	logTimezone string,
 	maxSizeHardLimit int,
+	maxEntries int64,
 	maxBlobSize int64,
 	maxProxyBlobSize int64) (*Config, error) {
 
@@ -217,6 +219,7 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 		Dir:                         dir,
 		MaxSize:                     maxSize,
 		MaxSizeHardLimit:            maxSizeHardLimit,
+		MaxEntries:                  maxEntries,
 		StorageMode:                 storageMode,
 		ZstdImplementation:          zstdImplementation,
 		HtpasswdFile:                htpasswdFile,
@@ -763,6 +766,7 @@ func get(ctx *cli.Context) (*Config, error) {
 		ctx.String("access_log_level"),
 		ctx.String("log_timezone"),
 		ctx.Int("max_size_hard_limit"),
+		ctx.Int64("max_entries"),
 		ctx.Int64("max_blob_size"),
 		ctx.Int64("max_proxy_blob_size"),
 	)

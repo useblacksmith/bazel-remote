@@ -1,0 +1,22 @@
+name: tests
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - master
+      - patchset
+  pull_request:
+jobs:
+  go-test-race:
+    name: go test -race
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      - name: go test -race
+        run: go test -race ./...

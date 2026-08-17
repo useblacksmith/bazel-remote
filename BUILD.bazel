@@ -15,6 +15,7 @@ go_library(
     visibility = ["//visibility:private"],
     deps = [
         "//cache/disk:go_default_library",
+        "//cache/lruflush:go_default_library",
         "//config:go_default_library",
         "//ldap:go_default_library",
         "//server:go_default_library",

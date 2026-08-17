@@ -62,9 +62,9 @@ var breakerTimeout = 15 * time.Second
 // Breaker states. The numeric values are the wire contract of the
 // bazel_remote_s3_breaker_state gauge.
 const (
-	breakerClosed int32 = iota // 0
-	breakerHalfOpen            // 1
-	breakerOpen                // 2
+	breakerClosed   int32 = iota // 0
+	breakerHalfOpen              // 1
+	breakerOpen                  // 2
 )
 
 func breakerStateName(state int32) string {
@@ -150,6 +150,18 @@ func (b *breaker) ExecuteNoProbe(call func() breakerOutcome) error {
 	}
 	b.record(call())
 	return nil
+}
+
+// isClosed reports whether the breaker is currently closed, WITHOUT
+// advancing state or claiming the half-open probe. It exists for advisory
+// traffic (LRU artifact PUTs) that wants the sick-shard fail-fast but is
+// contractually forbidden from influencing the data-plane breaker in
+// either direction: it must not record outcomes, and it must not consume
+// the probe slot a real cache read needs to close the breaker.
+func (b *breaker) isClosed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.state == breakerClosed
 }
 
 // allow decides whether a call may dial the backend, advancing

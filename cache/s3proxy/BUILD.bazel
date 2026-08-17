@@ -3,6 +3,7 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "go_default_library",
     srcs = [
+        "artifacts.go",
         "auth_methods.go",
         "breaker.go",
         "multi.go",
@@ -24,6 +25,7 @@ go_library(
 go_test(
     name = "go_default_test",
     srcs = [
+        "artifacts_test.go",
         "s3proxy_breaker_test.go",
         "s3proxy_lru_test.go",
         "s3proxy_test.go",
@@ -31,6 +33,7 @@ go_test(
     embed = [":go_default_library"],
     deps = [
         "//cache:go_default_library",
+        "//cache/lruflush:go_default_library",
         "//utils/backendproxy:go_default_library",
         "@com_github_johannesboyne_gofakes3//:go_default_library",
         "@com_github_johannesboyne_gofakes3//backend/s3mem:go_default_library",

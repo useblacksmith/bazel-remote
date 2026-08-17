@@ -37,6 +37,16 @@ type SizedLRU struct {
 	// cache below maxSize.
 	maxSize int64
 
+	// When positive, SizedLRU additionally evicts items as needed to keep
+	// the number of resident entries at or below maxEntries. This bounds
+	// the index metadata (key string, entry struct, list node, map slot -
+	// a fixed cost per entry regardless of blob size), which the byte
+	// budget alone does not: zero-byte blobs charge nothing against
+	// maxSize and tiny blobs charge at most one 4 KiB block, so without a
+	// count bound the metadata of a byte-full cache is effectively
+	// unbounded. Zero or negative means no entry-count bound.
+	maxEntries int64
+
 	// Channel containing evicted entries removed from ll, but not yet
 	// removed from the file system.
 	//
@@ -65,6 +75,7 @@ type SizedLRU struct {
 	gaugeCacheLogicalBytes   prometheus.Gauge
 	counterEvictedBytes      prometheus.Counter
 	counterOverwrittenBytes  prometheus.Counter
+	counterMaxEntriesEvicted prometheus.Counter
 
 	summaryCacheItemBytes prometheus.Summary
 
@@ -130,6 +141,10 @@ func NewSizedLRU(maxSize int64, onEvict EvictCallback, initialCapacity int) Size
 			Name: "bazel_remote_disk_cache_overwritten_bytes_total",
 			Help: "The total number of bytes removed from disk backend, due to put of already existing key",
 		}),
+		counterMaxEntriesEvicted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "bazel_remote_disk_cache_max_entries_evictions_total",
+			Help: "The total number of entries evicted because the entry-count limit was reached, rather than the byte-size limit",
+		}),
 		summaryCacheItemBytes: prometheus.NewSummary(prometheus.SummaryOpts{
 			Name: "bazel_remote_disk_cache_entry_bytes",
 			Help: "Size of cache entries",
@@ -150,6 +165,7 @@ func (c *SizedLRU) RegisterMetrics() {
 	prometheus.MustRegister(c.gaugeCacheLogicalBytes)
 	prometheus.MustRegister(c.counterEvictedBytes)
 	prometheus.MustRegister(c.counterOverwrittenBytes)
+	prometheus.MustRegister(c.counterMaxEntriesEvicted)
 	prometheus.MustRegister(c.summaryCacheItemBytes)
 
 	// Set gauges to constant configured values to help visualize configured limits
@@ -219,6 +235,20 @@ func (c *SizedLRU) Add(key string, value lruItem) (ok bool) {
 		ele := c.ll.Back()
 		if ele != nil {
 			c.removeElement(ele)
+		}
+	}
+
+	// Entry-count eviction (see maxEntries). Only inserts of new keys can
+	// grow the count, and the new entry is at the front of the list, so
+	// the evicted tail is always an older entry.
+	if c.maxEntries > 0 {
+		for int64(c.ll.Len()) > c.maxEntries {
+			ele := c.ll.Back()
+			if ele == nil {
+				break
+			}
+			c.removeElement(ele)
+			c.counterMaxEntriesEvicted.Inc()
 		}
 	}
 

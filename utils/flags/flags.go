@@ -59,6 +59,17 @@ func GetCliFlags() []cli.Flag {
 				"value might be 5% larger than --max_size.",
 			EnvVars: []string{"BAZEL_REMOTE_MAX_SIZE_HARD_LIMIT"},
 		},
+		&cli.Int64Flag{
+			Name:  "max_entries",
+			Value: 0,
+			Usage: "If positive, the maximum number of entries resident in the disk cache's " +
+				"in-memory LRU index; least-recently-used entries are evicted past the cap, " +
+				"exactly like the byte budget but counting entries. Each resident entry costs " +
+				"~270 bytes of process memory regardless of blob size, so this bounds index " +
+				"memory on small-blob-heavy workloads that the byte budget alone does not. " +
+				"Zero or negative means no entry-count bound.",
+			EnvVars: []string{"BAZEL_REMOTE_MAX_ENTRIES"},
+		},
 		&cli.StringFlag{
 			Name:    "storage_mode",
 			Value:   "zstd",

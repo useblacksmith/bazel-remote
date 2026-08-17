@@ -668,6 +668,14 @@ func (c *diskCache) loadExistingFiles(maxSizeBytes int64, cc CacheConfig) error 
 			bytesToGigaBytes(c.lru.maxSizeHardLimit))
 	}
 
+	if cc.maxEntries > 0 {
+		// Set before the Add loop below, so a cache directory holding
+		// more files than the cap is trimmed (oldest first) during load,
+		// like a restart with a smaller maxSize.
+		c.lru.maxEntries = cc.maxEntries
+		log.Printf("Will evict at max entries: %d", cc.maxEntries)
+	}
+
 	// Start one single goroutine running in background, continuously
 	// waiting for files to be removed and removing them. Benchmarks on
 	// Linux with the XFS file system have surprisingly shown that removal
