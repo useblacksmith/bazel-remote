@@ -22,9 +22,13 @@ const TrustRejectionErrorDomain = "cache.blacksmith.sh"
 // cause (missing/duplicate/unknown/invalid) travels in ErrorInfo.Metadata
 // under "cause".
 const (
-	// RejectionReasonS3BackendSelector marks rejections from the S3
+	// RejectionReasonS3BackendSelector marked rejections from the S3
 	// backend-selector trust interceptor (missing, duplicate, or
-	// non-allowlisted x-blacksmith-s3-endpoint metadata).
+	// non-allowlisted x-blacksmith-s3-endpoint metadata). Current L1s no
+	// longer mint it — unresolvable selectors route to the default backend
+	// instead of rejecting — but the constant stays: L1s predating the
+	// change still send it, and upstream clients must keep degrading it to
+	// a metered miss.
 	RejectionReasonS3BackendSelector = "S3_BACKEND_SELECTOR_REJECTED"
 
 	// RejectionReasonStoragePrefix marks rejections from the storage-prefix

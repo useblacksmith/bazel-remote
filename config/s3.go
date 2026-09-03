@@ -140,20 +140,46 @@ type S3BackendConfig struct {
 	Default         bool     `yaml:"default"`
 }
 
-// AllowedBackends returns, for each valid backend selector, the bucket set
-// the fail-closed gRPC interceptor accepts for it: the entry's default
-// bucket plus its extra_buckets. Only valid to call after validateConfig has
-// passed (bucket resolution cannot fail then).
-func (s3c *S3CloudStorageConfig) AllowedBackends() (map[string]map[string]bool, error) {
-	allowed := make(map[string]map[string]bool, len(s3c.Backends))
+// S3BackendRoutingEntry is one backends-map entry as the gRPC routing
+// interceptor needs it: the entry's resolved default bucket (used when a
+// request carries no usable bucket) and the full allowed set (default plus
+// extra_buckets).
+type S3BackendRoutingEntry struct {
+	DefaultBucket string
+	Buckets       map[string]bool
+}
+
+// RoutingBackends resolves the backends map for the gRPC routing
+// interceptor: for each selector key, its default bucket and allowed bucket
+// set; plus the map's designated default key, which serves every request
+// whose selector is missing or not in the map. Exactly one entry must be
+// marked default (the same invariant s3proxy.NewMulti enforces). Only valid
+// to call after validateConfig has passed (bucket resolution cannot fail
+// then).
+func (s3c *S3CloudStorageConfig) RoutingBackends() (defaultKey string, entries map[string]S3BackendRoutingEntry, err error) {
+	entries = make(map[string]S3BackendRoutingEntry, len(s3c.Backends))
 	for key := range s3c.Backends {
 		buckets, err := s3c.allowedBucketsForBackend(key)
 		if err != nil {
-			return nil, err
+			return "", nil, err
 		}
-		allowed[key] = buckets
+		backend := s3c.Backends[key]
+		bucket := backend.Bucket
+		if bucket == "" {
+			bucket = s3c.Bucket
+		}
+		entries[key] = S3BackendRoutingEntry{DefaultBucket: bucket, Buckets: buckets}
+		if backend.Default {
+			if defaultKey != "" {
+				return "", nil, fmt.Errorf("multiple s3.backends entries marked as default")
+			}
+			defaultKey = key
+		}
 	}
-	return allowed, nil
+	if defaultKey == "" {
+		return "", nil, fmt.Errorf("no s3.backends entry marked as default")
+	}
+	return defaultKey, entries, nil
 }
 
 // allowedBucketsForBackend resolves one backends-map entry's allowed bucket

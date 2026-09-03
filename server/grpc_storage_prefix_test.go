@@ -7,10 +7,40 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
+
+// requireTrustRejection asserts that err is an InvalidArgument rejection
+// carrying the typed ErrorInfo marker our trust interceptors mint — the
+// wire contract the upstream grpcproxy uses to degrade config-race
+// rejections to metered misses instead of failing builds.
+func requireTrustRejection(t *testing.T, err error, reason, cause string) {
+	t.Helper()
+	s, ok := status.FromError(err)
+	if !ok || s.Code() != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument status, got %v", err)
+	}
+	for _, detail := range s.Details() {
+		info, ok := detail.(*errdetails.ErrorInfo)
+		if !ok {
+			continue
+		}
+		if info.GetDomain() != cache.TrustRejectionErrorDomain {
+			t.Fatalf("ErrorInfo domain = %q, want %q", info.GetDomain(), cache.TrustRejectionErrorDomain)
+		}
+		if info.GetReason() != reason {
+			t.Fatalf("ErrorInfo reason = %q, want %q", info.GetReason(), reason)
+		}
+		if got := info.GetMetadata()["cause"]; got != cause {
+			t.Fatalf("ErrorInfo cause = %q, want %q", got, cause)
+		}
+		return
+	}
+	t.Fatalf("rejection %v carries no ErrorInfo trust marker", err)
+}
 
 func TestStoragePrefixFromIncomingContext(t *testing.T) {
 	t.Run("no metadata is rejected (fail-closed)", func(t *testing.T) {

@@ -49,27 +49,33 @@ func singleMetadataValue(md metadata.MD, key string) (value string, cause string
 	}
 }
 
-// trustRejectionLogEvery rate-limits rejection logging to one line per
-// (reason, cause) pair per interval. A misconfigured fleet can reject at
-// full request rate, and rejections are already metered per cause
-// (bazel_remote_..._rejected_total) — the log line exists so a live
-// debugging session on the node sees the incident in journald at all
-// (validated 2026-07-30: counters incremented, journal stayed empty),
-// not to reproduce the counter's volume.
-const trustRejectionLogEvery = 30 * time.Second
+// rateLimitedLogEvery rate-limits interceptor logging to one line per key
+// per interval. A misconfigured fleet can trip these paths at full request
+// rate, and every event is already metered per cause (the *_rejected_total /
+// *_defaulted_total counters) — the log line exists so a live debugging
+// session on the node sees the incident in journald at all (validated
+// 2026-07-30: counters incremented, journal stayed empty), not to reproduce
+// the counter's volume.
+const rateLimitedLogEvery = 30 * time.Second
 
-var trustRejectionLastLog sync.Map // "reason/cause" -> *atomic.Int64 (unix nanos)
+var rateLimitedLastLog sync.Map // key -> *atomic.Int64 (unix nanos)
 
-func logTrustRejection(reason, cause, message string) {
-	gateAny, _ := trustRejectionLastLog.LoadOrStore(reason+"/"+cause, new(atomic.Int64))
+// logRateLimited logs at most one line per key per rateLimitedLogEvery.
+func logRateLimited(key, format string, args ...interface{}) {
+	gateAny, _ := rateLimitedLastLog.LoadOrStore(key, new(atomic.Int64))
 	gate := gateAny.(*atomic.Int64)
 	last := gate.Load()
 	now := time.Now().UnixNano()
-	if now-last < int64(trustRejectionLogEvery) || !gate.CompareAndSwap(last, now) {
+	if now-last < int64(rateLimitedLogEvery) || !gate.CompareAndSwap(last, now) {
 		return
 	}
-	log.Printf("trust interceptor rejected request (reason=%s cause=%s, logged at most once per %v per cause; see the *_rejected_total counters for volume): %s",
-		reason, cause, trustRejectionLogEvery, message)
+	log.Printf(format, args...)
+}
+
+func logTrustRejection(reason, cause, message string) {
+	logRateLimited(reason+"/"+cause,
+		"trust interceptor rejected request (reason=%s cause=%s, logged at most once per %v per cause; see the *_rejected_total counters for volume): %s",
+		reason, cause, rateLimitedLogEvery, message)
 }
 
 // trustRejection mints an InvalidArgument rejection carrying the typed
