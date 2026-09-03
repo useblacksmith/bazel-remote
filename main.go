@@ -497,21 +497,35 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 		unaryInterceptors = append(unaryInterceptors, server.GRPCStoragePrefixUnaryServerInterceptor(authSecret))
 	}
 
-	// Multi-backend S3 mode: every cache RPC must carry exactly one
-	// allowlisted (endpoint, bucket) pair (the tenant's pinned backing-store
-	// endpoint and bucket, forwarded by the trusted upstream) or it is
-	// rejected fail-closed — same trust model as the storage prefix above.
-	// Health and capabilities RPCs are exempt. Only installed when a
-	// backends map is configured; single-backend deployments ignore both
-	// metadata keys.
+	// Multi-backend S3 mode: cache RPCs carry the tenant's pinned
+	// backing-store (endpoint, bucket) pair as gRPC metadata, forwarded by
+	// the trusted upstream. Requests resolve against the backends map;
+	// anything unresolvable (missing/unknown selector or bucket) routes to
+	// the map's default backend / the entry's default bucket, metered per
+	// cause — the L1 owns which backends exist, the upstream needs no
+	// endpoint knowledge of its own to be served. Tenant isolation is the
+	// storage-prefix interceptor's job (fail-closed above); the selector
+	// only picks the shard. Health and capabilities RPCs are exempt. Only
+	// installed when a backends map is configured; single-backend
+	// deployments ignore both metadata keys.
 	if c.S3CloudStorage != nil && len(c.S3CloudStorage.Backends) > 0 {
-		allowed, err := c.S3CloudStorage.AllowedBackends()
+		defaultKey, entries, err := c.S3CloudStorage.RoutingBackends()
 		if err != nil {
 			return err
 		}
-		log.Printf("Routing S3 operations by forwarded (endpoint, bucket) gRPC metadata, fail-closed (%d allowlisted backends)", len(allowed))
-		streamInterceptors = append(streamInterceptors, server.GRPCS3BackendStreamServerInterceptor(allowed))
-		unaryInterceptors = append(unaryInterceptors, server.GRPCS3BackendUnaryServerInterceptor(allowed))
+		routing := server.S3BackendRouting{
+			DefaultKey: defaultKey,
+			Backends:   make(map[string]server.S3BackendRoutingEntry, len(entries)),
+		}
+		for key, entry := range entries {
+			routing.Backends[key] = server.S3BackendRoutingEntry{
+				DefaultBucket: entry.DefaultBucket,
+				Buckets:       entry.Buckets,
+			}
+		}
+		log.Printf("Routing S3 operations by forwarded (endpoint, bucket) gRPC metadata (%d backends, default %q; unresolvable selectors route to the default)", len(entries), defaultKey)
+		streamInterceptors = append(streamInterceptors, server.GRPCS3BackendStreamServerInterceptor(routing))
+		unaryInterceptors = append(unaryInterceptors, server.GRPCS3BackendUnaryServerInterceptor(routing))
 	}
 
 	if c.TLSConfig != nil {
