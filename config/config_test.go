@@ -546,3 +546,67 @@ func TestSocketPathMissing(t *testing.T) {
 		t.Fatal("Expected the error message to mention the missing 'http_address' key/flag")
 	}
 }
+
+func TestReadChunkSizeYaml(t *testing.T) {
+	yaml := `host: localhost
+port: 8080
+grpc_port: 9092
+dir: /opt/cache-dir
+max_size: 100
+read_chunk_size: 262144
+`
+	config, err := NewFromYaml([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ReadChunkSizeBytes != 262144 {
+		t.Fatalf("ReadChunkSizeBytes = %d, want 262144", config.ReadChunkSizeBytes)
+	}
+}
+
+func TestReadChunkSizeOmittedIsZero(t *testing.T) {
+	yaml := `host: localhost
+port: 8080
+dir: /opt/cache-dir
+max_size: 100
+`
+	config, err := NewFromYaml([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ReadChunkSizeBytes != 0 {
+		t.Fatalf("omitted read_chunk_size = %d, want 0 (server default)", config.ReadChunkSizeBytes)
+	}
+}
+
+func TestReadChunkSizeValidation(t *testing.T) {
+	base := Config{
+		HTTPAddress:        "localhost:8080",
+		Dir:                "/opt/cache-dir",
+		MaxSize:            100,
+		StorageMode:        "zstd",
+		ZstdImplementation: "go",
+		MaxBlobSize:        math.MaxInt64,
+		MaxProxyBlobSize:   math.MaxInt64,
+		AccessLogLevel:     "all",
+		LogTimezone:        "UTC",
+	}
+
+	neg := base
+	neg.ReadChunkSizeBytes = -1
+	if err := validateConfig(&neg); err == nil {
+		t.Fatal("expected negative read_chunk_size to fail")
+	}
+
+	over := base
+	over.ReadChunkSizeBytes = maxReadChunkSizeBytes + 1
+	if err := validateConfig(&over); err == nil {
+		t.Fatal("expected oversized read_chunk_size to fail")
+	}
+
+	ok := base
+	ok.ReadChunkSizeBytes = 256 * 1024
+	if err := validateConfig(&ok); err != nil {
+		t.Fatalf("256 KiB read_chunk_size should be valid: %v", err)
+	}
+}

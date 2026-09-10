@@ -211,6 +211,14 @@ func GetCliFlags() []cli.Flag {
 			DefaultText: strconv.FormatInt(math.MaxInt64, 10),
 			EnvVars:     []string{"BAZEL_REMOTE_MAX_PROXY_BLOB_SIZE"},
 		},
+		&cli.Int64Flag{
+			Name:  "read_chunk_size",
+			Value: 0,
+			Usage: "Maximum ByteStream Read response payload in bytes. Zero keeps the 2 MiB default. " +
+				"Must not exceed 2 MiB. Smaller chunks reduce per-stream memory on a gRPC proxy whose " +
+				"downstream window is smaller than the default chunk (the FA L1→shim path).",
+			EnvVars: []string{"BAZEL_REMOTE_READ_CHUNK_SIZE"},
+		},
 		&cli.IntFlag{
 			Name:    "num_uploaders",
 			Value:   100,

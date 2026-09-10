@@ -244,6 +244,12 @@ OPTIONS:
       to preexisting blobs in the cache. (default: 9223372036854775807)
       [$BAZEL_REMOTE_MAX_PROXY_BLOB_SIZE]
 
+   --read_chunk_size value Maximum ByteStream Read response payload in
+      bytes. Zero keeps the 2 MiB default. Must not exceed 2 MiB. Smaller
+      chunks reduce per-stream memory on a gRPC proxy whose downstream window
+      is smaller than the default chunk (the FA L1→shim path).
+      [$BAZEL_REMOTE_READ_CHUNK_SIZE]
+
    --num_uploaders value When using proxy backends, sets the number of
       Goroutines to process parallel uploads to backend. (default: 100)
       [$BAZEL_REMOTE_NUM_UPLOADERS]
@@ -558,6 +564,8 @@ http_address: 0.0.0.0:8080
 #max_queued_uploads: 1000000
 # The largest blob size that will be accepted, for example 10MB:
 #max_blob_size: 10485760
+# ByteStream Read Send payload. Zero / omitted keeps the 2 MiB default.
+#read_chunk_size: 262144
 #
 #gcs_proxy:
 #  bucket: gcs-bucket
