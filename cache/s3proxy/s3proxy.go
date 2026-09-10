@@ -85,6 +85,10 @@ var (
 		Name: "bazel_remote_s3_cache_misses",
 		Help: "The total number of s3 backend cache misses",
 	}, []string{"backend"})
+	backendLookupsSkipped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "bazel_remote_s3_backend_lookups_skipped_total",
+		Help: "S3 backend Get/Contains lookups skipped without dialing MinIO.",
+	}, []string{"backend", "reason"})
 	uploadQueueDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_upload_queue_dropped_total",
 		Help: "Backend uploads dropped because the S3 upload queue was full.",
@@ -685,10 +689,35 @@ func (c *s3Cache) UpdateModificationTimestamp(ctx context.Context, bucket string
 	logResponse(c.accessLogger, "COMPOSE", bucket, object, err)
 }
 
+const skipReasonGoAC = "go_ac"
+
+// skipGoActionCacheBackendLookup reports whether Get/Contains should skip MinIO.
+// Go AC Get is dominated by never-stored ActionIDs; checking MinIO cannot hit
+// and floods 404s. CAS still hydrates from MinIO. After L1 eviction, Go AC will
+// miss instead of filling from L2 — acceptable because successful S3 AC fills
+// are ~0.01% of this traffic.
+func skipGoActionCacheBackendLookup(ctx context.Context, kind cache.EntryKind) bool {
+	if kind != cache.AC {
+		return false
+	}
+	if labels, ok := cache.MetricsLabelsFromContext(ctx); ok && labels.BuildToolID == "go" {
+		return true
+	}
+	prefix, ok := cache.StoragePrefixFromContext(ctx)
+	if !ok {
+		return false
+	}
+	return path.Base(prefix) == "go"
+}
+
 func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (io.ReadCloser, int64, error) {
 	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
 	if requirePrefix && !requestScopedPrefix {
 		c.logMissingRequiredStoragePrefix("DOWNLOAD", kind, hash)
+	}
+	if skipGoActionCacheBackendLookup(ctx, kind) {
+		backendLookupsSkipped.WithLabelValues(c.key, skipReasonGoAC).Inc()
+		return nil, -1, nil
 	}
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 	bucket := c.bucketForContext(ctx)
@@ -773,6 +802,10 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
 	if requirePrefix && !requestScopedPrefix {
 		c.logMissingRequiredStoragePrefix("CONTAINS", kind, hash)
+	}
+	if skipGoActionCacheBackendLookup(ctx, kind) {
+		backendLookupsSkipped.WithLabelValues(c.key, skipReasonGoAC).Inc()
+		return false, -1
 	}
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 	bucket := c.bucketForContext(ctx)

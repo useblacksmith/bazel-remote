@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -628,6 +629,16 @@ func fakeS3Backend(t *testing.T, buckets ...string) *s3Cache {
 	}
 }
 
+func seedS3Object(t *testing.T, c *s3Cache, prefix string, kind cache.EntryKind, hash, body string) {
+	t.Helper()
+	key := c.objectKeyForPrefix(prefix, hash, kind)
+	_, err := c.mcore.PutObject(context.Background(), c.bucket, key,
+		strings.NewReader(body), int64(len(body)), "", "", minio.PutObjectOptions{})
+	if err != nil {
+		t.Fatalf("seed PutObject %s: %v", key, err)
+	}
+}
+
 // TestPerRequestBucketRouting pins the v2 routing semantics: one endpoint,
 // one minio client — but the bucket comes from the request. Uploads captured
 // with different buckets on the same backend must land in their own buckets,
@@ -729,5 +740,211 @@ func TestLogMissingRequiredStoragePrefix(t *testing.T) {
 		if !strings.Contains(result, expected) {
 			t.Fatalf("log line %q does not contain %q", result, expected)
 		}
+	}
+}
+
+func TestSkipGoActionCacheBackendLookup(t *testing.T) {
+	goPrefix := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/go")
+	goPrefixSlash := cache.WithStoragePrefix(context.Background(), "staging/42/987654321/go/")
+	bazelPrefix := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/bazel")
+	buck2Prefix := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/buck2")
+	goTool := cache.WithMetricsLabels(context.Background(), cache.MetricsLabels{BuildToolID: "go"})
+
+	cases := []struct {
+		name string
+		ctx  context.Context
+		kind cache.EntryKind
+		skip bool
+	}{
+		{name: "go prefix AC", ctx: goPrefix, kind: cache.AC, skip: true},
+		{name: "go prefix trailing slash AC", ctx: goPrefixSlash, kind: cache.AC, skip: true},
+		{name: "go BuildToolID AC without prefix", ctx: goTool, kind: cache.AC, skip: true},
+		{name: "go prefix CAS", ctx: goPrefix, kind: cache.CAS, skip: false},
+		{name: "go BuildToolID CAS", ctx: goTool, kind: cache.CAS, skip: false},
+		{name: "bazel prefix AC", ctx: bazelPrefix, kind: cache.AC, skip: false},
+		{name: "buck2 prefix AC", ctx: buck2Prefix, kind: cache.AC, skip: false},
+		{name: "unscoped AC", ctx: context.Background(), kind: cache.AC, skip: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := skipGoActionCacheBackendLookup(tc.ctx, tc.kind); got != tc.skip {
+				t.Fatalf("skipGoActionCacheBackendLookup = %v, want %v", got, tc.skip)
+			}
+		})
+	}
+}
+
+func TestGoActionCacheSkipsExistingMinioObject(t *testing.T) {
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	c := fakeS3Backend(t, "default-bucket")
+	c.key = "go-ac-skip-existing"
+
+	goPrefix := "prd/10/123/v0/go"
+	bazelPrefix := "prd/10/123/v0/bazel"
+	ctxGo := cache.WithStoragePrefix(context.Background(), goPrefix)
+	ctxBazel := cache.WithStoragePrefix(context.Background(), bazelPrefix)
+	ctxGoTool := cache.WithMetricsLabels(context.Background(), cache.MetricsLabels{BuildToolID: "go"})
+
+	seedS3Object(t, c, goPrefix, cache.AC, hash, "goac")
+	seedS3Object(t, c, goPrefix, cache.CAS, hash, "gocas")
+	seedS3Object(t, c, bazelPrefix, cache.AC, hash, "bzlac")
+	seedS3Object(t, c, "", cache.AC, hash, "unsc")
+
+	missesBefore := testutil.ToFloat64(cacheMisses.WithLabelValues(c.key))
+	skipsBefore := testutil.ToFloat64(backendLookupsSkipped.WithLabelValues(c.key, skipReasonGoAC))
+
+	rc, size, err := c.Get(ctxGo, cache.AC, hash, -1)
+	if rc != nil || size != -1 || err != nil {
+		if rc != nil {
+			_ = rc.Close()
+		}
+		t.Fatalf("Go prefix AC Get = (%v, %d, %v), want skip miss", rc, size, err)
+	}
+	if exists, size := c.Contains(ctxGo, cache.AC, hash, -1); exists || size != -1 {
+		t.Fatalf("Go prefix AC Contains = (%v, %d), want skip miss", exists, size)
+	}
+
+	rc, _, err = c.Get(ctxGo, cache.CAS, hash, -1)
+	if err != nil || rc == nil {
+		t.Fatalf("Go prefix CAS Get = (%v, %v), want hit", rc, err)
+	}
+	data, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil || string(data) != "gocas" {
+		t.Fatalf("Go prefix CAS Get body = (%q, %v), want %q", data, err, "gocas")
+	}
+
+	rc, _, err = c.Get(ctxBazel, cache.AC, hash, -1)
+	if err != nil || rc == nil {
+		t.Fatalf("Bazel prefix AC Get = (%v, %v), want hit", rc, err)
+	}
+	data, err = io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil || string(data) != "bzlac" {
+		t.Fatalf("Bazel prefix AC Get body = (%q, %v), want %q", data, err, "bzlac")
+	}
+
+	rc, size, err = c.Get(ctxGoTool, cache.AC, hash, -1)
+	if rc != nil || size != -1 || err != nil {
+		if rc != nil {
+			_ = rc.Close()
+		}
+		t.Fatalf("BuildToolID go AC Get = (%v, %d, %v), want skip miss", rc, size, err)
+	}
+
+	if got := testutil.ToFloat64(cacheMisses.WithLabelValues(c.key)) - missesBefore; got != 0 {
+		t.Fatalf("cacheMisses delta = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(backendLookupsSkipped.WithLabelValues(c.key, skipReasonGoAC)) - skipsBefore; got != 3 {
+		t.Fatalf("backendLookupsSkipped{reason=go_ac} delta = %v, want 3", got)
+	}
+}
+
+func TestGoActionCacheSkipDoesNotDialHungBackend(t *testing.T) {
+	hung := make(chan struct{})
+	var requests atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		<-hung
+	}))
+	defer ts.Close()
+	defer close(hung)
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := minio.NewCore(u.Host, &minio.Options{
+		Creds:        credentials.NewStaticV4("KEY", "SECRET", ""),
+		Secure:       false,
+		BucketLookup: minio.BucketLookupPath,
+		MaxRetries:   1,
+		Region:       "us-east-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const hungDeadline = 200 * time.Millisecond
+	c := &s3Cache{
+		key:          "hung-go-ac-skip",
+		mcore:        core,
+		bucket:       "test-bucket",
+		breaker:      newBreaker("test-go-ac-hung", nil),
+		objectKey:    objectKeyV1,
+		readDeadline: hungDeadline,
+		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
+	}
+
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	ctxGo := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/go")
+	ctxBazel := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/bazel")
+
+	start := time.Now()
+	rc, size, err := c.Get(ctxGo, cache.AC, hash, -1)
+	elapsed := time.Since(start)
+	if rc != nil || size != -1 || err != nil {
+		if rc != nil {
+			_ = rc.Close()
+		}
+		t.Fatalf("Go AC Get = (%v, %d, %v), want immediate miss", rc, size, err)
+	}
+	if elapsed >= 80*time.Millisecond {
+		t.Fatalf("Go AC Get took %v, want immediate skip (not readDeadline)", elapsed)
+	}
+
+	start = time.Now()
+	exists, size := c.Contains(ctxGo, cache.AC, hash, -1)
+	elapsed = time.Since(start)
+	if exists || size != -1 {
+		t.Fatalf("Go AC Contains = (%v, %d), want skip miss", exists, size)
+	}
+	if elapsed >= 80*time.Millisecond {
+		t.Fatalf("Go AC Contains took %v, want immediate skip (not readDeadline)", elapsed)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("hung backend requests after Go AC skip = %d, want 0", got)
+	}
+
+	start = time.Now()
+	rc, _, err = c.Get(ctxBazel, cache.AC, hash, -1)
+	elapsed = time.Since(start)
+	if rc != nil {
+		_ = rc.Close()
+	}
+	if err == nil {
+		t.Fatal("Bazel AC Get skipped MinIO or returned a healthy miss; want hung-backend error")
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("Bazel AC Get took %v, want ~readDeadline", elapsed)
+	}
+
+	start = time.Now()
+	rc, _, err = c.Get(ctxGo, cache.CAS, hash, -1)
+	elapsed = time.Since(start)
+	if rc != nil {
+		_ = rc.Close()
+	}
+	if err == nil {
+		t.Fatal("Go CAS Get skipped MinIO or returned a healthy miss; want hung-backend error")
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("Go CAS Get took %v, want ~readDeadline", elapsed)
+	}
+
+	start = time.Now()
+	rc, _, err = c.Get(context.Background(), cache.AC, hash, -1)
+	elapsed = time.Since(start)
+	if rc != nil {
+		_ = rc.Close()
+	}
+	if err == nil {
+		t.Fatal("unscoped AC Get skipped MinIO; Buck2 / unscoped traffic must still probe")
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("unscoped AC Get took %v, want ~readDeadline", elapsed)
+	}
+	if got := requests.Load(); got == 0 {
+		t.Fatal("expected hung backend to be dialed for Bazel AC / Go CAS / unscoped AC")
 	}
 }
