@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/prometheus/client_golang/prometheus"
@@ -70,12 +71,24 @@ type SizedLRU struct {
 
 	onEvict EvictCallback
 
-	gaugeCacheSizeBytes      prometheus.Gauge
-	gaugeCacheSizeBytesLimit *prometheus.GaugeVec
-	gaugeCacheLogicalBytes   prometheus.Gauge
-	counterEvictedBytes      prometheus.Counter
-	counterOverwrittenBytes  prometheus.Counter
-	counterMaxEntriesEvicted prometheus.Counter
+	// Bytes (sizeOnDisk, without 4k rounding) currently resident per org,
+	// mirrored into gaugeOrgBytes. Guarded by the same lock as the rest of
+	// the SizedLRU (diskCache.mu in production).
+	orgBytes map[string]int64
+
+	// Interned org strings, so that millions of lruItems referencing the
+	// same org share a single string allocation. Append-only: bounded by
+	// the number of distinct orgs seen since startup (a few thousand).
+	orgIntern map[string]string
+
+	gaugeCacheSizeBytes               prometheus.Gauge
+	gaugeCacheSizeBytesLimit          *prometheus.GaugeVec
+	gaugeCacheLogicalBytes            prometheus.Gauge
+	counterEvictedBytes               prometheus.Counter
+	counterOverwrittenBytes           prometheus.Counter
+	counterMaxEntriesEvicted          prometheus.Counter
+	gaugeOrgBytes                     *prometheus.GaugeVec
+	counterEvictedBytesByResidenceAge *prometheus.CounterVec
 
 	summaryCacheItemBytes prometheus.Summary
 
@@ -98,6 +111,18 @@ type SizedLRU struct {
 	queuedEvictionsSize atomic.Int64
 }
 
+// orgUnknown is the org label used when write-time attribution is not
+// available, e.g. for entries reloaded from disk at startup.
+const orgUnknown = "unknown"
+
+// Manual cumulative buckets (in the style of Prometheus histogram le
+// labels) for the residence age of evicted entries: 1h, 6h, 24h, 72h.
+// A real prometheus.Histogram cannot weight observations by bytes, so
+// the buckets are maintained by hand with the same cumulative semantics,
+// keeping PromQL ratio queries natural.
+var residenceAgeBucketBounds = []int64{3600, 21600, 86400, 259200}
+var residenceAgeBucketLabels = []string{"3600", "21600", "86400", "259200", "+Inf"}
+
 type entry struct {
 	// This is used to identify cache items. For non-test code,
 	// this is a string of the form "<keyspace>/<hash>"
@@ -112,11 +137,13 @@ const BlockSize = 4096
 
 // NewSizedLRU returns a new SizedLRU cache
 func NewSizedLRU(maxSize int64, onEvict EvictCallback, initialCapacity int) SizedLRU {
-	return SizedLRU{
-		maxSize: maxSize,
-		ll:      list.New(),
-		cache:   make(map[interface{}]*list.Element, initialCapacity),
-		onEvict: onEvict,
+	lru := SizedLRU{
+		maxSize:   maxSize,
+		ll:        list.New(),
+		cache:     make(map[interface{}]*list.Element, initialCapacity),
+		onEvict:   onEvict,
+		orgBytes:  make(map[string]int64),
+		orgIntern: make(map[string]string),
 
 		gaugeCacheSizeBytes: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "bazel_remote_disk_cache_size_bytes",
@@ -155,8 +182,24 @@ func NewSizedLRU(maxSize int64, onEvict EvictCallback, initialCapacity int) Size
 				1:    0,
 			},
 		}),
+		gaugeOrgBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "bazel_remote_disk_cache_org_bytes",
+			Help: "The number of bytes currently resident in the disk backend, by the org that inserted them. Entries reloaded from disk at startup are attributed to org=\"unknown\" (attribution is not persisted); the gauge converges back to accuracy as those entries churn out.",
+		}, []string{"org"}),
+		counterEvictedBytesByResidenceAge: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "bazel_remote_disk_cache_evicted_bytes_by_residence_age_total",
+			Help: "The total number of bytes evicted from the disk backend, by cumulative residence-age bucket: le counts evicted bytes that were resident for at most le seconds, mirroring Prometheus histogram bucket semantics.",
+		}, []string{"le"}),
 		queuedEvictionsChan: make(chan []*entry, 1),
 	}
+
+	// Pre-create every residence-age bucket series so cumulative-bucket
+	// queries see explicit zeros rather than absent series.
+	for _, label := range residenceAgeBucketLabels {
+		lru.counterEvictedBytesByResidenceAge.WithLabelValues(label)
+	}
+
+	return lru
 }
 
 func (c *SizedLRU) RegisterMetrics() {
@@ -167,6 +210,8 @@ func (c *SizedLRU) RegisterMetrics() {
 	prometheus.MustRegister(c.counterOverwrittenBytes)
 	prometheus.MustRegister(c.counterMaxEntriesEvicted)
 	prometheus.MustRegister(c.summaryCacheItemBytes)
+	prometheus.MustRegister(c.gaugeOrgBytes)
+	prometheus.MustRegister(c.counterEvictedBytesByResidenceAge)
 
 	// Set gauges to constant configured values to help visualize configured limits
 	// and in particular help tuning max_size_hard_limit configuration by comparing it
@@ -178,6 +223,51 @@ func (c *SizedLRU) RegisterMetrics() {
 	}
 }
 
+// internOrg returns a canonical instance of org, so all lruItems for the
+// same org share one string allocation. An empty org means the write path
+// could not attribute the entry; map it to orgUnknown.
+func (c *SizedLRU) internOrg(org string) string {
+	if org == "" {
+		return orgUnknown
+	}
+	if interned, ok := c.orgIntern[org]; ok {
+		return interned
+	}
+	c.orgIntern[org] = org
+	return org
+}
+
+// addOrgBytes adjusts the resident-bytes accounting for org by delta
+// (positive on insert, negative on eviction/overwrite/removal). The label
+// series is deleted when an org's bytes reach zero, to keep /metrics tidy.
+func (c *SizedLRU) addOrgBytes(org string, delta int64) {
+	if delta == 0 {
+		return
+	}
+	total := c.orgBytes[org] + delta
+	if total <= 0 {
+		delete(c.orgBytes, org)
+		c.gaugeOrgBytes.DeleteLabelValues(org)
+		return
+	}
+	c.orgBytes[org] = total
+	c.gaugeOrgBytes.WithLabelValues(org).Set(float64(total))
+}
+
+// recordEvictedResidenceAge adds the evicted entry's sizeOnDisk to every
+// residence-age bucket whose bound is >= the time the entry spent in the
+// cache, plus the +Inf bucket (cumulative histogram-style buckets).
+func (c *SizedLRU) recordEvictedResidenceAge(value lruItem) {
+	age := time.Now().Unix() - value.addedAt
+	bytes := float64(value.sizeOnDisk)
+	for i, bound := range residenceAgeBucketBounds {
+		if age <= bound {
+			c.counterEvictedBytesByResidenceAge.WithLabelValues(residenceAgeBucketLabels[i]).Add(bytes)
+		}
+	}
+	c.counterEvictedBytesByResidenceAge.WithLabelValues(residenceAgeBucketLabels[len(residenceAgeBucketLabels)-1]).Add(bytes)
+}
+
 // Add adds a (key, value) to the cache, evicting items as necessary.
 // Add returns false and does not add the item if the item size is
 // larger than the maximum size of the cache, or if the item cannot
@@ -187,6 +277,8 @@ func (c *SizedLRU) RegisterMetrics() {
 // BlockSize (4096) bytes, as an estimate of actual disk usage since
 // most linux filesystems default to 4kb blocks.
 func (c *SizedLRU) Add(key string, value lruItem) (ok bool) {
+
+	value.org = c.internOrg(value.org)
 
 	roundedUpSizeOnDisk := roundUp4k(value.sizeOnDisk)
 
@@ -218,6 +310,11 @@ func (c *SizedLRU) Add(key string, value lruItem) (ok bool) {
 		kvCopy := &entry{kv.key, kv.value}
 		c.appendEvictionToQueue(kvCopy)
 
+		// Overwrite: the previous entry's bytes leave the cache. This is
+		// not an LRU-pressure eviction, so no residence-age observation.
+		c.addOrgBytes(kv.value.org, -kv.value.sizeOnDisk)
+		c.addOrgBytes(value.org, value.sizeOnDisk)
+
 		ee.Value.(*entry).value = value
 	} else {
 		sizeDelta = roundedUpSizeOnDisk
@@ -227,6 +324,8 @@ func (c *SizedLRU) Add(key string, value lruItem) (ok bool) {
 		uncompressedSizeDelta = roundUp4k(value.size)
 		ele := c.ll.PushFront(&entry{key, value})
 		c.cache[key] = ele
+
+		c.addOrgBytes(value.org, value.sizeOnDisk)
 	}
 
 	// Eviction. This is needed even if the key was already present, since the size of the
@@ -442,6 +541,8 @@ func (c *SizedLRU) removeElement(e *list.Element) {
 	c.currentSize -= roundUp4k(kv.value.sizeOnDisk)
 	c.uncompressedSize -= roundUp4k(kv.value.size)
 	c.counterEvictedBytes.Add(float64(kv.value.sizeOnDisk))
+	c.addOrgBytes(kv.value.org, -kv.value.sizeOnDisk)
+	c.recordEvictedResidenceAge(kv.value)
 	c.appendEvictionToQueue(kv)
 }
 

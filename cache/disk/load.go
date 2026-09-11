@@ -492,6 +492,16 @@ func (c *diskCache) scanDir() (scanResult, error) {
 
 					item[n].legacy = sm[4] == ".v1"
 
+					// Org attribution is lost across restarts by design:
+					// the inserting org is not persisted, so reloaded
+					// entries land in org="unknown" and the per-org gauge
+					// decays back to accuracy as those entries churn out.
+					// File mtime is the original commit time (committed
+					// files are never rewritten in place), preserving
+					// residence-age tracking across restarts.
+					item[n].org = orgUnknown
+					item[n].addedAt = info.ModTime().Unix()
+
 					metadata[n].ts = atime.Get(info)
 
 					n++

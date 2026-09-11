@@ -65,6 +65,18 @@ type lruItem struct {
 	// If true, the blob is a raw CAS file (no header, uncompressed)
 	// with a ".v1" filename suffix.
 	legacy bool
+
+	// Unix seconds (memory-lean: entries number in the millions) at which
+	// the blob was committed to the cache. For entries reloaded at startup
+	// this is the file mtime, which is the original commit time because
+	// committed files are never rewritten in place.
+	addedAt int64
+
+	// The org that inserted the blob, for per-org resident-bytes
+	// accounting. Interned by SizedLRU.Add so all entries for an org
+	// share one string allocation. orgUnknown when attribution is not
+	// available (e.g. entries reloaded from disk at startup).
+	org string
 }
 
 // diskCache is a filesystem-based LRU cache, with an optional backend proxy.
@@ -452,7 +464,7 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 		}
 	}
 
-	unreserve, removeTempfile, err = c.commit(key, legacy, blobFile, size, size, sizeOnDisk, random)
+	unreserve, removeTempfile, err = c.commit(ctx, key, legacy, blobFile, size, size, sizeOnDisk, random)
 	if err != nil {
 		return internalErr(err)
 	}
@@ -515,8 +527,23 @@ func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cac
 	return sizeOnDisk, nil
 }
 
+// orgFromContext resolves the org to attribute a written blob to: the
+// caller-supplied InstallationID when present, else the first path segment
+// of the request's storage prefix, else orgUnknown.
+func orgFromContext(ctx context.Context) string {
+	if labels, ok := cache.MetricsLabelsFromContext(ctx); ok && labels.InstallationID != "" {
+		return labels.InstallationID
+	}
+	if prefix, ok := cache.StoragePrefixFromContext(ctx); ok {
+		if seg, _, _ := strings.Cut(prefix, "/"); seg != "" {
+			return seg
+		}
+	}
+	return orgUnknown
+}
+
 // This must be called when the lock is not held.
-func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSize int64, logicalSize int64, sizeOnDisk int64, random string) (unreserve bool, removeTempfile bool, err error) {
+func (c *diskCache) commit(ctx context.Context, key string, legacy bool, tempfile string, reservedSize int64, logicalSize int64, sizeOnDisk int64, random string) (unreserve bool, removeTempfile bool, err error) {
 	unreserve = reservedSize > 0
 	removeTempfile = true
 
@@ -537,6 +564,8 @@ func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSiz
 		sizeOnDisk: sizeOnDisk,
 		legacy:     legacy,
 		random:     random,
+		addedAt:    time.Now().Unix(),
+		org:        orgFromContext(ctx),
 	}
 
 	if !c.lru.Add(key, newItem) {
@@ -900,7 +929,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		return nil, -1, internalErr(err)
 	}
 
-	unreserve, removeTempfile, err = c.commit(key, legacy, blobFile, size, foundSize, sizeOnDisk, random)
+	unreserve, removeTempfile, err = c.commit(ctx, key, legacy, blobFile, size, foundSize, sizeOnDisk, random)
 	if err != nil {
 		_ = rc.Close()
 		return nil, -1, internalErr(err)
