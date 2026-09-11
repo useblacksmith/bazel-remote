@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"syscall"
@@ -160,6 +161,15 @@ func (c *Config) setProxy() error {
 	}
 
 	if c.S3CloudStorage != nil {
+		// Canary toggle, read once at construction and threaded to every
+		// backend so it covers single-backend and map mode alike: Go-cache
+		// traffic bypasses the S3 backend entirely (reads answer clean
+		// misses, write-throughs are dropped).
+		goBackendDisconnect := os.Getenv("BAZEL_REMOTE_GO_BACKEND_DISCONNECT") == "1"
+		if goBackendDisconnect {
+			log.Println("Go-cache S3 backend disconnect enabled (BAZEL_REMOTE_GO_BACKEND_DISCONNECT=1): Go traffic will neither read from nor write to the S3 backend")
+		}
+
 		// Multi-backend mode: an allowlisted selector → backend map, one
 		// s3proxy backend (own minio client, transport, upload queue) per
 		// entry, routed per-request from the validated gRPC metadata
@@ -187,7 +197,8 @@ func (c *Config) setProxy() error {
 				c.S3CloudStorage.ConnRecycleInterval,
 				c.StorageMode, c.AccessLogger, c.ErrorLogger, numUploaders, maxQueuedUploads,
 				s3proxy.PrometheusMetrics(),
-				s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout))
+				s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout),
+				s3proxy.WithGoBackendDisconnect(goBackendDisconnect))
 			if err != nil {
 				return err
 			}
@@ -220,7 +231,8 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.ConnRecycleInterval,
 			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
 			s3proxy.PrometheusMetrics(),
-			s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout))
+			s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout),
+			s3proxy.WithGoBackendDisconnect(goBackendDisconnect))
 		return nil
 	}
 
