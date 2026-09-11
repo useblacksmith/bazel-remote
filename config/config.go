@@ -91,51 +91,54 @@ func (c *URLBackendConfig) validate(protocol string) error {
 
 // Config holds the top-level configuration for bazel-remote.
 type Config struct {
-	HTTPAddress                 string                    `yaml:"http_address"`
-	GRPCAddress                 string                    `yaml:"grpc_address"`
-	ProfileAddress              string                    `yaml:"profile_address"`
-	Dir                         string                    `yaml:"dir"`
-	MaxSize                     int                       `yaml:"max_size"`
-	MaxSizeHardLimit            int                       `yaml:"max_size_hard_limit"`
-	MaxEntries                  int64                     `yaml:"max_entries"`
-	StorageMode                 string                    `yaml:"storage_mode"`
-	ZstdImplementation          string                    `yaml:"zstd_implementation"`
-	HtpasswdFile                string                    `yaml:"htpasswd_file"`
-	LDAP                        *LDAPConfig               `yaml:"ldap,omitempty"`
-	MinTLSVersion               string                    `yaml:"min_tls_version"`
-	TLSCaFile                   string                    `yaml:"tls_ca_file"`
-	TLSCertFile                 string                    `yaml:"tls_cert_file"`
-	TLSKeyFile                  string                    `yaml:"tls_key_file"`
-	AllowUnauthenticatedReads   bool                      `yaml:"allow_unauthenticated_reads"`
-	S3CloudStorage              *S3CloudStorageConfig     `yaml:"s3_proxy,omitempty"`
-	AzBlobConfig                *AzBlobStorageConfig      `yaml:"azblob_proxy,omitempty"`
-	GoogleCloudStorage          *GoogleCloudStorageConfig `yaml:"gcs_proxy,omitempty"`
-	HTTPBackend                 *URLBackendConfig         `yaml:"http_proxy,omitempty"`
-	GRPCBackend                 *URLBackendConfig         `yaml:"grpc_proxy,omitempty"`
-	NumUploaders                int                       `yaml:"num_uploaders"`
-	MaxQueuedUploads            int                       `yaml:"max_queued_uploads"`
+	HTTPAddress               string                    `yaml:"http_address"`
+	GRPCAddress               string                    `yaml:"grpc_address"`
+	ProfileAddress            string                    `yaml:"profile_address"`
+	Dir                       string                    `yaml:"dir"`
+	MaxSize                   int                       `yaml:"max_size"`
+	MaxSizeHardLimit          int                       `yaml:"max_size_hard_limit"`
+	MaxEntries                int64                     `yaml:"max_entries"`
+	StorageMode               string                    `yaml:"storage_mode"`
+	ZstdImplementation        string                    `yaml:"zstd_implementation"`
+	HtpasswdFile              string                    `yaml:"htpasswd_file"`
+	LDAP                      *LDAPConfig               `yaml:"ldap,omitempty"`
+	MinTLSVersion             string                    `yaml:"min_tls_version"`
+	TLSCaFile                 string                    `yaml:"tls_ca_file"`
+	TLSCertFile               string                    `yaml:"tls_cert_file"`
+	TLSKeyFile                string                    `yaml:"tls_key_file"`
+	AllowUnauthenticatedReads bool                      `yaml:"allow_unauthenticated_reads"`
+	S3CloudStorage            *S3CloudStorageConfig     `yaml:"s3_proxy,omitempty"`
+	AzBlobConfig              *AzBlobStorageConfig      `yaml:"azblob_proxy,omitempty"`
+	GoogleCloudStorage        *GoogleCloudStorageConfig `yaml:"gcs_proxy,omitempty"`
+	HTTPBackend               *URLBackendConfig         `yaml:"http_proxy,omitempty"`
+	GRPCBackend               *URLBackendConfig         `yaml:"grpc_proxy,omitempty"`
+	NumUploaders              int                       `yaml:"num_uploaders"`
+	MaxQueuedUploads          int                       `yaml:"max_queued_uploads"`
 	// NumUploadersExplicit / MaxQueuedUploadsExplicit record whether the
 	// operator supplied the value (CLI flag set, or key present in the YAML
 	// file) as opposed to inheriting the default. perBackendUploadLimits
 	// needs presence, not value: an explicit `--num_uploaders 100` happens
 	// to equal defaultNumUploaders, and treating it as "unset" silently
 	// quarters the configured worker pool in multi-backend mode.
-	NumUploadersExplicit     bool `yaml:"-"`
-	MaxQueuedUploadsExplicit bool `yaml:"-"`
-	IdleTimeout                 time.Duration             `yaml:"idle_timeout"`
-	DisableHTTPACValidation     bool                      `yaml:"disable_http_ac_validation"`
-	DisableGRPCACDepsCheck      bool                      `yaml:"disable_grpc_ac_deps_check"`
-	EnableACKeyInstanceMangling bool                      `yaml:"enable_ac_key_instance_mangling"`
-	EnableEndpointMetrics       bool                      `yaml:"enable_endpoint_metrics"`
-	MetricsDurationBuckets      []float64                 `yaml:"endpoint_metrics_duration_buckets"`
-	HttpMetricsPrefix           bool                      `yaml:"http_metrics_prefix"`
-	ExperimentalRemoteAssetAPI  bool                      `yaml:"experimental_remote_asset_api"`
-	HTTPReadTimeout             time.Duration             `yaml:"http_read_timeout"`
-	HTTPWriteTimeout            time.Duration             `yaml:"http_write_timeout"`
-	AccessLogLevel              string                    `yaml:"access_log_level"`
-	LogTimezone                 string                    `yaml:"log_timezone"`
-	MaxBlobSize                 int64                     `yaml:"max_blob_size"`
-	MaxProxyBlobSize            int64                     `yaml:"max_proxy_blob_size"`
+	NumUploadersExplicit        bool          `yaml:"-"`
+	MaxQueuedUploadsExplicit    bool          `yaml:"-"`
+	IdleTimeout                 time.Duration `yaml:"idle_timeout"`
+	DisableHTTPACValidation     bool          `yaml:"disable_http_ac_validation"`
+	DisableGRPCACDepsCheck      bool          `yaml:"disable_grpc_ac_deps_check"`
+	EnableACKeyInstanceMangling bool          `yaml:"enable_ac_key_instance_mangling"`
+	EnableEndpointMetrics       bool          `yaml:"enable_endpoint_metrics"`
+	MetricsDurationBuckets      []float64     `yaml:"endpoint_metrics_duration_buckets"`
+	HttpMetricsPrefix           bool          `yaml:"http_metrics_prefix"`
+	ExperimentalRemoteAssetAPI  bool          `yaml:"experimental_remote_asset_api"`
+	HTTPReadTimeout             time.Duration `yaml:"http_read_timeout"`
+	HTTPWriteTimeout            time.Duration `yaml:"http_write_timeout"`
+	AccessLogLevel              string        `yaml:"access_log_level"`
+	LogTimezone                 string        `yaml:"log_timezone"`
+	MaxBlobSize                 int64         `yaml:"max_blob_size"`
+	MaxProxyBlobSize            int64         `yaml:"max_proxy_blob_size"`
+	// ReadChunkSizeBytes is the maximum ByteStream Read response payload.
+	// Zero keeps bazel-remote's 2 MiB default (server.maxChunkSize).
+	ReadChunkSizeBytes int64 `yaml:"read_chunk_size"`
 
 	// Fields that are created by combinations of the flags above.
 	ProxyBackend cache.Proxy
@@ -173,6 +176,10 @@ const (
 
 	multiBackendNumUploaders     = 25
 	multiBackendMaxQueuedUploads = 100000
+
+	// Must match server.maxChunkSize: the largest ByteStream Read Send
+	// the gRPC server will emit. Config cannot import server.
+	maxReadChunkSizeBytes = 2 * 1024 * 1024
 )
 
 var defaultDurationBuckets = []float64{.5, 1, 2.5, 5, 10, 20, 40, 80, 160, 320}
@@ -210,7 +217,8 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 	maxSizeHardLimit int,
 	maxEntries int64,
 	maxBlobSize int64,
-	maxProxyBlobSize int64) (*Config, error) {
+	maxProxyBlobSize int64,
+	readChunkSizeBytes int64) (*Config, error) {
 
 	c := Config{
 		HTTPAddress:                 httpAddress,
@@ -250,6 +258,7 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 		LogTimezone:                 logTimezone,
 		MaxBlobSize:                 maxBlobSize,
 		MaxProxyBlobSize:            maxProxyBlobSize,
+		ReadChunkSizeBytes:          readChunkSizeBytes,
 	}
 
 	err := validateConfig(&c)
@@ -436,6 +445,14 @@ func validateConfig(c *Config) error {
 
 	if c.MaxProxyBlobSize <= 0 {
 		return errors.New("the 'max_proxy_blob_size' flag/key must be a positive integer")
+	}
+
+	if c.ReadChunkSizeBytes < 0 {
+		return errors.New("the 'read_chunk_size' flag/key must not be negative")
+	}
+	if c.ReadChunkSizeBytes > maxReadChunkSizeBytes {
+		return fmt.Errorf("the 'read_chunk_size' flag/key %d exceeds the %d byte maximum",
+			c.ReadChunkSizeBytes, maxReadChunkSizeBytes)
 	}
 
 	if c.GoogleCloudStorage != nil && c.HTTPBackend != nil && c.S3CloudStorage != nil {
@@ -769,6 +786,7 @@ func get(ctx *cli.Context) (*Config, error) {
 		ctx.Int64("max_entries"),
 		ctx.Int64("max_blob_size"),
 		ctx.Int64("max_proxy_blob_size"),
+		ctx.Int64("read_chunk_size"),
 	)
 	if err != nil {
 		return nil, err

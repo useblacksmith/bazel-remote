@@ -22,7 +22,8 @@ import (
 
 const (
 	// The default maximum chunk size to write back to the client in Send calls.
-	// Inspired by Goma's FileBlob.FILE_CHUNK maxium size.
+	// Inspired by Goma's FileBlob.FILE_CHUNK maxium size. Must match
+	// config.maxReadChunkSizeBytes (the standalone --read_chunk_size ceiling).
 	maxChunkSize = 2 * 1024 * 1024 // 2M
 )
 

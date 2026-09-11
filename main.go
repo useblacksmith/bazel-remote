@@ -570,13 +570,20 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 
 	log.Println("Starting gRPC server on address", addr)
 
+	var grpcServerOpts []server.GRPCServerOption
+	if c.ReadChunkSizeBytes > 0 {
+		log.Printf("gRPC ByteStream read chunk size: %d bytes", c.ReadChunkSizeBytes)
+		grpcServerOpts = append(grpcServerOpts, server.WithReadChunkSizeBytes(c.ReadChunkSizeBytes))
+	}
+
 	return server.ListenAndServeGRPC(*grpcServer,
 		network, addr,
 		validateAC,
 		c.EnableACKeyInstanceMangling,
 		enableRemoteAssetAPI,
 		c.MaxBlobSize,
-		diskCache, c.AccessLogger, c.ErrorLogger)
+		diskCache, c.AccessLogger, c.ErrorLogger,
+		grpcServerOpts...)
 }
 
 type authenticator interface {

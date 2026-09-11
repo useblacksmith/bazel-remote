@@ -64,7 +64,8 @@ func WithReadLimits(maxActiveReads, maxBufferBytes int64) GRPCServerOption {
 }
 
 // WithReadChunkSizeBytes sets the maximum ByteStream response payload. Zero
-// preserves bazel-remote's default.
+// preserves bazel-remote's 2 MiB default. The standalone binary exposes this
+// as --read_chunk_size / YAML read_chunk_size.
 func WithReadChunkSizeBytes(chunkSizeBytes int64) GRPCServerOption {
 	return func(s *grpcServer) error {
 		if chunkSizeBytes < 0 {
