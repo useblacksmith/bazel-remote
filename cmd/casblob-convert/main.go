@@ -2,11 +2,13 @@
 // bazel-remote disk cache into zstd casblobs, so compressed-blobs/zstd reads
 // stream stored bytes instead of re-compressing on every read.
 //
-// It is deliberately simple: a single sequential loop that converts one
-// object at a time, with an optional sleep between objects and an optional
-// object limit per run. It is idempotent and resumable — every object is
-// converted (or skipped) independently, so the program can be stopped and
-// re-run at any time and it picks up whatever .v1 files remain.
+// It is deliberately simple: a pool of workers each converting one object
+// at a time, with an optional sleep between objects and an optional object
+// limit per run. It is idempotent and resumable — every object is converted
+// (or skipped) independently, so the program can be stopped and re-run at
+// any time and it picks up whatever .v1 files remain. On a quiesced node
+// run with -workers near the core count to saturate the NVMe; there is no
+// reason to go slow while the server is stopped.
 //
 // IT MUST ONLY RUN WHILE bazel-remote IS STOPPED. The server's in-memory
 // LRU index records each entry's exact filename (including the .v1 suffix);
@@ -41,6 +43,8 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
@@ -55,7 +59,8 @@ func main() {
 	dir := flag.String("dir", "/mnt/bazel-cache/data", "bazel-remote cache data directory")
 	tmp := flag.String("tmp", "", "temp dir for in-progress casblobs; must be on the same filesystem as -dir and OUTSIDE it (default: <dir>/../casblob-convert-tmp)")
 	limit := flag.Int("limit", 0, "stop after converting this many objects (0 = no limit)")
-	sleep := flag.Duration("sleep", 0, "pause between objects (rate limiting)")
+	sleep := flag.Duration("sleep", 0, "per-worker pause between objects (rate limiting)")
+	workers := flag.Int("workers", 8, "parallel conversion workers")
 	dryRun := flag.Bool("dry-run", false, "list what would be converted without touching anything")
 	force := flag.Bool("force", false, "skip the running-bazel-remote check (DANGEROUS)")
 	flag.Parse()
@@ -90,41 +95,64 @@ func main() {
 	}
 	log.Printf("found %d legacy .v1 CAS files under %s", len(files), *dir)
 
-	var converted, skipped, corrupt, failed int
-	var bytesIn, bytesOut int64
+	var converted, skipped, corrupt, failed, bytesIn, bytesOut int64
 	start := time.Now()
 
-	for _, path := range files {
-		if *limit > 0 && converted >= *limit {
-			break
-		}
-		if *dryRun {
+	if *dryRun {
+		for i, path := range files {
+			if *limit > 0 && i >= *limit {
+				break
+			}
 			fmt.Println(path)
-			converted++
-			continue
 		}
-		in, out, err := convertOne(zstd, *tmp, path)
-		switch {
-		case err == nil && out < 0: // skipped (zero-byte or already converted)
-			skipped++
-		case err == nil:
-			converted++
-			bytesIn += in
-			bytesOut += out
-		case err == errCorrupt:
-			corrupt++
-		default:
-			failed++
-			log.Printf("FAILED %s: %v", path, err)
-		}
-		if *sleep > 0 {
-			time.Sleep(*sleep)
-		}
+		return
 	}
 
-	log.Printf("done in %s: converted=%d skipped=%d corrupt-deleted=%d failed=%d", time.Since(start).Round(time.Second), converted, skipped, corrupt, failed)
-	if bytesIn > 0 {
-		log.Printf("bytes: %.1f GB raw -> %.1f GB casblob (%.2fx)", gb(bytesIn), gb(bytesOut), float64(bytesIn)/float64(bytesOut))
+	// -limit is approximate under parallelism: dispatch stops once the
+	// converted count reaches it, so in-flight workers may overshoot by up
+	// to -workers objects.
+	paths := make(chan string, 256)
+	var wg sync.WaitGroup
+	for i := 0; i < *workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range paths {
+				in, out, err := convertOne(zstd, *tmp, path)
+				switch {
+				case err == nil && out < 0: // skipped (zero-byte or already converted)
+					atomic.AddInt64(&skipped, 1)
+				case err == nil:
+					atomic.AddInt64(&converted, 1)
+					atomic.AddInt64(&bytesIn, in)
+					atomic.AddInt64(&bytesOut, out)
+				case err == errCorrupt:
+					atomic.AddInt64(&corrupt, 1)
+				default:
+					atomic.AddInt64(&failed, 1)
+					log.Printf("FAILED %s: %v", path, err)
+				}
+				if *sleep > 0 {
+					time.Sleep(*sleep)
+				}
+			}
+		}()
+	}
+	for _, path := range files {
+		if *limit > 0 && atomic.LoadInt64(&converted) >= int64(*limit) {
+			break
+		}
+		paths <- path
+	}
+	close(paths)
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	log.Printf("done in %s: converted=%d skipped=%d corrupt-deleted=%d failed=%d", elapsed.Round(time.Second), converted, skipped, corrupt, failed)
+	if bytesIn > 0 && elapsed > 0 {
+		log.Printf("bytes: %.1f GB raw -> %.1f GB casblob (%.2fx) at %.0f MB/s raw",
+			gb(bytesIn), gb(bytesOut), float64(bytesIn)/float64(bytesOut),
+			float64(bytesIn)/elapsed.Seconds()/(1<<20))
 	}
 	if failed > 0 {
 		os.Exit(1)
