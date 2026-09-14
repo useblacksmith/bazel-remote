@@ -14,6 +14,7 @@ import (
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 
 	"github.com/minio/minio-go/v7"
@@ -66,6 +67,12 @@ type s3Cache struct {
 	readDeadline time.Duration
 	objectKey    func(prefix string, hash string, kind cache.EntryKind) string
 	observer     cache.OperationObserver
+	// v1 CAS fallback (v2mode only): hydrate from the uncompressed v1
+	// keyspace on a cas.v2 miss, transcoding through v1FallbackTmpDir.
+	// See v1fallback.go.
+	v1Fallback       bool
+	v1FallbackTmpDir string
+	zstd             zstdimpl.ZstdImpl
 }
 
 type Option func(*s3Cache)
@@ -399,6 +406,15 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 
 	if c.v2mode {
 		c.objectKey = objectKeyV2
+		// The v1 fallback transcodes raw v1 objects to casblobs, which
+		// needs an encoder; reuse the same implementation the disk layer
+		// compresses with.
+		zi, err := zstdimpl.Get("go")
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize zstd for the s3proxy v1 fallback: %w", err)
+		}
+		c.zstd = zi
+		c.initV1Fallback()
 	} else {
 		c.objectKey = objectKeyV1
 	}
@@ -710,7 +726,7 @@ func skipGoActionCacheBackendLookup(ctx context.Context, kind cache.EntryKind) b
 	return path.Base(prefix) == "go"
 }
 
-func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (io.ReadCloser, int64, error) {
+func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64) (io.ReadCloser, int64, error) {
 	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
 	if requirePrefix && !requestScopedPrefix {
 		c.logMissingRequiredStoragePrefix("DOWNLOAD", kind, hash)
@@ -752,11 +768,18 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 		// everything else classifies as usual.
 		c.breaker.record(breakerReadOutcome(ctx, getErr))
 		cancel()
-		cacheMisses.WithLabelValues(c.key).Inc()
 		if minio.ToErrorResponse(getErr).Code == "NoSuchKey" {
+			if kind == cache.CAS && c.v1Fallback {
+				// The cas.v2 keyspace misses content that may still exist
+				// under the uncompressed v1 keys; hydrate from there.
+				logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, errNotFound)
+				return c.getV1Fallback(ctx, prefix, bucket, hash, size)
+			}
+			cacheMisses.WithLabelValues(c.key).Inc()
 			logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, errNotFound)
 			return nil, -1, nil
 		}
+		cacheMisses.WithLabelValues(c.key).Inc()
 		logResponse(c.accessLogger, "DOWNLOAD", bucket, objectKey, getErr)
 		return nil, -1, getErr
 	}
@@ -846,6 +869,18 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 		// A nil sink (the common case) makes this a no-op.
 		if sink, ok := cache.LeafSizeSinkFromContext(ctx); ok && s.Size >= 0 {
 			sink.RecordLeafSize(hash, s.Size, true)
+		}
+	}
+
+	if !exists && kind == cache.CAS && c.v1Fallback {
+		// Content absent from cas.v2 may still exist under the v1 keys.
+		// Reporting it present stops FindMissing from demanding a client
+		// re-upload; the next Get hydrates and promotes it. Size stays -1
+		// per the CAS/v2 convention, and the leaf-size sink is skipped:
+		// the v1 stat size is neither representation's final on-disk size.
+		if c.containsV1Fallback(ctx, prefix, bucket, hash) {
+			exists = true
+			err = nil
 		}
 	}
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"syscall"
 
 	"github.com/buchgr/bazel-remote/v2/cache/azblobproxy"
@@ -74,6 +75,16 @@ func getTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 		config.RootCAs = caCertPool
 	}
 	return config, nil
+}
+
+// v1FallbackTmpDir places the s3proxy v1-fallback transcode buffer NEXT TO
+// the cache dir, never inside it: the disk cache's startup scan
+// (cache/disk/load.go queueCacheDirs) hard-fails on any unknown directory
+// under the cache dir, so a buffer dir inside it would prevent the server
+// from starting. The sibling location keeps it on the same filesystem,
+// which is what actually matters (capacity for large blob transcodes).
+func v1FallbackTmpDir(cacheDir string) string {
+	return filepath.Join(filepath.Dir(filepath.Clean(cacheDir)), "s3-v1-fallback-tmp")
 }
 
 func (c *Config) setProxy() error {
@@ -187,7 +198,8 @@ func (c *Config) setProxy() error {
 				c.S3CloudStorage.ConnRecycleInterval,
 				c.StorageMode, c.AccessLogger, c.ErrorLogger, numUploaders, maxQueuedUploads,
 				s3proxy.PrometheusMetrics(),
-				s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout))
+				s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout),
+				s3proxy.WithV1FallbackTempDir(v1FallbackTmpDir(c.Dir)))
 			if err != nil {
 				return err
 			}
@@ -220,7 +232,8 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.ConnRecycleInterval,
 			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
 			s3proxy.PrometheusMetrics(),
-			s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout))
+			s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout),
+			s3proxy.WithV1FallbackTempDir(v1FallbackTmpDir(c.Dir)))
 		return nil
 	}
 
