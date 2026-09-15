@@ -14,6 +14,13 @@ type MetricsLabels struct {
 	BuildToolID    string
 	VMID           string
 	JobID          string
+
+	// L1Member is the "ip:port" of the L1 cache node the job's namespace
+	// set is pinned to at bind time (empty when the job runs without an
+	// L1). Carried so per-job accounting rows can be joined against
+	// per-node cache churn: "did evictions on node X slow anyone down"
+	// becomes a query instead of an investigation.
+	L1Member string
 }
 
 // WithMetricsLabels attaches caller-owned metrics labels to a request context.

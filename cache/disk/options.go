@@ -3,6 +3,7 @@ package disk
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
@@ -18,6 +19,28 @@ type CacheConfig struct {
 	metrics          *metricsDecorator // May be nil.
 	maxSizeHardLimit int64
 	maxEntries       int64
+
+	censusSink     ArtifactSink // May be nil (snapshots disabled).
+	censusInterval time.Duration
+	censusHost     string
+}
+
+// WithCensusSnapshots enables periodic tenant census snapshots: every
+// interval, per-tenant accumulators (resident bytes, put/hit/evict deltas,
+// eviction age distributions) are serialized as a JSONL artifact and
+// uploaded through sink under the tenant-prefix-free "census/" key space.
+// The in-memory accounting and its Prometheus metrics are always on; this
+// option only controls the snapshot export.
+func WithCensusSnapshots(sink ArtifactSink, interval time.Duration, host string) Option {
+	return func(c *CacheConfig) error {
+		if interval <= 0 {
+			return fmt.Errorf("census snapshot interval must be positive, got %s", interval)
+		}
+		c.censusSink = sink
+		c.censusInterval = interval
+		c.censusHost = host
+		return nil
+	}
 }
 
 func WithStorageMode(mode string) Option {
