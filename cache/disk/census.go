@@ -47,10 +47,12 @@ import (
 // Bump it on any breaking change to the JSONL format.
 const CensusArtifactSchemaVersion = 1
 
-// CensusArtifactKeyPrefix is the S3 key prefix for census snapshots. It
-// lives at the bucket root, outside every tenant storage prefix, so
+// DefaultCensusArtifactKeyPrefix is the default S3 key prefix for census
+// snapshots. Deployments override it (BAZEL_REMOTE_CENSUS_PREFIX) to sit
+// inside the key space their S3 credentials are scoped to — e.g.
+// "staging/l1-census/" — and outside every tenant storage prefix, so
 // tenant-scoped retention sweeps never touch it.
-const CensusArtifactKeyPrefix = "census/"
+const DefaultCensusArtifactKeyPrefix = "census/"
 
 // ArtifactSink uploads small metadata artifacts to the backing store. The
 // s3proxy backend satisfies this (same shape as lruflush.Sink).
@@ -425,10 +427,11 @@ func (r *censusRecorder) snapshot(host string) (CensusHeader, []CensusRow) {
 	return header, rows
 }
 
-// CensusArtifactKey returns the object key for a census snapshot. The
-// zero-padded window-end epoch-ms makes lexical (S3) listings chronological.
-func CensusArtifactKey(windowEndMs int64, host string) string {
-	return fmt.Sprintf("%s%020d-%s.jsonl", CensusArtifactKeyPrefix, windowEndMs, host)
+// CensusArtifactKey returns the object key for a census snapshot under the
+// given key prefix (which must end in "/"). The zero-padded window-end
+// epoch-ms makes lexical (S3) listings chronological.
+func CensusArtifactKey(keyPrefix string, windowEndMs int64, host string) string {
+	return fmt.Sprintf("%s%020d-%s.jsonl", keyPrefix, windowEndMs, host)
 }
 
 // writeCensusArtifact serializes a census snapshot as JSONL: the header on
@@ -486,11 +489,14 @@ func ReadCensusArtifact(r io.Reader) (CensusHeader, []CensusRow, error) {
 // it as a JSONL artifact through sink. Runs until the process exits. Upload
 // failures are logged and the window's deltas are dropped (best-effort:
 // census gates dashboards and investigations, not serving).
-func (c *diskCache) StartCensusSnapshots(sink ArtifactSink, interval time.Duration, host string) {
+func (c *diskCache) StartCensusSnapshots(sink ArtifactSink, interval time.Duration, keyPrefix string, host string) {
 	if c.census == nil || sink == nil || interval <= 0 {
 		return
 	}
-	log.Printf("Starting tenant census snapshots every %s", interval)
+	if keyPrefix == "" {
+		keyPrefix = DefaultCensusArtifactKeyPrefix
+	}
+	log.Printf("Starting tenant census snapshots every %s under %s", interval, keyPrefix)
 	go func() {
 		ticker := time.NewTicker(interval)
 		for range ticker.C {
@@ -503,7 +509,7 @@ func (c *diskCache) StartCensusSnapshots(sink ArtifactSink, interval time.Durati
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			key := CensusArtifactKey(header.WindowEndMs, host)
+			key := CensusArtifactKey(keyPrefix, header.WindowEndMs, host)
 			if err := sink.PutArtifact(ctx, key, []byte(buf.String())); err != nil {
 				log.Printf("ERROR: failed to upload census artifact %s: %v", key, err)
 			}

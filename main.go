@@ -201,8 +201,10 @@ func run(ctx *cli.Context) error {
 
 	// Tenant census snapshots: periodically export per-tenant cache
 	// accounting (resident bytes, put/hit/evict deltas, eviction age
-	// distributions) as JSONL artifacts under the "census/" key space of
-	// the backing store. Dark by default, same rollout posture as LRU
+	// distributions) as JSONL artifacts to the backing store, under
+	// BAZEL_REMOTE_CENSUS_PREFIX (a key space outside every tenant storage
+	// prefix that the deployment's scoped S3 credentials can write, e.g.
+	// "staging/l1-census/"). Dark by default, same rollout posture as LRU
 	// artifacts: enable per node by setting BAZEL_REMOTE_CENSUS_INTERVAL
 	// to a Go duration (e.g. "3h"). The in-memory accounting and its
 	// Prometheus age metrics are always on regardless of this setting.
@@ -216,8 +218,9 @@ func run(ctx *cli.Context) error {
 			if host == "" {
 				host = "unknown"
 			}
-			opts = append(opts, disk.WithCensusSnapshots(sink, interval, host))
-			log.Printf("Tenant census snapshots enabled: every %s to the backend's census/ key space", interval)
+			keyPrefix := os.Getenv("BAZEL_REMOTE_CENSUS_PREFIX")
+			opts = append(opts, disk.WithCensusSnapshots(sink, interval, keyPrefix, host))
+			log.Printf("Tenant census snapshots enabled: every %s", interval)
 		} else {
 			log.Println("Tenant census snapshots disabled: proxy backend cannot store artifacts (requires the S3 proxy)")
 		}
