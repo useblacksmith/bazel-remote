@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,6 +14,18 @@ import (
 
 // EvictCallback is the type of callbacks that are invoked when items are evicted.
 type EvictCallback func(key string, value lruItem)
+
+// IndexObserver receives synchronous notifications about LRU index
+// mutations, for tenant accounting and age metrics. All callbacks fire
+// under the diskCache mutex and MUST be O(1) memory-only operations: no
+// syscalls, no I/O, no locks that can block. The prevAccess argument of
+// OnAccess is the entry's lastAccess before this bump.
+type IndexObserver interface {
+	OnAdd(key string, value lruItem)
+	OnOverwrite(key string, oldValue lruItem, newValue lruItem)
+	OnEvict(key string, value lruItem)
+	OnAccess(key string, value lruItem, prevAccess uint32)
+}
 
 // SizedLRU is an LRU cache that will keep its total size below maxSize by evicting
 // items.
@@ -69,6 +82,11 @@ type SizedLRU struct {
 	queuedEvictionsChan chan []*entry
 
 	onEvict EvictCallback
+
+	// observer, when non-nil, receives index mutation callbacks (see
+	// IndexObserver). nowFn returns unix seconds and exists for tests.
+	observer IndexObserver
+	nowFn    func() uint32
 
 	gaugeCacheSizeBytes      prometheus.Gauge
 	gaugeCacheSizeBytesLimit *prometheus.GaugeVec
@@ -156,7 +174,12 @@ func NewSizedLRU(maxSize int64, onEvict EvictCallback, initialCapacity int) Size
 			},
 		}),
 		queuedEvictionsChan: make(chan []*entry, 1),
+		nowFn:               unixNow,
 	}
+}
+
+func unixNow() uint32 {
+	return uint32(time.Now().Unix())
 }
 
 func (c *SizedLRU) RegisterMetrics() {
@@ -204,6 +227,14 @@ func (c *SizedLRU) Add(key string, value lruItem) (ok bool) {
 	// time (unless Reserve method was used and evicted them).
 	c.calcTotalDiskSizeAndUpdatePeak(roundedUpSizeOnDisk)
 
+	// Stamp creation/access times unless the caller (the boot scan)
+	// pre-seeded them from file metadata.
+	if value.addedAt == 0 {
+		now := c.nowFn()
+		value.addedAt = now
+		value.lastAccess = now
+	}
+
 	var sizeDelta, uncompressedSizeDelta int64
 	if ee, ok := c.cache[key]; ok {
 		sizeDelta = roundedUpSizeOnDisk - roundUp4k(ee.Value.(*entry).value.sizeOnDisk)
@@ -218,6 +249,9 @@ func (c *SizedLRU) Add(key string, value lruItem) (ok bool) {
 		kvCopy := &entry{kv.key, kv.value}
 		c.appendEvictionToQueue(kvCopy)
 
+		if c.observer != nil {
+			c.observer.OnOverwrite(key, kv.value, value)
+		}
 		ee.Value.(*entry).value = value
 	} else {
 		sizeDelta = roundedUpSizeOnDisk
@@ -227,6 +261,9 @@ func (c *SizedLRU) Add(key string, value lruItem) (ok bool) {
 		uncompressedSizeDelta = roundUp4k(value.size)
 		ele := c.ll.PushFront(&entry{key, value})
 		c.cache[key] = ele
+		if c.observer != nil {
+			c.observer.OnAdd(key, value)
+		}
 	}
 
 	// Eviction. This is needed even if the key was already present, since the size of the
@@ -262,10 +299,17 @@ func (c *SizedLRU) Add(key string, value lruItem) (ok bool) {
 }
 
 // Get looks up a key in the cache. The lruItem is only valid if *list.Element is not nil.
+// A hit bumps the entry's recency and stamps lastAccess.
 func (c *SizedLRU) Get(key string) (lruItem, *list.Element) {
 	if ele, hit := c.cache[key]; hit {
 		c.ll.MoveToFront(ele)
-		return ele.Value.(*entry).value, ele
+		kv := ele.Value.(*entry)
+		prev := kv.value.lastAccess
+		kv.value.lastAccess = c.nowFn()
+		if c.observer != nil {
+			c.observer.OnAccess(key, kv.value, prev)
+		}
+		return kv.value, ele
 	}
 
 	return lruItem{}, nil
@@ -442,6 +486,9 @@ func (c *SizedLRU) removeElement(e *list.Element) {
 	c.currentSize -= roundUp4k(kv.value.sizeOnDisk)
 	c.uncompressedSize -= roundUp4k(kv.value.size)
 	c.counterEvictedBytes.Add(float64(kv.value.sizeOnDisk))
+	if c.observer != nil {
+		c.observer.OnEvict(kv.key, kv.value)
+	}
 	c.appendEvictionToQueue(kv)
 }
 

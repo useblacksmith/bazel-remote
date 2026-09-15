@@ -127,6 +127,10 @@ func New(dir string, maxSizeBytes int64, opts ...Option) (Cache, error) {
 		return nil, fmt.Errorf("loading of existing cache entries failed due to error: %w", err)
 	}
 
+	if cc.censusSink != nil && cc.censusInterval > 0 {
+		c.StartCensusSnapshots(cc.censusSink, cc.censusInterval, cc.censusKeyPrefix, cc.censusHost)
+	}
+
 	if cc.metrics == nil {
 		return &c, nil
 	}
@@ -494,6 +498,18 @@ func (c *diskCache) scanDir() (scanResult, error) {
 
 					metadata[n].ts = atime.Get(info)
 
+					// Seed timestamps from file metadata: blobs are
+					// written exactly once, so mtime is creation time.
+					// On noatime mounts atime is typically frozen at
+					// creation too, so post-boot entries look
+					// never-read until first touched; age metric
+					// consumers suppress the window after a restart.
+					item[n].addedAt = uint32(info.ModTime().Unix())
+					item[n].lastAccess = uint32(metadata[n].ts.Unix())
+					if item[n].lastAccess < item[n].addedAt {
+						item[n].lastAccess = item[n].addedAt
+					}
+
 					n++
 				}
 
@@ -659,6 +675,12 @@ func (c *diskCache) loadExistingFiles(maxSizeBytes int64, cc CacheConfig) error 
 
 	c.lru = NewSizedLRU(maxSizeBytes, onEvict, len(result.item))
 
+	// Wire the tenant census before the Add loop below, so the boot scan
+	// re-baselines per-tenant resident counters from disk state. Put/hit
+	// deltas accumulated during load are discarded (see below).
+	c.census = newCensusRecorder()
+	c.lru.observer = c.census
+
 	log.Printf("Will evict at max size: %.2f GB", bytesToGigaBytes(maxSizeBytes))
 
 	if cc.maxSizeHardLimit > 0 {
@@ -699,6 +721,11 @@ func (c *diskCache) loadExistingFiles(maxSizeBytes int64, cc CacheConfig) error 
 			}
 		}
 	}
+
+	// The boot scan is not traffic: keep the resident baseline it built,
+	// but discard the put/hit/evict deltas it accumulated so the first
+	// census window reflects only real requests.
+	c.census.resetWindowDeltas()
 
 	if c.lru.queuedEvictionsSize.Load() > 0 {
 		// We were either restarted with a lower cache size, or there is still

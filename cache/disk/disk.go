@@ -65,6 +65,20 @@ type lruItem struct {
 	// If true, the blob is a raw CAS file (no header, uncompressed)
 	// with a ".v1" filename suffix.
 	legacy bool
+
+	// addedAt is the entry's creation time in unix seconds: the commit
+	// time for entries written at runtime, or the file mtime for entries
+	// rebuilt by the boot scan (blobs are written exactly once, so mtime
+	// is the creation time). Zero means "stamp me on Add".
+	addedAt uint32
+
+	// lastAccess is the last recency bump in unix seconds. Memory-only
+	// (volumes are mounted noatime by design), so it resets to the boot
+	// scan's best guess after a restart — age-derived metrics are
+	// polluted for a few hours after a roll, and consumers of the
+	// derived metrics suppress accordingly. addedAt == lastAccess means
+	// the entry has never been read since creation.
+	lastAccess uint32
 }
 
 // diskCache is a filesystem-based LRU cache, with an optional backend proxy.
@@ -96,6 +110,10 @@ type diskCache struct {
 	mu  sync.Mutex
 	lru SizedLRU
 
+	// Tenant census and byte-weighted age accounting (see census.go).
+	// Wired as the LRU's IndexObserver in loadExistingFiles.
+	census *censusRecorder
+
 	gaugeCacheAge prometheus.Gauge
 }
 
@@ -119,6 +137,10 @@ func badReqErr(format string, a ...interface{}) *cache.Error {
 // Non-test users must call this to expose metrics.
 func (c *diskCache) RegisterMetrics() {
 	c.lru.RegisterMetrics()
+
+	if c.census != nil {
+		c.census.registerMetrics()
+	}
 
 	prometheus.MustRegister(c.gaugeCacheAge)
 
@@ -161,6 +183,17 @@ func (c *diskCache) updateCacheAgeMetric() {
 		// No items in the cache.
 		c.mu.Unlock()
 		return
+	}
+
+	// The retention window is the age of the LRU tail's in-memory access
+	// stamp: the current "evicted-after" horizon. Unlike the atime-based
+	// gauge below, this works on noatime mounts (but resets at restart).
+	if c.census != nil && value.lastAccess > 0 {
+		tailAge := time.Since(time.Unix(int64(value.lastAccess), 0)).Seconds()
+		if tailAge < 0 {
+			tailAge = 0
+		}
+		c.census.gaugeRetentionWindow.Set(tailAge)
 	}
 
 	age := 0.0
@@ -367,6 +400,10 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	key := cache.LookupKeyForContext(ctx, kind, hash)
 
+	if c.census != nil {
+		c.census.RecordTenant(ctx, key)
+	}
+
 	var tf *os.File // Tempfile.
 	var blobFile string
 
@@ -560,9 +597,13 @@ func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSiz
 func (c *diskCache) availableOrTryProxy(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (io.ReadCloser, int64, bool, error) {
 	locked := true
 	var err error
-	c.mu.Lock()
 
 	key := cache.LookupKeyForContext(ctx, kind, hash)
+	if c.census != nil {
+		c.census.RecordTenant(ctx, key)
+	}
+
+	c.mu.Lock()
 	item, listElem := c.lru.Get(key)
 	if listElem != nil {
 		c.mu.Unlock() // We expect a cache hit below.
