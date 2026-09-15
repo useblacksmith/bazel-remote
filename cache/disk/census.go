@@ -29,11 +29,7 @@ package disk
 // census rows carry an empty prefix alongside the prefix ID.
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"log"
 	"strings"
 	"sync"
@@ -43,21 +39,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// CensusArtifactSchemaVersion is stamped into every census artifact header.
-// Bump it on any breaking change to the JSONL format.
-const CensusArtifactSchemaVersion = 1
+// CensusSchemaVersion is stamped into every exported census row. Bump it on
+// any breaking change to the row shape. Additive fields do not need a bump:
+// the ClickHouse sink inserts with input_format_skip_unknown_fields=1, so a
+// fork that ships a new field before the table migration lands degrades to
+// dropping that field, never to failed inserts.
+const CensusSchemaVersion = 1
 
-// DefaultCensusArtifactKeyPrefix is the default S3 key prefix for census
-// snapshots. Deployments override it (BAZEL_REMOTE_CENSUS_PREFIX) to sit
-// inside the key space their S3 credentials are scoped to — e.g.
-// "staging/l1-census/" — and outside every tenant storage prefix, so
-// tenant-scoped retention sweeps never touch it.
-const DefaultCensusArtifactKeyPrefix = "census/"
-
-// ArtifactSink uploads small metadata artifacts to the backing store. The
-// s3proxy backend satisfies this (same shape as lruflush.Sink).
-type ArtifactSink interface {
-	PutArtifact(ctx context.Context, key string, body []byte) error
+// CensusSink receives one census snapshot per window. The ClickHouse HTTP
+// sink is the production implementation; the interface exists so tests can
+// capture snapshots without a server.
+type CensusSink interface {
+	PutCensus(ctx context.Context, header CensusHeader, rows []CensusRow) error
 }
 
 // Age bucket edges in seconds. The 72h edge is the Friday-push-Monday-build
@@ -418,7 +411,7 @@ func (r *censusRecorder) snapshot(host string) (CensusHeader, []CensusRow) {
 	r.mu.Unlock()
 
 	header := CensusHeader{
-		SchemaVersion: CensusArtifactSchemaVersion,
+		SchemaVersion: CensusSchemaVersion,
 		Host:          host,
 		WindowStartMs: startMs,
 		WindowEndMs:   endMs,
@@ -427,91 +420,25 @@ func (r *censusRecorder) snapshot(host string) (CensusHeader, []CensusRow) {
 	return header, rows
 }
 
-// CensusArtifactKey returns the object key for a census snapshot under the
-// given key prefix (which must end in "/"). The zero-padded window-end
-// epoch-ms makes lexical (S3) listings chronological.
-func CensusArtifactKey(keyPrefix string, windowEndMs int64, host string) string {
-	return fmt.Sprintf("%s%020d-%s.jsonl", keyPrefix, windowEndMs, host)
-}
-
-// writeCensusArtifact serializes a census snapshot as JSONL: the header on
-// the first line, then one CensusRow per line.
-func writeCensusArtifact(w io.Writer, header CensusHeader, rows []CensusRow) error {
-	enc := json.NewEncoder(w)
-	if err := enc.Encode(header); err != nil {
-		return err
-	}
-	for i := range rows {
-		if err := enc.Encode(rows[i]); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// ReadCensusArtifact parses a JSONL census artifact. Provided for Go
-// consumers and tests.
-func ReadCensusArtifact(r io.Reader) (CensusHeader, []CensusRow, error) {
-	var header CensusHeader
-
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-
-	if !sc.Scan() {
-		if err := sc.Err(); err != nil {
-			return header, nil, err
-		}
-		return header, nil, fmt.Errorf("census artifact: empty input")
-	}
-	if err := json.Unmarshal(sc.Bytes(), &header); err != nil {
-		return header, nil, fmt.Errorf("census artifact: bad header: %w", err)
-	}
-
-	var rows []CensusRow
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var row CensusRow
-		if err := json.Unmarshal(line, &row); err != nil {
-			return header, nil, fmt.Errorf("census artifact: bad row: %w", err)
-		}
-		rows = append(rows, row)
-	}
-	if err := sc.Err(); err != nil {
-		return header, nil, err
-	}
-	return header, rows, nil
-}
-
-// StartCensusSnapshots periodically snapshots the tenant census and uploads
-// it as a JSONL artifact through sink. Runs until the process exits. Upload
-// failures are logged and the window's deltas are dropped (best-effort:
-// census gates dashboards and investigations, not serving).
-func (c *diskCache) StartCensusSnapshots(sink ArtifactSink, interval time.Duration, keyPrefix string, host string) {
+// StartCensusSnapshots periodically snapshots the tenant census and exports
+// it through sink. Runs until the process exits. Export failures drop the
+// window's deltas (best-effort: census gates dashboards and investigations,
+// not serving — a tiny sample we can afford to lose).
+func (c *diskCache) StartCensusSnapshots(sink CensusSink, interval time.Duration, host string) {
 	if c.census == nil || sink == nil || interval <= 0 {
 		return
 	}
-	if keyPrefix == "" {
-		keyPrefix = DefaultCensusArtifactKeyPrefix
-	}
-	log.Printf("Starting tenant census snapshots every %s under %s", interval, keyPrefix)
+	log.Printf("Starting tenant census snapshots every %s", interval)
 	go func() {
 		ticker := time.NewTicker(interval)
 		for range ticker.C {
 			header, rows := c.census.snapshot(host)
 
-			var buf strings.Builder
-			if err := writeCensusArtifact(&buf, header, rows); err != nil {
-				log.Printf("ERROR: failed to serialize census artifact: %v", err)
-				continue
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			key := CensusArtifactKey(keyPrefix, header.WindowEndMs, host)
-			if err := sink.PutArtifact(ctx, key, []byte(buf.String())); err != nil {
-				log.Printf("ERROR: failed to upload census artifact %s: %v", key, err)
+			// The deadline bounds the sink's whole retry budget so a hung
+			// export can never overlap the next window's snapshot.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if err := sink.PutCensus(ctx, header, rows); err != nil {
+				log.Printf("ERROR: failed to export census snapshot (window dropped): %v", err)
 			}
 			cancel()
 		}

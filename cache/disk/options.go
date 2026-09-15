@@ -3,7 +3,6 @@ package disk
 import (
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -21,30 +20,23 @@ type CacheConfig struct {
 	maxSizeHardLimit int64
 	maxEntries       int64
 
-	censusSink      ArtifactSink // May be nil (snapshots disabled).
-	censusInterval  time.Duration
-	censusKeyPrefix string
-	censusHost      string
+	censusSink     CensusSink // May be nil (snapshots disabled).
+	censusInterval time.Duration
+	censusHost     string
 }
 
 // WithCensusSnapshots enables periodic tenant census snapshots: every
 // interval, per-tenant accumulators (resident bytes, put/hit/evict deltas,
-// eviction age distributions) are serialized as a JSONL artifact and
-// uploaded through sink under keyPrefix (a tenant-prefix-free key space the
-// deployment's S3 credentials can write, e.g. "staging/l1-census/"; empty
-// means DefaultCensusArtifactKeyPrefix). The in-memory accounting and its
-// Prometheus metrics are always on; this option only controls the export.
-func WithCensusSnapshots(sink ArtifactSink, interval time.Duration, keyPrefix string, host string) Option {
+// eviction age distributions) are exported through sink (production: the
+// ClickHouse HTTP sink). The in-memory accounting and its Prometheus metrics
+// are always on; this option only controls the export.
+func WithCensusSnapshots(sink CensusSink, interval time.Duration, host string) Option {
 	return func(c *CacheConfig) error {
 		if interval <= 0 {
 			return fmt.Errorf("census snapshot interval must be positive, got %s", interval)
 		}
-		if keyPrefix != "" && !strings.HasSuffix(keyPrefix, "/") {
-			return fmt.Errorf("census key prefix must end in '/', got %q", keyPrefix)
-		}
 		c.censusSink = sink
 		c.censusInterval = interval
-		c.censusKeyPrefix = keyPrefix
 		c.censusHost = host
 		return nil
 	}

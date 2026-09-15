@@ -201,29 +201,40 @@ func run(ctx *cli.Context) error {
 
 	// Tenant census snapshots: periodically export per-tenant cache
 	// accounting (resident bytes, put/hit/evict deltas, eviction age
-	// distributions) as JSONL artifacts to the backing store, under
-	// BAZEL_REMOTE_CENSUS_PREFIX (a key space outside every tenant storage
-	// prefix that the deployment's scoped S3 credentials can write, e.g.
-	// "staging/l1-census/"). Dark by default, same rollout posture as LRU
-	// artifacts: enable per node by setting BAZEL_REMOTE_CENSUS_INTERVAL
-	// to a Go duration (e.g. "3h"). The in-memory accounting and its
-	// Prometheus age metrics are always on regardless of this setting.
+	// distributions) straight to ClickHouse over its HTTP interface — one
+	// JSONEachRow INSERT per window, three attempts, then the window is
+	// dropped (advisory data; never buffered, never blocks serving). The
+	// backing store is deliberately not involved: census must not re-couple
+	// the node to the object store the extraction project is removing.
+	//
+	// Dark by default: enable per node by setting BAZEL_REMOTE_CENSUS_INTERVAL
+	// to a Go duration (e.g. "3h") plus the BAZEL_REMOTE_CLICKHOUSE_* trio.
+	// The credentials should be an INSERT-only ClickHouse role scoped to the
+	// census table. The in-memory accounting and its Prometheus age metrics
+	// are always on regardless of this setting.
 	if v := os.Getenv("BAZEL_REMOTE_CENSUS_INTERVAL"); v != "" {
 		interval, err := time.ParseDuration(v)
 		if err != nil || interval <= 0 {
 			log.Fatalf("Invalid BAZEL_REMOTE_CENSUS_INTERVAL %q: must be a positive Go duration, e.g. \"3h\"", v)
 		}
-		if sink, ok := c.ProxyBackend.(disk.ArtifactSink); ok {
-			host, _ := os.Hostname()
-			if host == "" {
-				host = "unknown"
-			}
-			keyPrefix := os.Getenv("BAZEL_REMOTE_CENSUS_PREFIX")
-			opts = append(opts, disk.WithCensusSnapshots(sink, interval, keyPrefix, host))
-			log.Printf("Tenant census snapshots enabled: every %s", interval)
-		} else {
-			log.Println("Tenant census snapshots disabled: proxy backend cannot store artifacts (requires the S3 proxy)")
+		chURL := os.Getenv("BAZEL_REMOTE_CLICKHOUSE_URL")
+		chUser := os.Getenv("BAZEL_REMOTE_CLICKHOUSE_USER")
+		chPassword := os.Getenv("BAZEL_REMOTE_CLICKHOUSE_PASSWORD")
+		if chURL == "" || chUser == "" {
+			// A set interval with missing endpoint config is a deployment
+			// mistake; fail loudly rather than silently exporting nothing.
+			log.Fatalf("BAZEL_REMOTE_CENSUS_INTERVAL is set but BAZEL_REMOTE_CLICKHOUSE_URL/USER are not")
 		}
+		sink, err := disk.NewClickHouseCensusSink(chURL, chUser, chPassword, os.Getenv("BAZEL_REMOTE_CLICKHOUSE_CENSUS_TABLE"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		host, _ := os.Hostname()
+		if host == "" {
+			host = "unknown"
+		}
+		opts = append(opts, disk.WithCensusSnapshots(sink, interval, host))
+		log.Printf("Tenant census snapshots enabled: every %s to ClickHouse", interval)
 	}
 
 	diskCache, err := disk.New(c.Dir, int64(c.MaxSize)*1024*1024*1024, opts...)

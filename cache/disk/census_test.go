@@ -2,7 +2,6 @@ package disk
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -229,54 +228,6 @@ func TestCensusOverwrite(t *testing.T) {
 	// Overwrites are not evictions.
 	if rows[0].EvictedBytes != 0 {
 		t.Errorf("EvictedBytes = %d, want 0", rows[0].EvictedBytes)
-	}
-}
-
-func TestCensusArtifactRoundTrip(t *testing.T) {
-	header := CensusHeader{
-		SchemaVersion: CensusArtifactSchemaVersion,
-		Host:          "bazel-l1-test-1",
-		WindowStartMs: 1000,
-		WindowEndMs:   2000,
-		TenantCount:   2,
-	}
-	rows := []CensusRow{
-		{
-			PrefixID:             "abc",
-			RawPrefix:            "bazelre/prod/1/2/go/",
-			ResidentBytes:        123,
-			ResidentEntries:      4,
-			PutBytes:             10,
-			EvictedBytes:         5,
-			EvictedByLastReadAge: []int64{1, 0, 0, 4, 0, 0, 0, 0, 0},
-		},
-		{PrefixID: "def", ResidentBytes: 9},
-	}
-
-	var sb strings.Builder
-	if err := writeCensusArtifact(&sb, header, rows); err != nil {
-		t.Fatal(err)
-	}
-
-	gotHeader, gotRows, err := ReadCensusArtifact(strings.NewReader(sb.String()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotHeader != header {
-		t.Errorf("header = %+v, want %+v", gotHeader, header)
-	}
-	if len(gotRows) != 2 {
-		t.Fatalf("rows = %d, want 2", len(gotRows))
-	}
-	if gotRows[0].PrefixID != "abc" || gotRows[0].ResidentBytes != 123 {
-		t.Errorf("row 0 = %+v", gotRows[0])
-	}
-	if len(gotRows[0].EvictedByLastReadAge) != censusNumBuckets {
-		t.Errorf("bucket array length = %d, want %d",
-			len(gotRows[0].EvictedByLastReadAge), censusNumBuckets)
-	}
-	if gotRows[1].ResidentBytes != 9 || gotRows[1].RawPrefix != "" {
-		t.Errorf("row 1 = %+v", gotRows[1])
 	}
 }
 
