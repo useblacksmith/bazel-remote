@@ -1190,3 +1190,36 @@ func TestGoBackendDisconnectOffGoPutStillEnqueues(t *testing.T) {
 		}
 	}
 }
+
+// Go-tenant LRU artifacts are part of the disconnect's "zero S3 ops"
+// contract: skipped as a successful no-op (an error would make the flusher
+// log every pass), counted on the skip counter. Key-based, because artifact
+// flushes run on timers whose contexts carry no tenant identity.
+func TestGoBackendDisconnectSkipsGoTenantArtifacts(t *testing.T) {
+	c := &s3Cache{key: "go-disconnect-artifacts", goBackendDisconnect: true}
+
+	skipsBefore := testutil.ToFloat64(backendUploadsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect))
+	if err := c.PutArtifact(context.Background(), "prd/10/123/go/lru/00000001-x.jsonl", []byte("{}")); err != nil {
+		t.Fatalf("skipped go artifact must be a successful no-op, got %v", err)
+	}
+	if got := testutil.ToFloat64(backendUploadsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect)) - skipsBefore; got != 1 {
+		t.Fatalf("expected 1 skipped artifact upload, got %v", got)
+	}
+}
+
+func TestGoTenantArtifactKey(t *testing.T) {
+	cases := map[string]bool{
+		"prd/10/123/go/lru/00000001-x.jsonl":    true,
+		"staging/42/9/v0/go/lru/x.jsonl":        true,
+		"go/lru/x.jsonl":                        true,
+		"prd/10/123/bazel/lru/00000001-x.jsonl": false,
+		"prd/10/123/go/cas.v2/ab/abcd":          false,
+		"lru/x.jsonl":                           false,
+		"prd/10/go":                             false,
+	}
+	for key, want := range cases {
+		if got := goTenantArtifactKey(key); got != want {
+			t.Errorf("goTenantArtifactKey(%q) = %v, want %v", key, got, want)
+		}
+	}
+}
