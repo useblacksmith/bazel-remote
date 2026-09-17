@@ -948,3 +948,278 @@ func TestGoActionCacheSkipDoesNotDialHungBackend(t *testing.T) {
 		t.Fatal("expected hung backend to be dialed for Bazel AC / Go CAS / unscoped AC")
 	}
 }
+
+func TestSkipBackendLookupReason(t *testing.T) {
+	goPrefix := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/go")
+	goTool := cache.WithMetricsLabels(context.Background(), cache.MetricsLabels{BuildToolID: "go"})
+	bazelPrefix := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/bazel")
+
+	cases := []struct {
+		name       string
+		disconnect bool
+		ctx        context.Context
+		kind       cache.EntryKind
+		reason     string
+		skip       bool
+	}{
+		{name: "off go prefix AC", disconnect: false, ctx: goPrefix, kind: cache.AC, reason: skipReasonGoAC, skip: true},
+		{name: "off go prefix CAS", disconnect: false, ctx: goPrefix, kind: cache.CAS, skip: false},
+		{name: "off go label CAS", disconnect: false, ctx: goTool, kind: cache.CAS, skip: false},
+		{name: "off bazel prefix AC", disconnect: false, ctx: bazelPrefix, kind: cache.AC, skip: false},
+		{name: "on go prefix AC", disconnect: true, ctx: goPrefix, kind: cache.AC, reason: skipReasonGoDisconnect, skip: true},
+		{name: "on go prefix CAS", disconnect: true, ctx: goPrefix, kind: cache.CAS, reason: skipReasonGoDisconnect, skip: true},
+		{name: "on go label AC", disconnect: true, ctx: goTool, kind: cache.AC, reason: skipReasonGoDisconnect, skip: true},
+		{name: "on go label CAS", disconnect: true, ctx: goTool, kind: cache.CAS, reason: skipReasonGoDisconnect, skip: true},
+		{name: "on bazel prefix AC", disconnect: true, ctx: bazelPrefix, kind: cache.AC, skip: false},
+		{name: "on bazel prefix CAS", disconnect: true, ctx: bazelPrefix, kind: cache.CAS, skip: false},
+		{name: "on unscoped AC", disconnect: true, ctx: context.Background(), kind: cache.AC, skip: false},
+		{name: "on unscoped CAS", disconnect: true, ctx: context.Background(), kind: cache.CAS, skip: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &s3Cache{goBackendDisconnect: tc.disconnect}
+			reason, skip := c.skipBackendLookupReason(tc.ctx, tc.kind)
+			if skip != tc.skip || reason != tc.reason {
+				t.Fatalf("skipBackendLookupReason = (%q, %v), want (%q, %v)", reason, skip, tc.reason, tc.skip)
+			}
+		})
+	}
+}
+
+// countingFakeS3Backend is fakeS3Backend with a request counter in front of
+// the endpoint — the seam for proving an operation never dialed the backend.
+func countingFakeS3Backend(t *testing.T, requests *atomic.Int64, buckets ...string) *s3Cache {
+	t.Helper()
+	backend := s3mem.New()
+	for _, bucket := range buckets {
+		if err := backend.CreateBucket(bucket); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inner := gofakes3.New(backend).Server()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core, err := minio.NewCore(u.Host, &minio.Options{
+		Creds:        credentials.NewStaticV4("KEY", "SECRET", ""),
+		Secure:       false,
+		BucketLookup: minio.BucketLookupPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return &s3Cache{
+		key:          backendKeyA,
+		mcore:        core,
+		bucket:       "default-bucket",
+		breaker:      newBreaker("test-counting-fake-s3", nil),
+		objectKey:    objectKeyV1,
+		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
+	}
+}
+
+// TestGoBackendDisconnectSkipsAllKinds pins the canary toggle's read side:
+// with the disconnect on, Go traffic (either detection signal) answers clean
+// misses for EVERY entry kind without dialing the backend — even for objects
+// the backend demonstrably holds — while non-Go traffic is untouched.
+func TestGoBackendDisconnectSkipsAllKinds(t *testing.T) {
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	var requests atomic.Int64
+	c := countingFakeS3Backend(t, &requests, "default-bucket")
+	c.key = "go-disconnect-lookups"
+	c.goBackendDisconnect = true
+
+	goPrefix := "prd/10/123/v0/go"
+	bazelPrefix := "prd/10/123/v0/bazel"
+	ctxGo := cache.WithStoragePrefix(context.Background(), goPrefix)
+	ctxGoTool := cache.WithMetricsLabels(context.Background(), cache.MetricsLabels{BuildToolID: "go"})
+	ctxBazel := cache.WithStoragePrefix(context.Background(), bazelPrefix)
+
+	seedS3Object(t, c, goPrefix, cache.AC, hash, "goac")
+	seedS3Object(t, c, goPrefix, cache.CAS, hash, "gocas")
+	seedS3Object(t, c, bazelPrefix, cache.AC, hash, "bzlac")
+	seedS3Object(t, c, bazelPrefix, cache.CAS, hash, "bzlcas")
+
+	seeded := requests.Load()
+	disconnectSkipsBefore := testutil.ToFloat64(backendLookupsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect))
+	goACSkipsBefore := testutil.ToFloat64(backendLookupsSkipped.WithLabelValues(c.key, skipReasonGoAC))
+
+	for _, signal := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{"go prefix", ctxGo},
+		{"go build tool label", ctxGoTool},
+	} {
+		for _, kind := range []cache.EntryKind{cache.AC, cache.CAS} {
+			rc, size, err := c.Get(signal.ctx, kind, hash, -1)
+			if rc != nil || size != -1 || err != nil {
+				if rc != nil {
+					_ = rc.Close()
+				}
+				t.Fatalf("%s %s Get = (%v, %d, %v), want skip miss", signal.name, kind, rc, size, err)
+			}
+			if exists, size := c.Contains(signal.ctx, kind, hash, -1); exists || size != -1 {
+				t.Fatalf("%s %s Contains = (%v, %d), want skip miss", signal.name, kind, exists, size)
+			}
+		}
+	}
+
+	if got := requests.Load() - seeded; got != 0 {
+		t.Fatalf("backend dialed %d times for disconnected Go traffic, want 0", got)
+	}
+	if got := testutil.ToFloat64(backendLookupsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect)) - disconnectSkipsBefore; got != 8 {
+		t.Fatalf("backendLookupsSkipped{reason=go_disconnect} delta = %v, want 8", got)
+	}
+	// With the toggle on, Go AC skips count under go_disconnect, not go_ac,
+	// so dashboards can tell the canary apart from the steady-state skip.
+	if got := testutil.ToFloat64(backendLookupsSkipped.WithLabelValues(c.key, skipReasonGoAC)) - goACSkipsBefore; got != 0 {
+		t.Fatalf("backendLookupsSkipped{reason=go_ac} delta = %v, want 0", got)
+	}
+
+	for _, kind := range []cache.EntryKind{cache.AC, cache.CAS} {
+		rc, _, err := c.Get(ctxBazel, kind, hash, -1)
+		if err != nil || rc == nil {
+			t.Fatalf("bazel %s Get = (%v, %v), want hit", kind, rc, err)
+		}
+		_ = rc.Close()
+		if exists, _ := c.Contains(ctxBazel, kind, hash, -1); !exists {
+			t.Fatalf("bazel %s Contains = false, want true", kind)
+		}
+	}
+	if got := requests.Load() - seeded; got == 0 {
+		t.Fatal("expected non-Go traffic to dial the backend with the disconnect on")
+	}
+}
+
+// TestGoBackendDisconnectPutSkipsEnqueue pins the canary toggle's write
+// side: with the disconnect on, a Go Put closes the payload and returns
+// without enqueueing, counted on backendUploadsSkipped and — critically —
+// with NO operation outcome (dropped/error/rejected statuses are consumed
+// by the web-side accounting as failures).
+func TestGoBackendDisconnectPutSkipsEnqueue(t *testing.T) {
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	uploadQueue := make(chan backendproxy.UploadReq, 2)
+	observer := &recordingObserver{}
+	c := &s3Cache{
+		key:                 "go-disconnect-put",
+		uploadQueue:         uploadQueue,
+		observer:            observer,
+		goBackendDisconnect: true,
+	}
+
+	skipsBefore := testutil.ToFloat64(backendUploadsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect))
+
+	ctxGoPrefix := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/go")
+	ctxGoTool := cache.WithMetricsLabels(context.Background(), cache.MetricsLabels{BuildToolID: "go"})
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		kind cache.EntryKind
+	}{
+		{"go prefix CAS", ctxGoPrefix, cache.CAS},
+		{"go prefix AC", ctxGoPrefix, cache.AC},
+		{"go build tool label CAS", ctxGoTool, cache.CAS},
+		{"go build tool label AC", ctxGoTool, cache.AC},
+	} {
+		rc := &closeRecorder{Reader: strings.NewReader("blob")}
+		c.Put(tc.ctx, tc.kind, hash, 4, 4, rc)
+		if !rc.closed {
+			t.Fatalf("%s: expected skipped Put to close the reader", tc.name)
+		}
+		select {
+		case <-uploadQueue:
+			t.Fatalf("%s: skipped Put reached the upload queue", tc.name)
+		default:
+		}
+	}
+
+	if got := testutil.ToFloat64(backendUploadsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect)) - skipsBefore; got != 4 {
+		t.Fatalf("backendUploadsSkipped{reason=go_disconnect} delta = %v, want 4", got)
+	}
+	if len(observer.outcomes) != 0 {
+		t.Fatalf("observer outcomes = %+v, want none for policy skips", observer.outcomes)
+	}
+
+	// Non-Go traffic still write-throughs with the disconnect on.
+	c.Put(cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/bazel"), cache.CAS, hash, 4, 4,
+		io.NopCloser(strings.NewReader("blob")))
+	select {
+	case item := <-uploadQueue:
+		_ = item.Rc.Close()
+	default:
+		t.Fatal("expected non-Go Put to enqueue with the disconnect on")
+	}
+}
+
+// TestGoBackendDisconnectOffGoPutStillEnqueues pins the toggle-off contract:
+// without the disconnect, Go traffic write-throughs exactly as before, for
+// both entry kinds.
+func TestGoBackendDisconnectOffGoPutStillEnqueues(t *testing.T) {
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	uploadQueue := make(chan backendproxy.UploadReq, 1)
+	c := &s3Cache{uploadQueue: uploadQueue}
+
+	ctxGo := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/go")
+	ctxGoTool := cache.WithMetricsLabels(context.Background(), cache.MetricsLabels{BuildToolID: "go"})
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		kind cache.EntryKind
+	}{
+		{"go prefix CAS", ctxGo, cache.CAS},
+		{"go prefix AC", ctxGo, cache.AC},
+		{"go build tool label CAS", ctxGoTool, cache.CAS},
+	} {
+		c.Put(tc.ctx, tc.kind, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
+		select {
+		case item := <-uploadQueue:
+			_ = item.Rc.Close()
+		default:
+			t.Fatalf("%s: toggle-off Go Put did not enqueue", tc.name)
+		}
+	}
+}
+
+// Go-tenant LRU artifacts are part of the disconnect's "zero S3 ops"
+// contract: skipped as a successful no-op (an error would make the flusher
+// log every pass), counted on the skip counter. Key-based, because artifact
+// flushes run on timers whose contexts carry no tenant identity.
+func TestGoBackendDisconnectSkipsGoTenantArtifacts(t *testing.T) {
+	c := &s3Cache{key: "go-disconnect-artifacts", goBackendDisconnect: true}
+
+	skipsBefore := testutil.ToFloat64(backendUploadsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect))
+	if err := c.PutArtifact(context.Background(), "prd/10/123/go/lru/00000001-x.jsonl", []byte("{}")); err != nil {
+		t.Fatalf("skipped go artifact must be a successful no-op, got %v", err)
+	}
+	if got := testutil.ToFloat64(backendUploadsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect)) - skipsBefore; got != 1 {
+		t.Fatalf("expected 1 skipped artifact upload, got %v", got)
+	}
+}
+
+func TestGoTenantArtifactKey(t *testing.T) {
+	cases := map[string]bool{
+		"prd/10/123/go/lru/00000001-x.jsonl":    true,
+		"staging/42/9/v0/go/lru/x.jsonl":        true,
+		"go/lru/x.jsonl":                        true,
+		"prd/10/123/bazel/lru/00000001-x.jsonl": false,
+		"prd/10/123/go/cas.v2/ab/abcd":          false,
+		"lru/x.jsonl":                           false,
+		"prd/10/go":                             false,
+	}
+	for key, want := range cases {
+		if got := goTenantArtifactKey(key); got != want {
+			t.Errorf("goTenantArtifactKey(%q) = %v, want %v", key, got, want)
+		}
+	}
+}

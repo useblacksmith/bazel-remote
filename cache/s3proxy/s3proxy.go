@@ -59,6 +59,12 @@ type s3Cache struct {
 	metrics          Metrics
 	v2mode           bool
 	updateTimestamps bool
+	// goBackendDisconnect severs Go-cache traffic from this backend
+	// entirely (BAZEL_REMOTE_GO_BACKEND_DISCONNECT=1): Get and Contains
+	// answer clean misses and Put drops the write-through before the upload
+	// queue, leaving the local disk cache as the only tier for Go. Canary
+	// toggle — flipping the env var is the whole roll-in/roll-out.
+	goBackendDisconnect bool
 	// readDeadline is the overall bound on one read-path call including the
 	// streamed body; defaults to the package-level readDeadline, overridable
 	// via WithReadDeadline. Connection failure is bounded separately and
@@ -76,6 +82,15 @@ func WithOperationObserver(observer cache.OperationObserver) Option {
 	}
 }
 
+// WithGoBackendDisconnect controls whether Go-cache requests bypass this
+// backend entirely, for every entry kind and operation (see
+// s3Cache.goBackendDisconnect).
+func WithGoBackendDisconnect(enabled bool) Option {
+	return func(c *s3Cache) {
+		c.goBackendDisconnect = enabled
+	}
+}
+
 var (
 	cacheHits = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_cache_hits",
@@ -88,6 +103,10 @@ var (
 	backendLookupsSkipped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_backend_lookups_skipped_total",
 		Help: "S3 backend Get/Contains lookups skipped without dialing MinIO.",
+	}, []string{"backend", "reason"})
+	backendUploadsSkipped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "bazel_remote_s3_backend_uploads_skipped_total",
+		Help: "S3 backend write-through uploads skipped by policy before enqueueing.",
 	}, []string{"backend", "reason"})
 	uploadQueueDropped = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_upload_queue_dropped_total",
@@ -630,6 +649,16 @@ func classifyUploadOutcome(err error) (status string, reason string) {
 }
 
 func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
+	if c.goBackendDisconnect && isGoRequest(ctx) {
+		// Drop the write-through before the upload queue. Deliberately NO
+		// ObserveOperation outcome: the web-side accounting counts the
+		// dropped/error/rejected statuses as failures (see
+		// classifyUploadOutcome), and this skip is policy, not a failure —
+		// the Prometheus counter is the signal.
+		backendUploadsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect).Inc()
+		_ = rc.Close()
+		return
+	}
 	if c.uploadQueue == nil {
 		_ = rc.Close()
 		return
@@ -689,17 +718,15 @@ func (c *s3Cache) UpdateModificationTimestamp(ctx context.Context, bucket string
 	logResponse(c.accessLogger, "COMPOSE", bucket, object, err)
 }
 
-const skipReasonGoAC = "go_ac"
+const (
+	skipReasonGoAC         = "go_ac"
+	skipReasonGoDisconnect = "go_disconnect"
+)
 
-// skipGoActionCacheBackendLookup reports whether Get/Contains should skip MinIO.
-// Go AC Get is dominated by never-stored ActionIDs; checking MinIO cannot hit
-// and floods 404s. CAS still hydrates from MinIO. After L1 eviction, Go AC will
-// miss instead of filling from L2 — acceptable because successful S3 AC fills
-// are ~0.01% of this traffic.
-func skipGoActionCacheBackendLookup(ctx context.Context, kind cache.EntryKind) bool {
-	if kind != cache.AC {
-		return false
-	}
+// isGoRequest reports whether the request is Go-cache traffic, identified by
+// either signal: the forwarded metrics labels carry BuildToolID "go", or the
+// tenant storage prefix's last segment (the build tool by convention) is "go".
+func isGoRequest(ctx context.Context) bool {
 	if labels, ok := cache.MetricsLabelsFromContext(ctx); ok && labels.BuildToolID == "go" {
 		return true
 	}
@@ -710,13 +737,37 @@ func skipGoActionCacheBackendLookup(ctx context.Context, kind cache.EntryKind) b
 	return path.Base(prefix) == "go"
 }
 
+// skipGoActionCacheBackendLookup reports whether Get/Contains should skip MinIO.
+// Go AC Get is dominated by never-stored ActionIDs; checking MinIO cannot hit
+// and floods 404s. CAS still hydrates from MinIO. After L1 eviction, Go AC will
+// miss instead of filling from L2 — acceptable because successful S3 AC fills
+// are ~0.01% of this traffic.
+func skipGoActionCacheBackendLookup(ctx context.Context, kind cache.EntryKind) bool {
+	return kind == cache.AC && isGoRequest(ctx)
+}
+
+// skipBackendLookupReason resolves whether a Get/Contains should skip MinIO,
+// and under which backendLookupsSkipped reason: go_disconnect covers every
+// entry kind while the disconnect toggle is on, go_ac is the always-on
+// AC-only skip. Distinct reasons let dashboards tell the canary's full
+// disconnect apart from the steady-state AC optimization.
+func (c *s3Cache) skipBackendLookupReason(ctx context.Context, kind cache.EntryKind) (string, bool) {
+	if c.goBackendDisconnect && isGoRequest(ctx) {
+		return skipReasonGoDisconnect, true
+	}
+	if skipGoActionCacheBackendLookup(ctx, kind) {
+		return skipReasonGoAC, true
+	}
+	return "", false
+}
+
 func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (io.ReadCloser, int64, error) {
 	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
 	if requirePrefix && !requestScopedPrefix {
 		c.logMissingRequiredStoragePrefix("DOWNLOAD", kind, hash)
 	}
-	if skipGoActionCacheBackendLookup(ctx, kind) {
-		backendLookupsSkipped.WithLabelValues(c.key, skipReasonGoAC).Inc()
+	if reason, skip := c.skipBackendLookupReason(ctx, kind); skip {
+		backendLookupsSkipped.WithLabelValues(c.key, reason).Inc()
 		return nil, -1, nil
 	}
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
@@ -803,8 +854,8 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	if requirePrefix && !requestScopedPrefix {
 		c.logMissingRequiredStoragePrefix("CONTAINS", kind, hash)
 	}
-	if skipGoActionCacheBackendLookup(ctx, kind) {
-		backendLookupsSkipped.WithLabelValues(c.key, skipReasonGoAC).Inc()
+	if reason, skip := c.skipBackendLookupReason(ctx, kind); skip {
+		backendLookupsSkipped.WithLabelValues(c.key, reason).Inc()
 		return false, -1
 	}
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
