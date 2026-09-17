@@ -3,6 +3,8 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "go_default_library",
     srcs = [
+        "census.go",
+        "census_clickhouse.go",
         "disk.go",
         "findmissing.go",
         "load.go",
@@ -36,6 +38,8 @@ go_library(
 go_test(
     name = "go_default_test",
     srcs = [
+        "census_clickhouse_test.go",
+        "census_test.go",
         "disk_test.go",
         "findmissing_test.go",
         "lru_capture_bench_test.go",
