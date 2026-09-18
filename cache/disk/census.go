@@ -137,7 +137,7 @@ func newCensusRecorder() *censusRecorder {
 
 		evictedBytesByAge: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "bazel_remote_disk_cache_evicted_bytes_by_age",
-			Help: "Bytes evicted from the disk cache, bucketed by age at eviction. age_kind is last_read (time since the entry was last read: evicted still-live bytes are the harm signal) or created (time since the entry was written: write-once bytes dying young are the garbage signal).",
+			Help: "Bytes evicted from the disk cache, bucketed by age at eviction. age_kind is last_read (time since the entry was last read: evicted still-live bytes are the harm signal), never_read (bucketed by created age, never-read entries only: young bands mean writes evicted before their first read), or created (time since the entry was written, every eviction: the superset of the other two).",
 		}, []string{"age_kind", "age_bucket", "tool"}),
 
 		accessIntervalByAge: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -271,13 +271,18 @@ func (r *censusRecorder) OnEvict(key string, value lruItem) {
 
 	sz := float64(value.sizeOnDisk)
 	// Never-read entries have no last read: they are counted in the
-	// never-read counter and the created-age buckets only, so the
-	// last_read series stays a pure harm signal (bytes someone actually
-	// used, evicted anyway). This also gives thrash alerts built-in
-	// restart tolerance: boot-scanned entries look never-read until first
-	// touched, so a roll cannot fabricate still-live evictions.
+	// never-read counter, a never_read age series (bucketed by CREATED
+	// age — a never-read entry evicted minutes after writing means the
+	// cache could not hold a write until its first read, and burying it
+	// in the aggregate created bands made that failure look healthy),
+	// and the created-age buckets. The last_read series stays a pure
+	// harm signal (bytes someone actually used, evicted anyway). This
+	// also gives thrash alerts built-in restart tolerance: boot-scanned
+	// entries look never-read until first touched, so a roll cannot
+	// fabricate still-live evictions.
 	if neverRead {
 		r.evictedNeverReadBytes.WithLabelValues(tool).Add(sz)
+		r.evictedBytesByAge.WithLabelValues("never_read", censusBucketLabels[createdIdx], tool).Add(sz)
 	} else {
 		r.evictedBytesByAge.WithLabelValues("last_read", censusBucketLabels[lastReadIdx], tool).Add(sz)
 	}

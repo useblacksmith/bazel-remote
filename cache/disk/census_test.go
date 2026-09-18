@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestCensusBucketIdx(t *testing.T) {
@@ -152,6 +154,12 @@ func TestCensusAccounting(t *testing.T) {
 	}
 	if rows3[0].EvictedNeverReadBytes != 200 {
 		t.Errorf("EvictedNeverReadBytes = %d, want 200", rows3[0].EvictedNeverReadBytes)
+	}
+	// The never_read Prometheus series buckets by CREATED age (14h -> 24h
+	// band): a young never-read eviction must be visible as such, not
+	// buried in the aggregate created bands.
+	if got := testutil.ToFloat64(rec.evictedBytesByAge.WithLabelValues("never_read", "24h", "go")); got != 200 {
+		t.Errorf("never_read 24h band = %v, want 200", got)
 	}
 	// B's last read is its creation stamp, 14h before eviction: not live.
 	if rows3[0].EvictedLiveBytes != 0 {
