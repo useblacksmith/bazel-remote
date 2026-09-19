@@ -123,9 +123,11 @@ type censusRecorder struct {
 
 	// Prometheus collectors. Labels are {age_kind, age_bucket, tool} /
 	// {age_bucket, tool} / {tool}: bounded cardinality, no tenant labels.
-	evictedBytesByAge     *prometheus.CounterVec
-	accessIntervalByAge   *prometheus.CounterVec
-	evictedNeverReadBytes *prometheus.CounterVec
+	evictedBytesByAge       *prometheus.CounterVec
+	evictedEntriesByAge     *prometheus.CounterVec
+	accessIntervalByAge     *prometheus.CounterVec
+	evictedNeverReadBytes   *prometheus.CounterVec
+	evictedNeverReadEntries *prometheus.CounterVec
 	gaugeRetentionWindow  prometheus.Gauge
 }
 
@@ -140,6 +142,11 @@ func newCensusRecorder() *censusRecorder {
 			Help: "Bytes evicted from the disk cache, bucketed by age at eviction. age_kind is last_read (time since the entry was last read: evicted still-live bytes are the harm signal) or created (time since the entry was written: write-once bytes dying young are the garbage signal).",
 		}, []string{"age_kind", "age_bucket", "tool"}),
 
+		evictedEntriesByAge: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "bazel_remote_disk_cache_evicted_entries_by_age",
+			Help: "Entries evicted from the disk cache, bucketed by age at eviction: the item-count twin of evicted_bytes_by_age (same age_kind semantics).",
+		}, []string{"age_kind", "age_bucket", "tool"}),
+
 		accessIntervalByAge: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "bazel_remote_disk_cache_access_interval_bytes",
 			Help: "Bytes re-read from the disk cache, bucketed by time since the previous read: each workload's re-read cadence, byte-weighted.",
@@ -148,6 +155,11 @@ func newCensusRecorder() *censusRecorder {
 		evictedNeverReadBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "bazel_remote_disk_cache_evicted_never_read_bytes",
 			Help: "Bytes evicted without ever having been read since creation. High never-read share plus low hit ratio indicates a cache-hostile workload rather than genuine churn.",
+		}, []string{"tool"}),
+
+		evictedNeverReadEntries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "bazel_remote_disk_cache_evicted_never_read_entries",
+			Help: "Entries evicted without ever having been read since creation: the item-count twin of evicted_never_read_bytes.",
 		}, []string{"tool"}),
 
 		gaugeRetentionWindow: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -159,8 +171,10 @@ func newCensusRecorder() *censusRecorder {
 
 func (r *censusRecorder) registerMetrics() {
 	prometheus.MustRegister(r.evictedBytesByAge)
+	prometheus.MustRegister(r.evictedEntriesByAge)
 	prometheus.MustRegister(r.accessIntervalByAge)
 	prometheus.MustRegister(r.evictedNeverReadBytes)
+	prometheus.MustRegister(r.evictedNeverReadEntries)
 	prometheus.MustRegister(r.gaugeRetentionWindow)
 }
 
@@ -278,10 +292,13 @@ func (r *censusRecorder) OnEvict(key string, value lruItem) {
 	// touched, so a roll cannot fabricate still-live evictions.
 	if neverRead {
 		r.evictedNeverReadBytes.WithLabelValues(tool).Add(sz)
+		r.evictedNeverReadEntries.WithLabelValues(tool).Inc()
 	} else {
 		r.evictedBytesByAge.WithLabelValues("last_read", censusBucketLabels[lastReadIdx], tool).Add(sz)
+		r.evictedEntriesByAge.WithLabelValues("last_read", censusBucketLabels[lastReadIdx], tool).Inc()
 	}
 	r.evictedBytesByAge.WithLabelValues("created", censusBucketLabels[createdIdx], tool).Add(sz)
+	r.evictedEntriesByAge.WithLabelValues("created", censusBucketLabels[createdIdx], tool).Inc()
 }
 
 func (r *censusRecorder) OnAccess(key string, value lruItem, prevAccess uint32) {
