@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestCensusBucketIdx(t *testing.T) {
@@ -152,6 +154,14 @@ func TestCensusAccounting(t *testing.T) {
 	}
 	if rows3[0].EvictedNeverReadBytes != 200 {
 		t.Errorf("EvictedNeverReadBytes = %d, want 200", rows3[0].EvictedNeverReadBytes)
+	}
+	// Entry-count twins: B is one never-read entry; A was one previously-read
+	// entry in the 24h last_read band (evicted 14h after its last read).
+	if got := testutil.ToFloat64(rec.evictedNeverReadEntries.WithLabelValues("go")); got != 1 {
+		t.Errorf("evictedNeverReadEntries = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(rec.evictedEntriesByAge.WithLabelValues("last_read", "24h", "go")); got != 1 {
+		t.Errorf("evictedEntriesByAge last_read 24h = %v, want 1", got)
 	}
 	// B's last read is its creation stamp, 14h before eviction: not live.
 	if rows3[0].EvictedLiveBytes != 0 {
