@@ -42,14 +42,14 @@ const (
 // cache read needs to close the breaker.
 func (c *s3Cache) PutArtifact(ctx context.Context, key string, body []byte) error {
 	bucket := c.bucketForContext(ctx)
-	// Under the Go backend disconnect, Go-tenant LRU artifacts are skipped
-	// along with the cache bytes they describe: the artifacts' only consumer
-	// (the web retention sweep) is paused for Go namespaces during the
-	// canary, and "Go namespaces produce zero S3 ops" is the cut's whole
-	// contract. A skipped advisory upload is a successful no-op, not an
-	// error — failing it would make the flusher log every pass.
-	if c.goBackendDisconnect && goTenantArtifactKey(key) {
-		backendUploadsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect).Inc()
+	// Under a backend disconnect, that tool's tenant LRU artifacts are
+	// skipped along with the cache bytes they describe: the artifacts' only
+	// consumer (the web retention sweep) is paused for those namespaces, and
+	// "a disconnected tool produces zero S3 ops" is the cut's whole contract.
+	// A skipped advisory upload is a successful no-op, not an error —
+	// failing it would make the flusher log every pass.
+	if reason, disconnected := c.disconnectedArtifactReason(key); disconnected {
+		backendUploadsSkipped.WithLabelValues(c.key, reason).Inc()
 		return nil
 	}
 	if !c.breaker.isClosed() {
@@ -66,20 +66,27 @@ func (c *s3Cache) PutArtifact(ctx context.Context, key string, body []byte) erro
 	return err
 }
 
-// goTenantArtifactKey reports whether an artifact key sits inside a Go-cache
-// tenant namespace: the artifact segment ("lru/", and any future sibling)
-// nested directly under a tool segment of "go" (keys are
+// disconnectedArtifactReason reports whether an artifact key sits inside a
+// disconnected tool's tenant namespace, and under which skip reason: the
+// artifact segment ("lru/", and any future sibling) nested directly under a
+// disconnected tool segment (keys are
 // <env>/<installation>/<repo>/<tool>/lru/<name>). Keyed on the key rather
 // than the request context because artifact flushes run on timers whose
 // contexts carry no tenant identity.
-func goTenantArtifactKey(key string) bool {
+func (c *s3Cache) disconnectedArtifactReason(key string) (string, bool) {
+	if len(c.disconnectedTools) == 0 {
+		return "", false
+	}
 	segments := strings.Split(key, "/")
 	for i := 1; i < len(segments); i++ {
-		if segments[i] == "lru" && segments[i-1] == "go" {
-			return true
+		if segments[i] != "lru" {
+			continue
+		}
+		if reason, disconnected := c.disconnectedTools[segments[i-1]]; disconnected {
+			return reason, true
 		}
 	}
-	return false
+	return "", false
 }
 
 // PutArtifact routes to the backend selected on ctx, mirroring the cache

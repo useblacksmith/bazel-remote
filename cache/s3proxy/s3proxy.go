@@ -59,12 +59,19 @@ type s3Cache struct {
 	metrics          Metrics
 	v2mode           bool
 	updateTimestamps bool
-	// goBackendDisconnect severs Go-cache traffic from this backend
-	// entirely (BAZEL_REMOTE_GO_BACKEND_DISCONNECT=1): Get and Contains
-	// answer clean misses and Put drops the write-through before the upload
-	// queue, leaving the local disk cache as the only tier for Go. Canary
-	// toggle — flipping the env var is the whole roll-in/roll-out.
-	goBackendDisconnect bool
+	// disconnectedTools severs the named build tools from this backend
+	// entirely: Get and Contains answer clean misses, Put drops the
+	// write-through before the upload queue, and LRU artifacts are skipped,
+	// leaving the local disk cache as the only tier for those tools. Nil
+	// disconnects nothing. Canary toggle — flipping the env var is the whole
+	// roll-in/roll-out.
+	//
+	// Values are each tool's pre-rendered skip reason ("go" ->
+	// "go_disconnect"), which keeps the hot skip path allocation-free and,
+	// more importantly, bounds the metric label: the reason reaching
+	// Prometheus is always one this map was configured with, never a build
+	// tool named by an incoming request.
+	disconnectedTools map[string]string
 	// readDeadline is the overall bound on one read-path call including the
 	// streamed body; defaults to the package-level readDeadline, overridable
 	// via WithReadDeadline. Connection failure is bounded separately and
@@ -82,12 +89,23 @@ func WithOperationObserver(observer cache.OperationObserver) Option {
 	}
 }
 
-// WithGoBackendDisconnect controls whether Go-cache requests bypass this
-// backend entirely, for every entry kind and operation (see
-// s3Cache.goBackendDisconnect).
-func WithGoBackendDisconnect(enabled bool) Option {
+// WithBackendDisconnectTools severs the named build tools ("go", "turbo")
+// from this backend, for every entry kind and operation (see
+// s3Cache.disconnectedTools). Empty disconnects nothing.
+func WithBackendDisconnectTools(tools []string) Option {
 	return func(c *s3Cache) {
-		c.goBackendDisconnect = enabled
+		if len(tools) == 0 {
+			c.disconnectedTools = nil
+			return
+		}
+		disconnected := make(map[string]string, len(tools))
+		for _, tool := range tools {
+			if tool == "" {
+				continue
+			}
+			disconnected[tool] = tool + skipReasonDisconnectSuffix
+		}
+		c.disconnectedTools = disconnected
 	}
 }
 
@@ -649,13 +667,13 @@ func classifyUploadOutcome(err error) (status string, reason string) {
 }
 
 func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
-	if c.goBackendDisconnect && isGoRequest(ctx) {
+	if reason, disconnected := c.disconnectReason(ctx); disconnected {
 		// Drop the write-through before the upload queue. Deliberately NO
 		// ObserveOperation outcome: the web-side accounting counts the
 		// dropped/error/rejected statuses as failures (see
 		// classifyUploadOutcome), and this skip is policy, not a failure —
 		// the Prometheus counter is the signal.
-		backendUploadsSkipped.WithLabelValues(c.key, skipReasonGoDisconnect).Inc()
+		backendUploadsSkipped.WithLabelValues(c.key, reason).Inc()
 		_ = rc.Close()
 		return
 	}
@@ -719,8 +737,12 @@ func (c *s3Cache) UpdateModificationTimestamp(ctx context.Context, bucket string
 }
 
 const (
-	skipReasonGoAC         = "go_ac"
-	skipReasonGoDisconnect = "go_disconnect"
+	skipReasonGoAC = "go_ac"
+	// skipReasonDisconnectSuffix builds a disconnected tool's reason label.
+	// Go's label predates the generalization, so it is spelled to keep
+	// producing exactly "go_disconnect" — the existing dashboards and alerts
+	// query that series by name.
+	skipReasonDisconnectSuffix = "_disconnect"
 )
 
 // isGoRequest reports whether the request is Go-cache traffic, identified by
@@ -737,6 +759,33 @@ func isGoRequest(ctx context.Context) bool {
 	return path.Base(prefix) == "go"
 }
 
+// disconnectReason resolves whether this request belongs to a disconnected
+// build tool, and under which skip reason.
+//
+// Both of isGoRequest's signals are consulted independently, and either one
+// naming a disconnected tool is enough — deliberately not "resolve the tool,
+// then test it". The two can disagree (a request can carry a bazel label under
+// a go prefix), and the disconnect is a promise that a tool produces zero S3
+// operations, so an ambiguous request has to be treated as the tool being
+// withheld. Tightening this to a single resolved tool would silently re-attach
+// exactly the traffic the cut exists to remove.
+func (c *s3Cache) disconnectReason(ctx context.Context) (string, bool) {
+	if len(c.disconnectedTools) == 0 {
+		return "", false
+	}
+	if labels, ok := cache.MetricsLabelsFromContext(ctx); ok {
+		if reason, disconnected := c.disconnectedTools[labels.BuildToolID]; disconnected {
+			return reason, true
+		}
+	}
+	if prefix, ok := cache.StoragePrefixFromContext(ctx); ok {
+		if reason, disconnected := c.disconnectedTools[path.Base(prefix)]; disconnected {
+			return reason, true
+		}
+	}
+	return "", false
+}
+
 // skipGoActionCacheBackendLookup reports whether Get/Contains should skip MinIO.
 // Go AC Get is dominated by never-stored ActionIDs; checking MinIO cannot hit
 // and floods 404s. CAS still hydrates from MinIO. After L1 eviction, Go AC will
@@ -747,13 +796,13 @@ func skipGoActionCacheBackendLookup(ctx context.Context, kind cache.EntryKind) b
 }
 
 // skipBackendLookupReason resolves whether a Get/Contains should skip MinIO,
-// and under which backendLookupsSkipped reason: go_disconnect covers every
-// entry kind while the disconnect toggle is on, go_ac is the always-on
-// AC-only skip. Distinct reasons let dashboards tell the canary's full
-// disconnect apart from the steady-state AC optimization.
+// and under which backendLookupsSkipped reason: <tool>_disconnect covers every
+// entry kind for a disconnected tool, go_ac is the always-on AC-only skip.
+// Distinct reasons let dashboards tell a full disconnect apart from the
+// steady-state AC optimization, and one disconnected tool apart from another.
 func (c *s3Cache) skipBackendLookupReason(ctx context.Context, kind cache.EntryKind) (string, bool) {
-	if c.goBackendDisconnect && isGoRequest(ctx) {
-		return skipReasonGoDisconnect, true
+	if reason, disconnected := c.disconnectReason(ctx); disconnected {
+		return reason, true
 	}
 	if skipGoActionCacheBackendLookup(ctx, kind) {
 		return skipReasonGoAC, true

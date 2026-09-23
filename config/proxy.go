@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/buchgr/bazel-remote/v2/cache/azblobproxy"
@@ -165,9 +166,10 @@ func (c *Config) setProxy() error {
 		// backend so it covers single-backend and map mode alike: Go-cache
 		// traffic bypasses the S3 backend entirely (reads answer clean
 		// misses, write-throughs are dropped).
-		goBackendDisconnect := os.Getenv("BAZEL_REMOTE_GO_BACKEND_DISCONNECT") == "1"
-		if goBackendDisconnect {
-			log.Println("Go-cache S3 backend disconnect enabled (BAZEL_REMOTE_GO_BACKEND_DISCONNECT=1): Go traffic will neither read from nor write to the S3 backend")
+		disconnectTools := backendDisconnectTools()
+		if len(disconnectTools) > 0 {
+			log.Printf("S3 backend disconnect enabled for build tools %s: that traffic will neither read from nor write to the S3 backend",
+				strings.Join(disconnectTools, ", "))
 		}
 
 		// Multi-backend mode: an allowlisted selector → backend map, one
@@ -198,7 +200,7 @@ func (c *Config) setProxy() error {
 				c.StorageMode, c.AccessLogger, c.ErrorLogger, numUploaders, maxQueuedUploads,
 				s3proxy.PrometheusMetrics(),
 				s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout),
-				s3proxy.WithGoBackendDisconnect(goBackendDisconnect))
+				s3proxy.WithBackendDisconnectTools(disconnectTools))
 			if err != nil {
 				return err
 			}
@@ -232,7 +234,7 @@ func (c *Config) setProxy() error {
 			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
 			s3proxy.PrometheusMetrics(),
 			s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout),
-			s3proxy.WithGoBackendDisconnect(goBackendDisconnect))
+			s3proxy.WithBackendDisconnectTools(disconnectTools))
 		return nil
 	}
 
@@ -270,4 +272,34 @@ func parseBucketLookupType(typeStr string) (minio.BucketLookupType, error) {
 	}
 
 	return val, nil
+}
+
+// backendDisconnectTools resolves which build tools are severed from the S3
+// backend. BAZEL_REMOTE_BACKEND_DISCONNECT_TOOLS is the general form, a
+// comma-separated list of build tool IDs ("go,turbo").
+//
+// BAZEL_REMOTE_GO_BACKEND_DISCONNECT=1 predates that list and is still
+// honoured, because the binary and the env file roll independently: a node
+// that picks up a new binary before its config is re-rendered would otherwise
+// quietly start writing Go traffic to MinIO again, which is the one outcome
+// this cut exists to prevent. Dropping it is safe only once no rendered env
+// file sets it.
+func backendDisconnectTools() []string {
+	var tools []string
+	seen := make(map[string]bool)
+	add := func(tool string) {
+		tool = strings.TrimSpace(tool)
+		if tool == "" || seen[tool] {
+			return
+		}
+		seen[tool] = true
+		tools = append(tools, tool)
+	}
+	if os.Getenv("BAZEL_REMOTE_GO_BACKEND_DISCONNECT") == "1" {
+		add("go")
+	}
+	for _, tool := range strings.Split(os.Getenv("BAZEL_REMOTE_BACKEND_DISCONNECT_TOOLS"), ",") {
+		add(tool)
+	}
+	return tools
 }
