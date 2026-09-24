@@ -916,6 +916,9 @@ func TestGrpcByteStream(t *testing.T) {
 	var decmpBuf bytes.Buffer
 	dr, dw := io.Pipe()
 	dec, err := zstd.NewReader(dr, zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		t.Fatal(err)
+	}
 	errs := make(chan error, 1)
 
 	go func() {
