@@ -27,4 +27,4 @@ linters:
       # for a dependency bump; do that migration in a dedicated change.
       - linters:
           - staticcheck
-        text: 'SA1019: grpc\.(Dial|DialContext|WithBlock) is deprecated'
+        text: 'SA1019: google\.golang\.org/grpc\.(Dial|DialContext|WithBlock) is deprecated'
