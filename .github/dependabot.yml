@@ -8,6 +8,17 @@ updates:
       go-deps:
         patterns:
           - "*"
+  # Runtime source lives on patchset (see BLACKSMITH.md); without a
+  # target-branch, Dependabot only updates main, which is not a release source.
+  - package-ecosystem: gomod
+    directory: "/"
+    target-branch: patchset
+    schedule:
+      interval: weekly
+    groups:
+      go-deps:
+        patterns:
+          - "*"
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
