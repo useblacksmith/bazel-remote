@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"sync"
 	"time"
 
@@ -78,6 +80,51 @@ func WithReadChunkSizeBytes(chunkSizeBytes int64) GRPCServerOption {
 			s.readChunkSizeBytes = chunkSizeBytes
 		}
 		return nil
+	}
+}
+
+// WithMaxInflightCASWrites caps concurrent CAS ByteStream Writes that reach
+// the Put path; excess writes are shed with FAILED_PRECONDITION. 0 = unlimited.
+func WithMaxInflightCASWrites(n int) GRPCServerOption {
+	return func(s *grpcServer) error {
+		if n < 0 {
+			return fmt.Errorf("max inflight CAS writes must not be negative: %d", n)
+		}
+		if n > 0 {
+			s.casWriteSlots = make(chan struct{}, n)
+		}
+		return nil
+	}
+}
+
+var casWriteSlotsInflight = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "bazel_remote_cas_write_slots_inflight",
+	Help: "New CAS ByteStream writes currently admitted through the in-flight write gate.",
+})
+
+var casWriteShedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "bazel_remote_cas_write_shed_total",
+	Help: "New CAS ByteStream writes rejected because the in-flight write gate was full.",
+})
+
+func (s *grpcServer) tryAcquireCASWriteSlot() bool {
+	if s.casWriteSlots == nil {
+		return true
+	}
+	select {
+	case s.casWriteSlots <- struct{}{}:
+		casWriteSlotsInflight.Inc()
+		return true
+	default:
+		casWriteShedTotal.Inc()
+		return false
+	}
+}
+
+func (s *grpcServer) releaseCASWriteSlot() {
+	if s.casWriteSlots != nil {
+		<-s.casWriteSlots
+		casWriteSlotsInflight.Dec()
 	}
 }
 

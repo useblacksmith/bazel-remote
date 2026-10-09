@@ -3105,3 +3105,75 @@ func TestInsufficientStorageWhenProxyTriesToStoreAc(t *testing.T) {
 		assertStatusCodeFromError(t, err, codes.ResourceExhausted)
 	}
 }
+
+func TestGrpcByteStreamWriteShedWhenInflightCapReached(t *testing.T) {
+	fixture := grpcTestSetupInternal(t, false, WithMaxInflightCASWrites(1))
+	defer os.RemoveAll(fixture.tempdir)
+
+	writeResource := func(blob []byte, hash string) string {
+		return fmt.Sprintf("uploads/%s/blobs/%s/%d", uuid.New().String(), hash, len(blob))
+	}
+	fullWrite := func(blob []byte, hash string) error {
+		bswc, err := fixture.bsClient.Write(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = bswc.Send(&bytestream.WriteRequest{
+			ResourceName: writeResource(blob, hash),
+			FinishWrite:  true,
+			Data:         blob,
+		})
+		if err != nil && err != io.EOF {
+			t.Fatal(err)
+		}
+		_, err = bswc.CloseAndRecv()
+		return err
+	}
+
+	heldBlob, heldHash := testutils.RandomDataAndHash(64)
+	heldResource := writeResource(heldBlob, heldHash)
+	held, err := fixture.bsClient.Write(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = held.Send(&bytestream.WriteRequest{
+		ResourceName: heldResource,
+		Data:         heldBlob[:32],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Let the server consume the first chunk and take the only slot.
+	time.Sleep(200 * time.Millisecond)
+
+	otherBlob, otherHash := testutils.RandomDataAndHash(64)
+	err = fullWrite(otherBlob, otherHash)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected codes.FailedPrecondition while a write holds the slot, got %v", err)
+	}
+
+	if err := fullWrite(otherBlob, otherHash); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected second shed, got %v", err)
+	}
+
+	err = held.Send(&bytestream.WriteRequest{
+		ResourceName: heldResource,
+		FinishWrite:  true,
+		Data:         heldBlob[32:],
+		WriteOffset:  32,
+	})
+	if err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	if _, err := held.CloseAndRecv(); err != nil {
+		t.Fatalf("held write should complete: %v", err)
+	}
+
+	if err := fullWrite(otherBlob, otherHash); err != nil {
+		t.Fatalf("write after slot release should succeed: %v", err)
+	}
+	// Now present: the Contains early return answers before the gate.
+	if err := fullWrite(otherBlob, otherHash); err != nil {
+		t.Fatalf("duplicate write of present blob should succeed: %v", err)
+	}
+}

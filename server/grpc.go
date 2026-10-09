@@ -50,7 +50,13 @@ type grpcServer struct {
 	readChunkSizeBytes     int64
 	runtimeMetrics         RuntimeMetrics
 	readLimiter            *readLimiter
-	sourceBuffers          *sourceBufferPool
+	// casWriteSlots bounds in-flight CAS ByteStream Writes past the Contains
+	// check. Each one holds a 1MB chunk buffer, the zstd output and pipe/gRPC
+	// buffers before anything reaches disk, so an unbounded burst from one
+	// tenant (8k concurrent writes observed) takes the heap past GOMEMLIMIT
+	// and stalls the process. nil = unlimited.
+	casWriteSlots chan struct{}
+	sourceBuffers *sourceBufferPool
 	// writePayloadConsumed, when set, is invoked once per fully-consumed
 	// ByteStream WriteRequest; see WithWritePayloadConsumed.
 	writePayloadConsumed func(*bytestream.WriteRequest)

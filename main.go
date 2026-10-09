@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -498,6 +499,17 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 	grpcSem *semaphore.Weighted, diskCache disk.Cache) error {
 
 	opts := []grpc.ServerOption{}
+	// A static per-stream window bounds how many bytes a client can push
+	// ahead of the (disk-bound) Put goroutine, so memory per in-flight or
+	// shed write is this instead of the BDP-grown default (up to 16MB).
+	if v := os.Getenv("BAZEL_REMOTE_GRPC_INITIAL_WINDOW_SIZE"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 32)
+		if err != nil || n < 65536 {
+			return fmt.Errorf("invalid BAZEL_REMOTE_GRPC_INITIAL_WINDOW_SIZE %q (bytes, >= 65536)", v)
+		}
+		log.Printf("gRPC initial stream window: %d bytes", n)
+		opts = append(opts, grpc.InitialWindowSize(int32(n)), grpc.InitialConnWindowSize(int32(n)*16))
+	}
 	streamInterceptors := []grpc.StreamServerInterceptor{}
 	unaryInterceptors := []grpc.UnaryServerInterceptor{}
 
@@ -610,6 +622,14 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 	log.Println("Starting gRPC server on address", addr)
 
 	var grpcServerOpts []server.GRPCServerOption
+	if v := os.Getenv("BAZEL_REMOTE_MAX_INFLIGHT_CAS_WRITES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return fmt.Errorf("invalid BAZEL_REMOTE_MAX_INFLIGHT_CAS_WRITES %q", v)
+		}
+		log.Printf("gRPC ByteStream max in-flight CAS writes: %d", n)
+		grpcServerOpts = append(grpcServerOpts, server.WithMaxInflightCASWrites(n))
+	}
 	if c.ReadChunkSizeBytes > 0 {
 		log.Printf("gRPC ByteStream read chunk size: %d bytes", c.ReadChunkSizeBytes)
 		grpcServerOpts = append(grpcServerOpts, server.WithReadChunkSizeBytes(c.ReadChunkSizeBytes))
