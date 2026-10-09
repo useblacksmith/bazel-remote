@@ -3148,11 +3148,11 @@ func TestGrpcByteStreamWriteShedWhenInflightCapReached(t *testing.T) {
 
 	otherBlob, otherHash := testutils.RandomDataAndHash(64)
 	err = fullWrite(otherBlob, otherHash)
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("expected codes.Unavailable while a write holds the slot, got %v", err)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected codes.FailedPrecondition while a write holds the slot, got %v", err)
 	}
 
-	if err := fullWrite(otherBlob, otherHash); status.Code(err) != codes.Unavailable {
+	if err := fullWrite(otherBlob, otherHash); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected second shed, got %v", err)
 	}
 

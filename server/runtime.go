@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"sync"
 	"time"
 
@@ -95,14 +97,26 @@ func WithMaxInflightCASWrites(n int) GRPCServerOption {
 	}
 }
 
+var casWriteSlotsInflight = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "bazel_remote_cas_write_slots_inflight",
+	Help: "New CAS ByteStream writes currently admitted through the in-flight write gate.",
+})
+
+var casWriteShedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "bazel_remote_cas_write_shed_total",
+	Help: "New CAS ByteStream writes rejected because the in-flight write gate was full.",
+})
+
 func (s *grpcServer) tryAcquireCASWriteSlot() bool {
 	if s.casWriteSlots == nil {
 		return true
 	}
 	select {
 	case s.casWriteSlots <- struct{}{}:
+		casWriteSlotsInflight.Inc()
 		return true
 	default:
+		casWriteShedTotal.Inc()
 		return false
 	}
 }
@@ -110,6 +124,7 @@ func (s *grpcServer) tryAcquireCASWriteSlot() bool {
 func (s *grpcServer) releaseCASWriteSlot() {
 	if s.casWriteSlots != nil {
 		<-s.casWriteSlots
+		casWriteSlotsInflight.Dec()
 	}
 }
 

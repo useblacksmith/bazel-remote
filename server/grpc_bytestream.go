@@ -431,7 +431,7 @@ var errWriteOffset error = errors.New("bytestream writes from non-zero offsets a
 
 // UNAVAILABLE is the connection-class code clients treat as "drop this
 // write", never a failed build.
-var errCASWriteShed = status.Error(codes.Unavailable, "too many in-flight CAS writes")
+var errCASWriteShed = status.Error(codes.FailedPrecondition, "too many in-flight CAS writes")
 var errDecoderPoolFail error = errors.New("failed to get DecoderWrapper from pool")
 
 func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
