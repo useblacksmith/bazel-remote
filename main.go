@@ -499,6 +499,17 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 	grpcSem *semaphore.Weighted, diskCache disk.Cache) error {
 
 	opts := []grpc.ServerOption{}
+	// A static per-stream window bounds how many bytes a client can push
+	// ahead of the (disk-bound) Put goroutine, so memory per in-flight or
+	// shed write is this instead of the BDP-grown default (up to 16MB).
+	if v := os.Getenv("BAZEL_REMOTE_GRPC_INITIAL_WINDOW_SIZE"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 32)
+		if err != nil || n < 65536 {
+			return fmt.Errorf("invalid BAZEL_REMOTE_GRPC_INITIAL_WINDOW_SIZE %q (bytes, >= 65536)", v)
+		}
+		log.Printf("gRPC initial stream window: %d bytes", n)
+		opts = append(opts, grpc.InitialWindowSize(int32(n)), grpc.InitialConnWindowSize(int32(n)*16))
+	}
 	streamInterceptors := []grpc.StreamServerInterceptor{}
 	unaryInterceptors := []grpc.UnaryServerInterceptor{}
 
