@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -610,6 +611,14 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 	log.Println("Starting gRPC server on address", addr)
 
 	var grpcServerOpts []server.GRPCServerOption
+	if v := os.Getenv("BAZEL_REMOTE_MAX_INFLIGHT_CAS_WRITES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return fmt.Errorf("invalid BAZEL_REMOTE_MAX_INFLIGHT_CAS_WRITES %q", v)
+		}
+		log.Printf("gRPC ByteStream max in-flight CAS writes: %d", n)
+		grpcServerOpts = append(grpcServerOpts, server.WithMaxInflightCASWrites(n))
+	}
 	if c.ReadChunkSizeBytes > 0 {
 		log.Printf("gRPC ByteStream read chunk size: %d bytes", c.ReadChunkSizeBytes)
 		grpcServerOpts = append(grpcServerOpts, server.WithReadChunkSizeBytes(c.ReadChunkSizeBytes))

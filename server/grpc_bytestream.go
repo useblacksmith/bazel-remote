@@ -428,6 +428,10 @@ func (s *grpcServer) parseWriteResource(r string) (string, int64, casblob.Compre
 }
 
 var errWriteOffset error = errors.New("bytestream writes from non-zero offsets are unsupported")
+
+// UNAVAILABLE is the connection-class code clients treat as "drop this
+// write", never a failed build.
+var errCASWriteShed = status.Error(codes.Unavailable, "too many in-flight CAS writes")
 var errDecoderPoolFail error = errors.New("failed to get DecoderWrapper from pool")
 
 func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
@@ -532,6 +536,12 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 					return
 				}
 
+				if !s.tryAcquireCASWriteSlot() {
+					s.accessLogger.Printf("GRPC BYTESTREAM WRITE SHED: %s", resourceName)
+					recvResult <- errCASWriteShed
+					return
+				}
+
 				var rc io.ReadCloser = pr
 				if cmp == casblob.Zstandard {
 					dec, ok := decoderPool.Get().(*syncpool.DecoderWrapper)
@@ -550,6 +560,7 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 				}
 
 				go func() {
+					defer s.releaseCASWriteSlot()
 					defer func() { _ = rc.Close() }()
 					err := s.cache.Put(srv.Context(), cache.CAS, hash, size, rc)
 					putResult <- err

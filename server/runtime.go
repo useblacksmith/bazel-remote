@@ -81,6 +81,38 @@ func WithReadChunkSizeBytes(chunkSizeBytes int64) GRPCServerOption {
 	}
 }
 
+// WithMaxInflightCASWrites caps concurrent CAS ByteStream Writes that reach
+// the Put path; excess writes are shed with UNAVAILABLE. 0 = unlimited.
+func WithMaxInflightCASWrites(n int) GRPCServerOption {
+	return func(s *grpcServer) error {
+		if n < 0 {
+			return fmt.Errorf("max inflight CAS writes must not be negative: %d", n)
+		}
+		if n > 0 {
+			s.casWriteSlots = make(chan struct{}, n)
+		}
+		return nil
+	}
+}
+
+func (s *grpcServer) tryAcquireCASWriteSlot() bool {
+	if s.casWriteSlots == nil {
+		return true
+	}
+	select {
+	case s.casWriteSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *grpcServer) releaseCASWriteSlot() {
+	if s.casWriteSlots != nil {
+		<-s.casWriteSlots
+	}
+}
+
 // WithWritePayloadConsumed registers a callback the ByteStream Write handler
 // invokes exactly once per received message, after that message's Data has
 // been fully consumed (the pipe write to the cache reader returned). It is
