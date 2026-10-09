@@ -431,10 +431,7 @@ var errWriteOffset error = errors.New("bytestream writes from non-zero offsets a
 
 // UNAVAILABLE is the connection-class code clients treat as "drop this
 // write", never a failed build.
-// errCASWriteAbsorbed signals a new CAS write that was acknowledged at the
-// admission gate without being stored: the client sees committed_size as if
-// the blob existed and stops sending, and the blob is simply a future miss.
-var errCASWriteAbsorbed = errors.New("cas write absorbed at admission gate")
+var errCASWriteShed = status.Error(codes.Unavailable, "too many in-flight CAS writes")
 var errDecoderPoolFail error = errors.New("failed to get DecoderWrapper from pool")
 
 func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
@@ -561,12 +558,8 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 				// release.
 				if !s.tryAcquireCASWriteSlot() {
 					_ = rc.Close()
-					if cmp == casblob.Identity {
-						resp.CommittedSize = size
-					} else {
-						resp.CommittedSize = -1
-					}
-					putResult <- errCASWriteAbsorbed
+					s.accessLogger.Printf("GRPC BYTESTREAM WRITE SHED: %s", resourceName)
+					recvResult <- errCASWriteShed
 					return
 				}
 
@@ -647,8 +640,10 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 			}
 
 			_ = pw.CloseWithError(err)
-			s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s %s",
-				resourceName, err.Error())
+			if err != errCASWriteShed {
+				s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s %s",
+					resourceName, err.Error())
+			}
 			return err
 		}
 
@@ -658,12 +653,8 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 		default:
 		}
 
-		if err == io.EOF || err == errCASWriteAbsorbed {
-			if err == errCASWriteAbsorbed {
-				s.accessLogger.Printf("GRPC BYTESTREAM WRITE ABSORBED: %s", resourceName)
-			} else {
-				s.accessLogger.Printf("GRPC BYTESTREAM SKIPPED WRITE: %s", resourceName)
-			}
+		if err == io.EOF {
+			s.accessLogger.Printf("GRPC BYTESTREAM SKIPPED WRITE: %s", resourceName)
 
 			err = srv.SendAndClose(&resp)
 			if err != nil {
