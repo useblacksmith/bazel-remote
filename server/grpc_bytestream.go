@@ -636,8 +636,10 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 			}
 
 			_ = pw.CloseWithError(err)
-			s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s %s",
-				resourceName, err.Error())
+			if err != errCASWriteShed {
+				s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s %s",
+					resourceName, err.Error())
+			}
 			return err
 		}
 
