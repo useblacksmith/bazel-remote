@@ -84,7 +84,7 @@ func WithReadChunkSizeBytes(chunkSizeBytes int64) GRPCServerOption {
 }
 
 // WithMaxInflightCASWrites caps concurrent CAS ByteStream Writes that reach
-// the Put path; excess writes are shed with UNAVAILABLE. 0 = unlimited.
+// the Put path; excess writes are shed with FAILED_PRECONDITION. 0 = unlimited.
 func WithMaxInflightCASWrites(n int) GRPCServerOption {
 	return func(s *grpcServer) error {
 		if n < 0 {

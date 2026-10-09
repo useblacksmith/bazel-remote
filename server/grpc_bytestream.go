@@ -429,8 +429,12 @@ func (s *grpcServer) parseWriteResource(r string) (string, int64, casblob.Compre
 
 var errWriteOffset error = errors.New("bytestream writes from non-zero offsets are unsupported")
 
-// UNAVAILABLE is the connection-class code clients treat as "drop this
-// write", never a failed build.
+// FAILED_PRECONDITION is deliberately not a connection-class code: Bazel's
+// retrier treats UNAVAILABLE as transient and walks the full --remote_retries
+// backoff ladder per blob, which under sustained shedding becomes a
+// minutes-long upload tail after the build summary. A permanent code makes
+// the client log the upload failure once and move on; the action result is
+// never published, so nothing references the unstored blob.
 var errCASWriteShed = status.Error(codes.FailedPrecondition, "too many in-flight CAS writes")
 var errDecoderPoolFail error = errors.New("failed to get DecoderWrapper from pool")
 
