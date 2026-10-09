@@ -3106,7 +3106,7 @@ func TestInsufficientStorageWhenProxyTriesToStoreAc(t *testing.T) {
 	}
 }
 
-func TestGrpcByteStreamWriteShedWhenInflightCapReached(t *testing.T) {
+func TestGrpcByteStreamWriteAbsorbedWhenInflightCapReached(t *testing.T) {
 	fixture := grpcTestSetupInternal(t, false, WithMaxInflightCASWrites(1))
 	defer os.RemoveAll(fixture.tempdir)
 
@@ -3146,14 +3146,14 @@ func TestGrpcByteStreamWriteShedWhenInflightCapReached(t *testing.T) {
 	// Let the server consume the first chunk and take the only slot.
 	time.Sleep(200 * time.Millisecond)
 
+	// With the only slot held, a new blob is absorbed: the client sees
+	// success, but nothing is stored.
 	otherBlob, otherHash := testutils.RandomDataAndHash(64)
-	err = fullWrite(otherBlob, otherHash)
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("expected codes.Unavailable while a write holds the slot, got %v", err)
+	if err := fullWrite(otherBlob, otherHash); err != nil {
+		t.Fatalf("absorbed write should be acknowledged, got %v", err)
 	}
-
-	if err := fullWrite(otherBlob, otherHash); status.Code(err) != codes.Unavailable {
-		t.Fatalf("expected second shed, got %v", err)
+	if ok, _ := fixture.diskCache.Contains(ctx, cache.CAS, otherHash, int64(len(otherBlob))); ok {
+		t.Fatal("absorbed blob must not be stored")
 	}
 
 	err = held.Send(&bytestream.WriteRequest{
@@ -3171,6 +3171,9 @@ func TestGrpcByteStreamWriteShedWhenInflightCapReached(t *testing.T) {
 
 	if err := fullWrite(otherBlob, otherHash); err != nil {
 		t.Fatalf("write after slot release should succeed: %v", err)
+	}
+	if ok, _ := fixture.diskCache.Contains(ctx, cache.CAS, otherHash, int64(len(otherBlob))); !ok {
+		t.Fatal("write after slot release must be stored")
 	}
 	// Now present: the Contains early return answers before the gate.
 	if err := fullWrite(otherBlob, otherHash); err != nil {
