@@ -536,12 +536,6 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 					return
 				}
 
-				if !s.tryAcquireCASWriteSlot() {
-					s.accessLogger.Printf("GRPC BYTESTREAM WRITE SHED: %s", resourceName)
-					recvResult <- errCASWriteShed
-					return
-				}
-
 				var rc io.ReadCloser = pr
 				if cmp == casblob.Zstandard {
 					dec, ok := decoderPool.Get().(*syncpool.DecoderWrapper)
@@ -557,6 +551,16 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 						return
 					}
 					rc = dec.IOReadCloser()
+				}
+
+				// Acquire last so every earlier error path returns
+				// without holding a slot; the Put goroutine owns the
+				// release.
+				if !s.tryAcquireCASWriteSlot() {
+					_ = rc.Close()
+					s.accessLogger.Printf("GRPC BYTESTREAM WRITE SHED: %s", resourceName)
+					recvResult <- errCASWriteShed
+					return
 				}
 
 				go func() {
