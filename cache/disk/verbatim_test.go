@@ -93,13 +93,23 @@ func TestPutZstdEvictsOnDigestMismatch(t *testing.T) {
 		t.Fatal("blob with wrong digest should have been evicted")
 	}
 
-	// Wrong declared size: the frame decodes to more bytes than claimed.
+	// Declared size far below the body: rejected at write time, since no
+	// valid encoding of that many bytes can be that long.
 	_, hash := testutils.RandomDataAndHash(size)
-	if err := c.PutZstd(ctx, hash, size/2, bytes.NewReader(frame)); err != nil {
+	if err := c.PutZstd(ctx, hash, size/2, bytes.NewReader(frame)); err == nil {
+		t.Fatal("expected oversized body to be rejected")
+	}
+	if ok, _ := c.Contains(ctx, cache.CAS, hash, size/2); ok {
+		t.Fatal("rejected blob should not be present")
+	}
+
+	// Declared size slightly below the decoded size: passes the write
+	// bound, caught by the verifier.
+	if err := c.PutZstd(ctx, hash, size-1, bytes.NewReader(frame)); err != nil {
 		t.Fatal(err)
 	}
 	waitVerified(t, c)
-	if ok, _ := c.Contains(ctx, cache.CAS, hash, size/2); ok {
+	if ok, _ := c.Contains(ctx, cache.CAS, hash, size-1); ok {
 		t.Fatal("blob with wrong size should have been evicted")
 	}
 

@@ -183,7 +183,9 @@ func (c *diskCache) checkVerbatimDigest(blobPath string, job verifyJob) string {
 	defer func() { _ = rc.Close() }()
 
 	hasher := sha256.New()
-	n, err := io.Copy(hasher, rc)
+	// Stop one byte past the declared size: a frame that expands further
+	// is wrong regardless of what follows.
+	n, err := io.Copy(hasher, io.LimitReader(rc, job.size+1))
 	if err != nil {
 		return "decode_error"
 	}

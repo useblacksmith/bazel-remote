@@ -16,9 +16,13 @@ func TestVerbatimZstdRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, size := range []int64{3*1024*1024 + 123, 4096 + 7} {
+		testVerbatimZstdRoundTrip(t, zstd, size)
+	}
+}
 
-	const size = 3*1024*1024 + 123
-	data, _ := testutils.RandomDataAndHash(int64(size))
+func testVerbatimZstdRoundTrip(t *testing.T, zstd zstdimpl.ZstdImpl, size int64) {
+	data, _ := testutils.RandomDataAndHash(size)
 	frame := zstd.EncodeAll(data)
 
 	dir := testutils.TempDir(t)
@@ -35,7 +39,7 @@ func TestVerbatimZstdRoundTrip(t *testing.T) {
 		t.Fatalf("size on disk %d, want %d", onDisk, want)
 	}
 
-	for _, offset := range []int64{0, 1, 1024*1024 + 7, size - 1} {
+	for _, offset := range []int64{0, 1, size / 2, size - 1} {
 		f, err := os.Open(fn)
 		if err != nil {
 			t.Fatal(err)
@@ -73,6 +77,19 @@ func TestVerbatimZstdRoundTrip(t *testing.T) {
 		if !bytes.Equal(got, data[offset:]) {
 			t.Fatalf("offset %d: zstd read mismatch (%d bytes)", offset, len(got))
 		}
+	}
+}
+
+func TestWriteZstdFrameAndCloseRejectsOversizedBody(t *testing.T) {
+	dir := testutils.TempDir(t)
+	const size = 4096
+	body := make([]byte, MaxCompressedSize(size)+1)
+	f, err := os.Create(path.Join(dir, "blob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteZstdFrameAndClose(bytes.NewReader(body), f, size); err == nil {
+		t.Fatal("expected error for body longer than any valid encoding of size")
 	}
 }
 
