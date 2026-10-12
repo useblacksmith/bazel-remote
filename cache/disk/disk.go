@@ -43,6 +43,11 @@ type Cache interface {
 	GetValidatedActionResult(ctx context.Context, hash string) (*pb.ActionResult, []byte, error)
 	GetZstd(ctx context.Context, hash string, size int64, offset int64) (io.ReadCloser, int64, error)
 	Put(ctx context.Context, kind cache.EntryKind, hash string, size int64, r io.Reader) error
+	// PutZstd stores a client-compressed CAS blob as received, deferring
+	// digest verification to a background worker (see verbatim.go). It
+	// returns ErrVerbatimUnavailable without reading from r when the blob
+	// must take the decoding Put path instead.
+	PutZstd(ctx context.Context, hash string, size int64, r io.Reader) error
 	Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64)
 	FindMissingCasBlobs(ctx context.Context, blobs []*pb.Digest) ([]*pb.Digest, error)
 
@@ -113,6 +118,9 @@ type diskCache struct {
 	// Tenant census and byte-weighted age accounting (see census.go).
 	// Wired as the LRU's IndexObserver in loadExistingFiles.
 	census *censusRecorder
+
+	// Background digest verification for blobs stored via PutZstd.
+	verifier *verbatimVerifier
 
 	gaugeCacheAge prometheus.Gauge
 }
@@ -323,7 +331,13 @@ func (c *diskCache) FileLocationForContext(ctx context.Context, kind cache.Entry
 // If `hash` is not the empty string, and the contents don't match it,
 // a non-nil error is returned. All data will be read from `r` before
 // this function returns.
-func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, size int64, r io.Reader) (rErr error) {
+func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, size int64, r io.Reader) error {
+	return c.put(ctx, kind, hash, size, r, nil)
+}
+
+// verbatim, when non-nil, stores r as a zstd stream without decoding it and
+// hands the committed blob to the background verifier.
+func (c *diskCache) put(ctx context.Context, kind cache.EntryKind, hash string, size int64, r io.Reader, verbatim *verifyJob) (rErr error) {
 	defer func() {
 		if r != nil {
 			_, _ = io.Copy(io.Discard, r)
@@ -472,14 +486,22 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 	removeTempfile = true
 
 	var sizeOnDisk int64
-	sizeOnDisk, err = c.writeAndCloseFile(ctx, r, kind, hash, size, tf)
-	if err != nil {
-		return internalErr(err)
+	if verbatim != nil {
+		sizeOnDisk, err = casblob.WriteZstdFrameAndClose(r, tf, size)
+		if err != nil {
+			return internalErr(annotate.Err(ctx, "Failed to write compressed CAS blob to disk", err))
+		}
+	} else {
+		sizeOnDisk, err = c.writeAndCloseFile(ctx, r, kind, hash, size, tf)
+		if err != nil {
+			return internalErr(err)
+		}
 	}
 
 	r = nil // We read all the data from r.
 
-	if c.proxy != nil {
+	// Unverified blobs reach the proxy only after verification.
+	if c.proxy != nil && verbatim == nil {
 		rc, err := os.Open(blobFile)
 		if err != nil {
 			log.Println("Failed to proxy Put:", err)
@@ -492,6 +514,13 @@ func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, 
 	unreserve, removeTempfile, err = c.commit(key, legacy, blobFile, size, size, sizeOnDisk, random)
 	if err != nil {
 		return internalErr(err)
+	}
+
+	if verbatim != nil {
+		verbatim.key = key
+		verbatim.random = random
+		c.verifier.enqueue(*verbatim)
+		verbatim.enqueued = true
 	}
 
 	if acForObserver != nil {

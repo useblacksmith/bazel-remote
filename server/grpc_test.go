@@ -2875,6 +2875,10 @@ func (c *StubCache) GetZstd(ctx context.Context, hash string, size int64, offset
 	return nil, -1, c.ProgrammedGetError
 }
 
+func (c *StubCache) PutZstd(ctx context.Context, hash string, size int64, r io.Reader) error {
+	return disk.ErrVerbatimUnavailable
+}
+
 func (c *StubCache) Put(ctx context.Context, kind cache.EntryKind, hash string, size int64, r io.Reader) error {
 	c.PutCalls.Add(1)
 	return c.ProgrammedPutError
