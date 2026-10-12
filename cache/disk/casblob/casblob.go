@@ -93,6 +93,13 @@ type readCloserWrapper struct {
 var errWrongMagicNum = errors.New("expected magic number not found")
 
 // Read the header and leave f at the start of the data.
+// singleChunk reports whether the blob is stored as exactly one compressed
+// chunk, which holds for every blob WriteZstdFrameAndClose writes and for
+// regular blobs no larger than defaultChunkSize.
+func (h *header) singleChunk() bool {
+	return len(h.chunkOffsets) == 2
+}
+
 func readHeader(f *os.File) (*header, error) {
 	var err error
 	var h header
@@ -274,9 +281,9 @@ func GetUncompressedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize 
 			return nil, err
 		}
 	}
-	if h.chunkSize != defaultChunkSize {
-		// Single-chunk blob stored as received from the client (see
-		// WriteZstdFrameAndClose): stream past the offset instead of
+	if h.singleChunk() {
+		// Single-chunk blob (every blob WriteZstdFrameAndClose writes, and
+		// regular blobs up to one chunk): stream past the offset instead of
 		// decoding the whole blob into memory, and never emit more than
 		// the declared size even if the frame has not been verified yet.
 		rc, err := skipDecoded(zstd, f, remainder)
@@ -407,8 +414,8 @@ func GetZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, o
 		return f, nil
 	}
 
-	if h.chunkSize != defaultChunkSize {
-		// Single-chunk blob stored as received: decode past the offset
+	if h.singleChunk() {
+		// Single-chunk blob: decode past the offset
 		// and re-encode the rest as a stream, bounded by the declared size.
 		rc, err := skipDecoded(zstd, f, remainder)
 		if err != nil {
@@ -465,7 +472,7 @@ func GetUncheckedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File) (io.ReadCloser, 
 		_ = f.Close()
 		return nil, err
 	}
-	if h.compression != Zstandard || h.chunkSize == defaultChunkSize || len(h.chunkOffsets) != 2 {
+	if h.compression != Zstandard || !h.singleChunk() {
 		_ = f.Close()
 		return nil, errors.New("not a single-chunk zstd blob")
 	}

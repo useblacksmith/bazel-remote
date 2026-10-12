@@ -16,7 +16,7 @@ func TestVerbatimZstdRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, size := range []int64{3*1024*1024 + 123, 4096 + 7} {
+	for _, size := range []int64{3*1024*1024 + 123, 4096 + 7, defaultChunkSize, defaultChunkSize - 1, defaultChunkSize + 1} {
 		testVerbatimZstdRoundTrip(t, zstd, size)
 	}
 }
