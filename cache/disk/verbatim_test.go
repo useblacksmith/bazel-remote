@@ -3,6 +3,8 @@ package disk
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"testing"
 	"time"
@@ -103,14 +105,17 @@ func TestPutZstdEvictsOnDigestMismatch(t *testing.T) {
 		t.Fatal("rejected blob should not be present")
 	}
 
-	// Declared size slightly below the decoded size: passes the write
-	// bound, caught by the verifier.
-	if err := c.PutZstd(ctx, hash, size-1, bytes.NewReader(frame)); err != nil {
+	// Declared size slightly below the decoded size, with the digest of
+	// exactly that prefix: passes the write bound and the prefix hashes
+	// correctly, so only the length check can catch it.
+	prefixHash := sha256.Sum256(data[:size-1])
+	prefixKey := hex.EncodeToString(prefixHash[:])
+	if err := c.PutZstd(ctx, prefixKey, size-1, bytes.NewReader(frame)); err != nil {
 		t.Fatal(err)
 	}
 	waitVerified(t, c)
-	if ok, _ := c.Contains(ctx, cache.CAS, hash, size-1); ok {
-		t.Fatal("blob with wrong size should have been evicted")
+	if ok, _ := c.Contains(ctx, cache.CAS, prefixKey, size-1); ok {
+		t.Fatal("frame expanding past its declared size should have been evicted")
 	}
 
 	// Garbage that is not zstd at all.

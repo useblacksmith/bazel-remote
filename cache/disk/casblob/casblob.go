@@ -283,7 +283,7 @@ func GetUncompressedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize 
 		if err != nil {
 			return nil, err
 		}
-		return &readCloserWrapper{header: h, rdr: io.LimitReader(rc, expectedSize-offset), rdrCloser: rc, file: f}, nil
+		return &readCloserWrapper{header: h, rdr: io.LimitReader(rc, h.uncompressedSize-offset), rdrCloser: rc, file: f}, nil
 	}
 
 	if remainder == 0 {
@@ -414,7 +414,7 @@ func GetZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, o
 		if err != nil {
 			return nil, err
 		}
-		return encodedReadCloser(zstd, &readCloserWrapper{header: h, rdr: io.LimitReader(rc, expectedSize-offset), rdrCloser: rc, file: f})
+		return encodedReadCloser(zstd, &readCloserWrapper{header: h, rdr: io.LimitReader(rc, h.uncompressedSize-offset), rdrCloser: rc, file: f})
 	}
 
 	compressedFirstChunk := make([]byte, h.chunkOffsets[chunkNum+1]-h.chunkOffsets[chunkNum])
@@ -455,6 +455,32 @@ func GetLegacyZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File) (io.ReadCloser,
 // skipDecoded returns a decoder positioned at the given uncompressed
 // offset within the zstd stream that starts at f's current position. f is
 // closed on error.
+// GetUncheckedReadCloser decodes a single-chunk blob written by
+// WriteZstdFrameAndClose without capping the output at the declared size, so
+// that a verifier can tell whether the frame expands past it. f is closed
+// with the returned reader, or on error.
+func GetUncheckedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File) (io.ReadCloser, error) {
+	h, err := readHeader(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if h.compression != Zstandard || h.chunkSize == defaultChunkSize || len(h.chunkOffsets) != 2 {
+		_ = f.Close()
+		return nil, errors.New("not a single-chunk zstd blob")
+	}
+	if _, err = f.Seek(h.chunkOffsets[0], io.SeekStart); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	dec, err := zstd.GetDecoder(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &readCloserWrapper{header: h, rdr: dec, rdrCloser: dec, file: f}, nil
+}
+
 func skipDecoded(zstd zstdimpl.ZstdImpl, f *os.File, skip int64) (io.ReadCloser, error) {
 	dec, err := zstd.GetDecoder(f)
 	if err != nil {

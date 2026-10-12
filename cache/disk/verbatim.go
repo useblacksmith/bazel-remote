@@ -176,7 +176,7 @@ func (c *diskCache) checkVerbatimDigest(blobPath string, job verifyJob) string {
 		return "read_error"
 	}
 
-	rc, err := casblob.GetUncompressedReadCloser(c.zstd, f, job.size, 0)
+	rc, err := casblob.GetUncheckedReadCloser(c.zstd, f)
 	if err != nil {
 		return "decode_error"
 	}

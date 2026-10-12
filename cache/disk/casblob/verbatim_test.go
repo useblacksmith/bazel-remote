@@ -145,3 +145,54 @@ func TestVerbatimUncompressedReadCappedAtDeclaredSize(t *testing.T) {
 		}
 	}
 }
+
+func TestVerbatimReadWithUnknownExpectedSize(t *testing.T) {
+	zstd, err := zstdimpl.Get("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := testutils.TempDir(t)
+	const size = 48 * 1024
+	data, _ := testutils.RandomDataAndHash(size)
+	frame := zstd.EncodeAll(data)
+	f, err := os.Create(path.Join(dir, "blob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteZstdFrameAndClose(bytes.NewReader(frame), f, size); err != nil {
+		t.Fatal(err)
+	}
+	rf, err := os.Open(path.Join(dir, "blob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := GetUncompressedReadCloser(zstd, rf, -1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("read %d bytes with unknown expected size, want %d", len(got), size)
+	}
+
+	rf, err = os.Open(path.Join(dir, "blob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err = GetUncheckedReadCloser(zstd, rf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("unchecked read mismatch")
+	}
+}
