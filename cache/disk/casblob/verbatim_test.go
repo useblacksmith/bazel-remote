@@ -105,3 +105,43 @@ func TestWriteZstdFrameAndCloseRejectsBadSizes(t *testing.T) {
 		}
 	}
 }
+
+func TestVerbatimUncompressedReadCappedAtDeclaredSize(t *testing.T) {
+	zstd, err := zstdimpl.Get("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := testutils.TempDir(t)
+	const actual = 64 * 1024
+	const declared = actual - 300
+	data, _ := testutils.RandomDataAndHash(actual)
+	frame := zstd.EncodeAll(data)
+	f, err := os.Create(path.Join(dir, "blob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteZstdFrameAndClose(bytes.NewReader(frame), f, declared); err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int64{0, 17} {
+		rf, err := os.Open(path.Join(dir, "blob"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc, err := GetUncompressedReadCloser(zstd, rf, declared, offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if int64(len(got)) != declared-offset {
+			t.Fatalf("offset %d: read %d bytes, want %d", offset, len(got), declared-offset)
+		}
+		if !bytes.Equal(got, data[offset:declared]) {
+			t.Fatalf("offset %d: content mismatch", offset)
+		}
+	}
+}

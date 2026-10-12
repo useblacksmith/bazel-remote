@@ -274,6 +274,18 @@ func GetUncompressedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize 
 			return nil, err
 		}
 	}
+	if h.chunkSize != defaultChunkSize {
+		// Single-chunk blob stored as received from the client (see
+		// WriteZstdFrameAndClose): stream past the offset instead of
+		// decoding the whole blob into memory, and never emit more than
+		// the declared size even if the frame has not been verified yet.
+		rc, err := skipDecoded(zstd, f, remainder)
+		if err != nil {
+			return nil, err
+		}
+		return &readCloserWrapper{header: h, rdr: io.LimitReader(rc, expectedSize-offset), rdrCloser: rc, file: f}, nil
+	}
+
 	if remainder == 0 {
 		dec, err := zstd.GetDecoder(f)
 		if err != nil {
@@ -287,18 +299,6 @@ func GetUncompressedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize 
 			rdrCloser: dec,
 			file:      f,
 		}, nil
-	}
-
-	if h.chunkSize != defaultChunkSize {
-		// Single-chunk blob stored as received from the client (see
-		// WriteZstdFrameAndClose): stream past the offset instead of
-		// decoding the whole blob into memory, and never emit more than
-		// the declared size even if the frame has not been verified yet.
-		rc, err := skipDecoded(zstd, f, remainder)
-		if err != nil {
-			return nil, err
-		}
-		return &readCloserWrapper{header: h, rdr: io.LimitReader(rc, expectedSize-offset), rdrCloser: rc, file: f}, nil
 	}
 
 	compressedFirstChunk := make([]byte, h.chunkOffsets[chunkNum+1]-h.chunkOffsets[chunkNum])
