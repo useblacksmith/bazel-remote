@@ -35,9 +35,8 @@ import (
 // code-based auth check.
 
 // storagePrefixRejected and authSecretRejected meter the fail-closed
-// rejections below, by cause — symmetric with the selector interceptor's
-// bazel_remote_s3_backend_selector_rejected_total, and the counters the
-// rate-limited trust-rejection log line points operators at. The prefix and
+// rejections below, by cause — the counters the rate-limited
+// trust-rejection log line points operators at. The prefix and
 // secret are minted by the trusted upstream, never by customers, so any
 // nonzero series means upstream drift: FA/L1 version skew, a Doppler secret
 // mismatch, or a forwarding bug.

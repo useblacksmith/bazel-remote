@@ -48,27 +48,37 @@ func TestS3BackendsMapConfig(t *testing.T) {
 		t.Fatalf("ConnRecycleInterval = %v, want 1m", s3.ConnRecycleInterval)
 	}
 
-	// The allowlist pairs each selector with its bucket set: the entry's
-	// (possibly inherited) default bucket plus any extra_buckets.
-	allowed, err := s3.AllowedBackends()
+	// The routing table pairs each selector with its default bucket and
+	// bucket set (the entry's — possibly inherited — default bucket plus any
+	// extra_buckets), and names the map's default key.
+	defaultKey, entries, err := s3.RoutingBackends()
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantBuckets := map[string][]string{
-		"http://minio-a.example.com:9000":  {"shared-bucket"},
-		"https://minio-b.example.com:9000": {"bucket-b", "bucket-b-pre-rename"},
+	if defaultKey != "http://minio-a.example.com:9000" {
+		t.Fatalf("default key = %q, want backend a", defaultKey)
 	}
-	for key, buckets := range wantBuckets {
-		got, ok := allowed[key]
+	want := map[string]struct {
+		defaultBucket string
+		buckets       []string
+	}{
+		"http://minio-a.example.com:9000":  {"shared-bucket", []string{"shared-bucket"}},
+		"https://minio-b.example.com:9000": {"bucket-b", []string{"bucket-b", "bucket-b-pre-rename"}},
+	}
+	for key, w := range want {
+		got, ok := entries[key]
 		if !ok {
-			t.Fatalf("expected %q in allowed backends %v", key, allowed)
+			t.Fatalf("expected %q in routing backends %v", key, entries)
 		}
-		if len(got) != len(buckets) {
-			t.Fatalf("backend %q allowed buckets = %v, want %v", key, got, buckets)
+		if got.DefaultBucket != w.defaultBucket {
+			t.Fatalf("backend %q default bucket = %q, want %q", key, got.DefaultBucket, w.defaultBucket)
 		}
-		for _, bucket := range buckets {
-			if !got[bucket] {
-				t.Fatalf("backend %q allowed buckets = %v, missing %q", key, got, bucket)
+		if len(got.Buckets) != len(w.buckets) {
+			t.Fatalf("backend %q allowed buckets = %v, want %v", key, got.Buckets, w.buckets)
+		}
+		for _, bucket := range w.buckets {
+			if !got.Buckets[bucket] {
+				t.Fatalf("backend %q allowed buckets = %v, missing %q", key, got.Buckets, bucket)
 			}
 		}
 	}
