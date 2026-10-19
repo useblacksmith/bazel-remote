@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk"
 	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 
 	"google.golang.org/genproto/googleapis/bytestream"
@@ -34,6 +35,10 @@ type consumptionTrackingCache struct {
 // can legitimately lag by up to one read buffer. A contract violation
 // (pipelined Recv) would lag by at least one full chunk.
 const consumptionReadBufferBytes = 1024
+
+func (c *consumptionTrackingCache) PutZstd(ctx context.Context, hash string, size int64, r io.Reader) error {
+	return disk.ErrVerbatimUnavailable
+}
 
 func (c *consumptionTrackingCache) Put(ctx context.Context, kind cache.EntryKind, hash string, size int64, r io.Reader) error {
 	buf := make([]byte, consumptionReadBufferBytes)

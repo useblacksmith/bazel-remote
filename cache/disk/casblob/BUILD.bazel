@@ -10,7 +10,10 @@ go_library(
 
 go_test(
     name = "go_default_test",
-    srcs = ["casblob_test.go"],
+    srcs = [
+        "casblob_test.go",
+        "verbatim_test.go",
+    ],
     deps = [
         ":go_default_library",
         "//cache/disk/zstdimpl:go_default_library",

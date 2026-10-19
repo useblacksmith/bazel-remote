@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
 
 	"github.com/buchgr/bazel-remote/v2/utils/zstdpool"
@@ -438,6 +439,33 @@ var errWriteOffset error = errors.New("bytestream writes from non-zero offsets a
 var errCASWriteShed = status.Error(codes.FailedPrecondition, "too many in-flight CAS writes")
 var errDecoderPoolFail error = errors.New("failed to get DecoderWrapper from pool")
 
+// putUpload stores the body of a ByteStream Write. Compressed uploads are
+// stored as received when the cache offers that path, and decoded inline
+// otherwise.
+func (s *grpcServer) putUpload(ctx context.Context, hash string, size int64, cmp casblob.CompressionType, pr io.Reader) error {
+	if cmp == casblob.Identity {
+		return s.cache.Put(ctx, cache.CAS, hash, size, pr)
+	}
+
+	err := s.cache.PutZstd(ctx, hash, size, pr)
+	if !errors.Is(err, disk.ErrVerbatimUnavailable) {
+		return err
+	}
+
+	dec, ok := decoderPool.Get().(*syncpool.DecoderWrapper)
+	if !ok {
+		s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s", errDecoderPoolFail)
+		return errDecoderPoolFail
+	}
+	if err := dec.Reset(pr); err != nil {
+		s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s", err)
+		return err
+	}
+	rc := dec.IOReadCloser()
+	defer func() { _ = rc.Close() }()
+	return s.cache.Put(ctx, cache.CAS, hash, size, rc)
+}
+
 func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 
 	var resp bytestream.WriteResponse
@@ -540,28 +568,10 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 					return
 				}
 
-				var rc io.ReadCloser = pr
-				if cmp == casblob.Zstandard {
-					dec, ok := decoderPool.Get().(*syncpool.DecoderWrapper)
-					if !ok {
-						s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s", errDecoderPoolFail)
-						recvResult <- errDecoderPoolFail
-						return
-					}
-					err = dec.Reset(pr)
-					if err != nil {
-						s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s", err)
-						recvResult <- err
-						return
-					}
-					rc = dec.IOReadCloser()
-				}
-
 				// Acquire last so every earlier error path returns
 				// without holding a slot; the Put goroutine owns the
 				// release.
 				if !s.tryAcquireCASWriteSlot() {
-					_ = rc.Close()
 					s.accessLogger.Printf("GRPC BYTESTREAM WRITE SHED: %s", resourceName)
 					recvResult <- errCASWriteShed
 					return
@@ -569,9 +579,7 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 
 				go func() {
 					defer s.releaseCASWriteSlot()
-					defer func() { _ = rc.Close() }()
-					err := s.cache.Put(srv.Context(), cache.CAS, hash, size, rc)
-					putResult <- err
+					putResult <- s.putUpload(srv.Context(), hash, size, cmp, pr)
 				}()
 
 				firstIteration = false

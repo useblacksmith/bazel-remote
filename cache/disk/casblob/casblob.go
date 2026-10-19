@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"sync"
 
@@ -23,6 +24,18 @@ const (
 )
 
 const defaultChunkSize = 1024 * 1024 * 1 // 1M
+
+// MaxVerbatimZstdSize bounds blobs that can be stored as a single
+// client-provided chunk: the header's chunk size field is a uint32.
+const MaxVerbatimZstdSize = int64(math.MaxUint32)
+
+// MaxCompressedSize is the most bytes a zstd stream encoding size
+// uncompressed bytes can legitimately occupy (ZSTD_compressBound plus frame
+// header and checksum, rounded up). Longer uploads are rejected before they
+// can consume disk beyond the space reserved for the blob.
+func MaxCompressedSize(size int64) int64 {
+	return size + size/128 + 128
+}
 
 // 4 bytes, to be written to disk in little-endian format.
 // https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#skippable-frames
@@ -80,6 +93,13 @@ type readCloserWrapper struct {
 var errWrongMagicNum = errors.New("expected magic number not found")
 
 // Read the header and leave f at the start of the data.
+// singleChunk reports whether the blob is stored as exactly one compressed
+// chunk, which holds for every blob WriteZstdFrameAndClose writes and for
+// regular blobs no larger than defaultChunkSize.
+func (h *header) singleChunk() bool {
+	return len(h.chunkOffsets) == 2
+}
+
 func readHeader(f *os.File) (*header, error) {
 	var err error
 	var h header
@@ -261,6 +281,18 @@ func GetUncompressedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize 
 			return nil, err
 		}
 	}
+	if h.singleChunk() {
+		// Single-chunk blob (every blob WriteZstdFrameAndClose writes, and
+		// regular blobs up to one chunk): stream past the offset instead of
+		// decoding the whole blob into memory, and never emit more than
+		// the declared size even if the frame has not been verified yet.
+		rc, err := skipDecoded(zstd, f, remainder)
+		if err != nil {
+			return nil, err
+		}
+		return &readCloserWrapper{header: h, rdr: io.LimitReader(rc, h.uncompressedSize-offset), rdrCloser: rc, file: f}, nil
+	}
+
 	if remainder == 0 {
 		dec, err := zstd.GetDecoder(f)
 		if err != nil {
@@ -382,6 +414,16 @@ func GetZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, o
 		return f, nil
 	}
 
+	if h.singleChunk() {
+		// Single-chunk blob: decode past the offset
+		// and re-encode the rest as a stream, bounded by the declared size.
+		rc, err := skipDecoded(zstd, f, remainder)
+		if err != nil {
+			return nil, err
+		}
+		return encodedReadCloser(zstd, &readCloserWrapper{header: h, rdr: io.LimitReader(rc, h.uncompressedSize-offset), rdrCloser: rc, file: f})
+	}
+
 	compressedFirstChunk := make([]byte, h.chunkOffsets[chunkNum+1]-h.chunkOffsets[chunkNum])
 	_, err = io.ReadFull(f, compressedFirstChunk)
 	if err != nil {
@@ -414,6 +456,56 @@ func GetZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File, expectedSize int64, o
 // GetLegacyZstdReadCloser returns an io.ReadCloser that provides
 // zstandard-compressed data from an uncompressed file.
 func GetLegacyZstdReadCloser(zstd zstdimpl.ZstdImpl, f *os.File) (io.ReadCloser, error) {
+	return encodedReadCloser(zstd, f)
+}
+
+// skipDecoded returns a decoder positioned at the given uncompressed
+// offset within the zstd stream that starts at f's current position. f is
+// closed on error.
+// GetUncheckedReadCloser decodes a single-chunk blob written by
+// WriteZstdFrameAndClose without capping the output at the declared size, so
+// that a verifier can tell whether the frame expands past it. f is closed
+// with the returned reader, or on error.
+func GetUncheckedReadCloser(zstd zstdimpl.ZstdImpl, f *os.File) (io.ReadCloser, error) {
+	h, err := readHeader(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if h.compression != Zstandard || !h.singleChunk() {
+		_ = f.Close()
+		return nil, errors.New("not a single-chunk zstd blob")
+	}
+	if _, err = f.Seek(h.chunkOffsets[0], io.SeekStart); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	dec, err := zstd.GetDecoder(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &readCloserWrapper{header: h, rdr: dec, rdrCloser: dec, file: f}, nil
+}
+
+func skipDecoded(zstd zstdimpl.ZstdImpl, f *os.File, skip int64) (io.ReadCloser, error) {
+	dec, err := zstd.GetDecoder(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if _, err = io.CopyN(io.Discard, dec, skip); err != nil {
+		_ = dec.Close()
+		_ = f.Close()
+		return nil, err
+	}
+	return dec, nil
+}
+
+// encodedReadCloser returns an io.ReadCloser that provides zstandard
+// compressed data from the uncompressed stream f. f is closed when the
+// stream has been consumed, or on error.
+func encodedReadCloser(zstd zstdimpl.ZstdImpl, f io.ReadCloser) (io.ReadCloser, error) {
 
 	pr, pw := io.Pipe()
 
@@ -658,4 +750,58 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 	}
 
 	return fileOffset, nil
+}
+
+// WriteZstdFrameAndClose stores r - a zstd stream whose decoded content the
+// client claims is exactly size bytes - as a single-chunk Zstandard casblob
+// without decoding it. Nothing about the content is verified here; the
+// caller must verify the digest separately before trusting the blob (see
+// disk.PutZstd). Returns the size on disk.
+func WriteZstdFrameAndClose(r io.Reader, f *os.File, size int64) (int64, error) {
+	defer func() { _ = f.Close() }()
+
+	if size <= 0 || size > MaxVerbatimZstdSize {
+		return -1, fmt.Errorf("invalid single-chunk blob size: %d", size)
+	}
+
+	h := header{
+		uncompressedSize: size,
+		compression:      Zstandard,
+		chunkSize:        uint32(size),
+		chunkOffsets:     make([]int64, 2),
+	}
+	h.chunkOffsets[0] = chunkTableOffset
+
+	if err := h.write(f); err != nil {
+		return -1, err
+	}
+	h.chunkOffsets[0] = h.size()
+
+	limit := MaxCompressedSize(size)
+	n, err := io.Copy(f, io.LimitReader(r, limit+1))
+	if err != nil {
+		return -1, fmt.Errorf("failed to write compressed blob to disk: %w", err)
+	}
+	if n == 0 {
+		return -1, errors.New("empty compressed blob")
+	}
+	if n > limit {
+		return -1, fmt.Errorf("compressed blob exceeds %d bytes, the most a %d byte blob can compress to", limit, size)
+	}
+	h.chunkOffsets[1] = h.chunkOffsets[0] + n
+
+	if _, err = f.Seek(chunkTableOffset, io.SeekStart); err != nil {
+		return -1, fmt.Errorf("failed to seek to offset %d: %w", chunkTableOffset, err)
+	}
+	if err = binary.Write(f, binary.LittleEndian, h.chunkOffsets); err != nil {
+		return -1, fmt.Errorf("failed to write chunk offsets: %w", err)
+	}
+	if err = f.Sync(); err != nil {
+		return -1, fmt.Errorf("failed to sync file: %w", err)
+	}
+	if err = f.Close(); err != nil {
+		return -1, fmt.Errorf("failed to close file: %w", err)
+	}
+
+	return h.chunkOffsets[1], nil
 }

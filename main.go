@@ -159,6 +159,16 @@ func run(ctx *cli.Context) error {
 		log.Println("Zstandard implementation:", c.ZstdImplementation)
 	}
 
+	verbatimZstdUploadWorkers := 0
+	if v := os.Getenv("BAZEL_REMOTE_VERBATIM_ZSTD_UPLOADS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return fmt.Errorf("invalid BAZEL_REMOTE_VERBATIM_ZSTD_UPLOADS %q (number of verifier workers)", v)
+		}
+		verbatimZstdUploadWorkers = n
+		log.Printf("Storing client-compressed CAS uploads as received; digest verifier workers: %d", n)
+	}
+
 	opts := []disk.Option{
 		disk.WithStorageMode(c.StorageMode),
 		disk.WithZstdImplementation(c.ZstdImplementation),
@@ -167,6 +177,7 @@ func run(ctx *cli.Context) error {
 		disk.WithMaxSizeHardLimit(int64(c.MaxSizeHardLimit) * 1024 * 1024 * 1024),
 		disk.WithMaxEntries(c.MaxEntries),
 		disk.WithAccessLogger(c.AccessLogger),
+		disk.WithVerbatimZstdUploads(verbatimZstdUploadWorkers),
 	}
 	if c.ProxyBackend != nil {
 		opts = append(opts, disk.WithProxyBackend(c.ProxyBackend))

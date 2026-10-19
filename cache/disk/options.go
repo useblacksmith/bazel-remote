@@ -57,6 +57,18 @@ func WithStorageMode(mode string) Option {
 	}
 }
 
+// WithVerbatimZstdUploads stores client-compressed CAS uploads as received
+// (no inline decode, hash or re-encode) and verifies their digests on the
+// given number of background workers. workers <= 0 leaves the feature off.
+func WithVerbatimZstdUploads(workers int) Option {
+	return func(c *CacheConfig) error {
+		if workers > 0 {
+			c.diskCache.startVerbatimVerifier(workers)
+		}
+		return nil
+	}
+}
+
 func WithZstdImplementation(impl string) Option {
 	return func(c *CacheConfig) error {
 		var err error
