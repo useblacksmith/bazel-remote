@@ -179,9 +179,6 @@ func (c *GrpcClients) CheckCapabilities(ctx context.Context, zstd bool) error {
 	if err != nil {
 		return err
 	}
-	if !resp.CacheCapabilities.ActionCacheUpdateCapabilities.UpdateEnabled {
-		return errors.New("proxy backend does not allow action cache updates")
-	}
 	if !contains(resp.CacheCapabilities.DigestFunctions, pb.DigestFunction_SHA256) {
 		return errors.New("proxy backend does not support sha256")
 	}
