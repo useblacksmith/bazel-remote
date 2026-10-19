@@ -12,6 +12,7 @@ import (
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
+	"github.com/buchgr/bazel-remote/v2/utils/tempfile"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -103,6 +104,10 @@ func (v *verbatimVerifier) enqueue(job verifyJob) {
 // verification completes return whatever the client sent; a client whose
 // upload does not match its digest only corrupts entries under its own
 // storage prefix, and only until the verifier catches up.
+//
+// Until then the file keeps the setgid "in progress" bit tempfile.Create
+// set, so a blob whose verification is lost to a restart is dropped by the
+// next boot scan rather than loaded as trusted.
 func (c *diskCache) PutZstd(ctx context.Context, hash string, size int64, r io.Reader) error {
 	if c.verifier == nil || c.storageMode != casblob.Zstandard {
 		verbatimFallbackTotal.WithLabelValues("disabled").Inc()
@@ -155,6 +160,10 @@ func (c *diskCache) verifyVerbatim(job verifyJob) {
 		}
 		c.mu.Unlock()
 		return
+	}
+
+	if err := os.Chmod(blobPath, tempfile.FinalMode); err != nil {
+		log.Println("failed to mark", blobPath, "as complete:", err)
 	}
 
 	if c.proxy != nil {

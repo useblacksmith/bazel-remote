@@ -432,8 +432,9 @@ func (c *diskCache) put(ctx context.Context, kind cache.EntryKind, hash string, 
 			if err != nil {
 				log.Printf("warning: failed to remove temp file: %q", blobFile)
 			}
-		} else if blobFile != "" {
-			// Mark the file as "complete".
+		} else if blobFile != "" && verbatim == nil {
+			// Mark the file as "complete". Stored-as-received blobs
+			// keep the in-progress bit until the verifier clears it.
 			err := os.Chmod(blobFile, tempfile.FinalMode)
 			if err != nil {
 				log.Println("failed to mark", blobFile, "as complete:", err)

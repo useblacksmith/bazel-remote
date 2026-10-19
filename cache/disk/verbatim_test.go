@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -74,6 +76,69 @@ func TestPutZstdStoresAsReceivedAndVerifies(t *testing.T) {
 	}
 	if got, err = zstd.DecodeAll(compressed); err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("compressed read back mismatch: %v", err)
+	}
+}
+
+func TestPutZstdRestartDropsUnverified(t *testing.T) {
+	c := newVerbatimTestCache(t, 1)
+	ctx := context.Background()
+	zstd, _ := zstdimpl.Get("go")
+
+	const size = 4096
+	verifiedData, verifiedHash := testutils.RandomDataAndHash(size)
+	if err := c.PutZstd(ctx, verifiedHash, size, bytes.NewReader(zstd.EncodeAll(verifiedData))); err != nil {
+		t.Fatal(err)
+	}
+	waitVerified(t, c)
+
+	// A verifier with no workers accepts jobs and never runs them, like a
+	// process that exits with the queue still full.
+	c.startVerbatimVerifier(0)
+	pendingData, pendingHash := testutils.RandomDataAndHash(size)
+	if err := c.PutZstd(ctx, pendingHash, size, bytes.NewReader(zstd.EncodeAll(pendingData))); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := c.Contains(ctx, cache.CAS, pendingHash, size); !ok {
+		t.Fatal("unverified blob should be served until the verifier rules on it")
+	}
+	modeOf := func(hash string) os.FileMode {
+		key := cache.LookupKeyForContext(ctx, cache.CAS, hash)
+		item, ok := c.lru.Peek(key)
+		if !ok {
+			t.Fatalf("%s not in lru", hash)
+		}
+		info, err := os.Stat(c.getElementPath(key, item))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.Mode()
+	}
+	if modeOf(verifiedHash)&os.ModeSetgid != 0 {
+		t.Fatal("verified blob should have been marked complete")
+	}
+	if modeOf(pendingHash)&os.ModeSetgid == 0 {
+		t.Fatal("unverified blob should still be marked in progress")
+	}
+
+	reloaded, err := New(c.dir, 1024*1024*1024, WithStorageMode("zstd"), WithVerbatimZstdUploads(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := reloaded.Contains(ctx, cache.CAS, verifiedHash, size); !ok {
+		t.Fatal("verified blob should survive a restart")
+	}
+	if ok, _ := reloaded.Contains(ctx, cache.CAS, pendingHash, size); ok {
+		t.Fatal("unverified blob should be dropped by the boot scan")
+	}
+	var files []string
+	_ = filepath.WalkDir(c.dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			files = append(files, p)
+		}
+		return err
+	})
+	if len(files) != 1 {
+		t.Fatalf("expected only the verified blob on disk, found %v", files)
 	}
 }
 

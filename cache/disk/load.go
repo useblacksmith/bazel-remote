@@ -23,6 +23,7 @@ import (
 	"github.com/djherbis/atime"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
@@ -356,6 +357,11 @@ func (r scanResult) Swap(i, j int) {
 	r.metadata[i], r.metadata[j] = r.metadata[j], r.metadata[i]
 }
 
+var incompleteFilesRemoved = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "bazel_remote_disk_cache_incomplete_files_removed_total",
+	Help: "Files the boot scan removed because they were still marked in progress (partially written, or stored as received and not yet verified) when the previous process exited.",
+})
+
 func (c *diskCache) scanDir() (scanResult, error) {
 
 	numWorkers := runtime.NumCPU()
@@ -462,6 +468,19 @@ func (c *diskCache) scanDir() (scanResult, error) {
 					info, err := de.Info()
 					if err != nil {
 						return fmt.Errorf("failed to get file info for %q: %w", path.Join(dirName, name), err)
+					}
+
+					// tempfile.Create sets setgid on every new file and the
+					// writer clears it once the blob is complete and trusted
+					// (after digest verification for blobs stored as
+					// received), so a file still carrying it was cut short
+					// by a restart.
+					if info.Mode()&os.ModeSetgid != 0 {
+						if err := os.Remove(path.Join(dirName, name)); err != nil {
+							return fmt.Errorf("failed to remove incomplete file %q: %w", path.Join(dirName, name), err)
+						}
+						incompleteFilesRemoved.Inc()
+						continue
 					}
 
 					fields := strings.Split(name, "/")
