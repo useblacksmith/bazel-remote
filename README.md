@@ -229,11 +229,6 @@ OPTIONS:
       after which the server will shut itself down. (default: 0s, ie disabled)
       [$BAZEL_REMOTE_IDLE_TIMEOUT]
 
-   --max_queued_uploads value When using proxy backends, sets the maximum
-      number of objects in queue for upload. If the queue is full, uploads will
-      be skipped until the queue has space again. (default: 1000000)
-      [$BAZEL_REMOTE_MAX_QUEUED_UPLOADS]
-
    --max_blob_size value The maximum logical/uncompressed blob size that will
       be accepted from clients. Note that this limit is not applied to
       preexisting blobs in the cache. (default: 9223372036854775807)
@@ -249,10 +244,6 @@ OPTIONS:
       chunks reduce per-stream memory on a gRPC proxy whose downstream window
       is smaller than the default chunk (the FA L1→shim path).
       [$BAZEL_REMOTE_READ_CHUNK_SIZE]
-
-   --num_uploaders value When using proxy backends, sets the number of
-      Goroutines to process parallel uploads to backend. (default: 100)
-      [$BAZEL_REMOTE_NUM_UPLOADERS]
 
    --grpc_proxy.url value The base URL to use for the experimental grpc proxy
       backend, e.g. grpc://localhost:9090 or grpcs://example.com:7070. Note that
@@ -558,10 +549,6 @@ http_address: 0.0.0.0:8080
 
 # At most one of the proxy backends can be selected:
 #
-# If this is 0, proxy backends won't upload blobs.
-#num_uploaders: 100
-# The maximum number of proxy uploads to queue, before dropping uploads.
-#max_queued_uploads: 1000000
 # The largest blob size that will be accepted, for example 10MB:
 #max_blob_size: 10485760
 # ByteStream Read Send payload. Zero / omitted keeps the 2 MiB default.

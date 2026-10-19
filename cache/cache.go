@@ -64,15 +64,6 @@ func (e *Error) Error() string {
 // Implementations are expected to be safe for concurrent use.
 type Proxy interface {
 
-	// Put makes a reasonable effort to asynchronously upload the cache
-	// item identified by `hash` with logical size `logicalSize` and
-	// `sizeOnDisk` bytes on disk, whose data is readable from `rc` to
-	// the proxy backend. The data available in `rc` is in the same
-	// format as used by the disk.Cache instance.
-	//
-	// This is allowed to fail silently (for example when under heavy load).
-	Put(ctx context.Context, kind EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser)
-
 	// Get returns an io.ReadCloser from which the cache item identified by
 	// `hash` can be read, its logical size, and an error if something went
 	// wrong. The data available from `rc` is in the same format as used by

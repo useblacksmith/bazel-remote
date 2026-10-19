@@ -37,7 +37,6 @@ import (
 //   - Streamed GETs defer their outcome to the body's terminal state via
 //     allow/record and bodyOutcomeReadCloser (healthy headers prove nothing
 //     in a brownout), holding a half-open probe slot until the body
-//     finishes. Write-through uploads never probe at all (ExecuteNoProbe).
 
 var (
 	breakerState = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -126,26 +125,6 @@ func newBreaker(name string, errorLogger cache.Logger) *breaker {
 // across the call itself.
 func (b *breaker) Execute(call func() breakerOutcome) error {
 	if !b.allow() {
-		return errBreakerOpen
-	}
-	b.record(call())
-	return nil
-}
-
-// ExecuteNoProbe is Execute for calls too expensive to serve as the
-// half-open recovery probe — write-through PutObjects bounded only by the
-// 10m uploadTimeout. If such a call claimed the single probe slot, every
-// read on the backend would keep failing fast as errBreakerOpen for however
-// long the upload takes, so a recovered MinIO could serve artificial misses
-// for minutes. Instead these calls run only while the breaker is closed and
-// fail fast otherwise; probing is left to the read path, whose calls are
-// bounded in seconds and arrive constantly (the host's FindMissingBlobs
-// falls through to a backend Stat before every upload cycle).
-func (b *breaker) ExecuteNoProbe(call func() breakerOutcome) error {
-	b.mu.Lock()
-	closed := b.state == breakerClosed
-	b.mu.Unlock()
-	if !closed {
 		return errBreakerOpen
 	}
 	b.record(call())

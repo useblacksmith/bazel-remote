@@ -11,11 +11,8 @@ import (
 	"log"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
-	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -34,13 +31,6 @@ const (
 	// The maximum chunk size to write back to the client in Send calls.
 	// Inspired by Goma's FileBlob.FILE_CHUNK maxium size.
 	maxChunkSize = 2 * 1024 * 1024 // 2M
-
-	// uploadTimeout bounds a single asynchronous backend upload. Uploads
-	// previously ran on context.Background() with no deadline, so a hung
-	// backend connection could pin an upload worker forever. The bound is
-	// generous (large CAS blobs can be slow on a busy link); it exists to
-	// reclaim workers, not to police latency.
-	uploadTimeout = 10 * time.Minute
 )
 
 var transportMisses = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -62,26 +52,6 @@ var configRejectMisses = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bazel_remote_grpcproxy_config_reject_miss_total",
 	Help: "Proxy backend requests rejected by the backend's own trust interceptors (marked with the cache.blacksmith.sh ErrorInfo domain), degraded to cache misses. Nonzero means FA/L1 config skew (backend allowlist or prefix trust drift) — alertable.",
 }, []string{"method"})
-
-var uploadsDropped = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "bazel_remote_grpcproxy_upload_dropped_total",
-	Help: "Backend uploads dropped before forwarding (queue overflow, missing tenant prefix).",
-}, []string{"reason"})
-
-var uploadsForwarded = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "bazel_remote_grpcproxy_upload_forwarded_total",
-	Help: "Backend uploads forwarded to the gRPC proxy backend successfully.",
-})
-
-var uploadsFailed = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "bazel_remote_grpcproxy_upload_failed_total",
-	Help: "Backend uploads that reached the gRPC proxy backend but failed.",
-})
-
-var uploadQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "bazel_remote_grpcproxy_upload_queue_depth",
-	Help: "Queued backend uploads awaiting a gRPC proxy upload worker.",
-})
 
 // errBlobNotFound is fetchBlobDigest's not-found sentinel; callers treat it
 // as a cache miss, never a request-failing error.
@@ -209,9 +179,6 @@ func (c *GrpcClients) CheckCapabilities(ctx context.Context, zstd bool) error {
 	if err != nil {
 		return err
 	}
-	if !resp.CacheCapabilities.ActionCacheUpdateCapabilities.UpdateEnabled {
-		return errors.New("proxy backend does not allow action cache updates")
-	}
 	if !contains(resp.CacheCapabilities.DigestFunctions, pb.DigestFunction_SHA256) {
 		return errors.New("proxy backend does not support sha256")
 	}
@@ -223,7 +190,6 @@ func (c *GrpcClients) CheckCapabilities(ctx context.Context, zstd bool) error {
 
 type remoteGrpcProxyCache struct {
 	clients      *GrpcClients
-	uploadQueue  chan<- backendproxy.UploadReq
 	accessLogger cache.Logger
 	errorLogger  cache.Logger
 	observer     cache.OperationObserver
@@ -246,7 +212,7 @@ func WithOperationObserver(observer cache.OperationObserver) Option {
 
 func New(clients *GrpcClients, storageMode string,
 	accessLogger cache.Logger, errorLogger cache.Logger,
-	numUploaders, maxQueuedUploads int, options ...Option) cache.Proxy {
+	options ...Option) cache.Proxy {
 
 	proxy := &remoteGrpcProxyCache{
 		clients:      clients,
@@ -258,49 +224,7 @@ func New(clients *GrpcClients, storageMode string,
 		opt(proxy)
 	}
 
-	proxy.uploadQueue = backendproxy.StartUploaders(proxy, numUploaders, maxQueuedUploads)
-
 	return proxy
-}
-
-// StopUploaders terminates the upload worker pool by closing the queue.
-// Only safe when no further Put calls can occur — intended for an embedder
-// tearing down a backend that never served traffic (e.g. startup failure
-// after construction); a Put after StopUploaders panics on the closed
-// channel.
-func (r *remoteGrpcProxyCache) StopUploaders() {
-	if r.uploadQueue != nil {
-		close(r.uploadQueue)
-		r.uploadQueue = nil
-	}
-}
-
-// observeUpload reports one terminal backend-upload outcome. Failure statuses
-// ("error", "dropped") match the shared build-cache status taxonomy so
-// downstream failure counting keeps working; success is "forwarded" (see
-// WithOperationObserver). The entry kind is carried on the outcome because a
-// "forwarded" CAS write and a "forwarded" AC write mean different things to a
-// storage accountant: CAS writes are deduplicated by FindMissingBlobs before
-// upload, while AC updates unconditionally rewrite the same action digest on
-// every build, so observers must be able to tell them apart.
-func (r *remoteGrpcProxyCache) observeUpload(item backendproxy.UploadReq, status, reason string) {
-	switch status {
-	case "forwarded":
-		uploadsForwarded.Inc()
-	case "error":
-		uploadsFailed.Inc()
-	case "dropped":
-		uploadsDropped.WithLabelValues(reason).Inc()
-	}
-	uploadQueueDepth.Set(float64(len(r.uploadQueue)))
-	cache.ObserveOperation(cache.WithMetricsLabels(context.Background(), item.MetricsLabels), r.observer, cache.OperationOutcome{
-		Method: "backend_upload",
-		Kind:   item.Kind.String(),
-		Status: status,
-		Reason: reason,
-		Ops:    1,
-		Bytes:  nonNegativeUint64(item.SizeOnDisk),
-	})
 }
 
 func nonNegativeUint64(value int64) uint64 {
@@ -371,192 +295,6 @@ func withOutgoingS3Backend(ctx context.Context) context.Context {
 		ctx = ensureOutgoingMetadataValue(ctx, cache.S3BucketGRPCMetadataKey, selection.Bucket)
 	}
 	return ctx
-}
-
-// uploadContext rebuilds an outgoing context for an asynchronous upload from
-// the prefix captured at enqueue time (the original request context is long
-// gone by the time upload workers run). The context carries a deadline so a
-// hung backend cannot pin an upload worker indefinitely; callers must call
-// the returned cancel func.
-func uploadContext(item backendproxy.UploadReq) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-	if item.RequestScopedStoragePrefix && item.StoragePrefix != "" {
-		ctx = metadata.AppendToOutgoingContext(ctx, cache.StoragePrefixGRPCMetadataKey, item.StoragePrefix)
-	}
-	if item.S3Backend.Endpoint != "" {
-		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BackendGRPCMetadataKey, item.S3Backend.Endpoint)
-	}
-	if item.S3Backend.Bucket != "" {
-		ctx = metadata.AppendToOutgoingContext(ctx, cache.S3BucketGRPCMetadataKey, item.S3Backend.Bucket)
-	}
-	return ctx, cancel
-}
-
-func (r *remoteGrpcProxyCache) UploadFile(item backendproxy.UploadReq) {
-	defer func() { _ = item.Rc.Close() }()
-
-	// A required-but-missing prefix means the tenant attribution was lost
-	// between the auth interceptor and this queue. Forwarding the upload
-	// unscoped would let the downstream land it in a shared or wrong
-	// keyspace, so drop it instead: the cost is one lost warmup, never a
-	// cross-tenant write.
-	if item.RequireStoragePrefix && !item.RequestScopedStoragePrefix {
-		logResponse(r.errorLogger, "Upload", "missing request-scoped storage prefix; dropping upload", item.Kind, item.Hash)
-		r.observeUpload(item, "dropped", "missing_prefix")
-		return
-	}
-
-	switch item.Kind {
-	case cache.RAW:
-		// RAW cache entries are a special case of AC, used when --disable_http_ac_validation
-		// is enabled. We can treat them as AC in this scope
-		fallthrough
-	case cache.AC:
-		data := make([]byte, item.SizeOnDisk)
-		read := int64(0)
-		for {
-			n, err := item.Rc.Read(data[read:])
-			if n > 0 {
-				read += int64(n)
-			}
-			if err == io.EOF || read == item.SizeOnDisk {
-				break
-			}
-		}
-		if read != item.SizeOnDisk {
-			logResponse(r.errorLogger, "Update", "Unexpected short read", item.Kind, item.Hash)
-			r.observeUpload(item, "error", "short_read")
-			return
-		}
-		ar := &pb.ActionResult{}
-		err := proto.Unmarshal(data, ar)
-		if err != nil {
-			logResponse(r.errorLogger, "Update", err.Error(), item.Kind, item.Hash)
-			r.observeUpload(item, "error", "unmarshal_failed")
-			return
-		}
-		digest := &pb.Digest{
-			Hash:      item.Hash,
-			SizeBytes: item.LogicalSize,
-		}
-
-		req := &pb.UpdateActionResultRequest{
-			ActionDigest: digest,
-			ActionResult: ar,
-		}
-		ctx, cancel := uploadContext(item)
-		defer cancel()
-		_, err = r.clients.ac.UpdateActionResult(ctx, req)
-		if err != nil {
-			logResponse(r.errorLogger, "Update", err.Error(), item.Kind, item.Hash)
-			r.observeUpload(item, "error", "backend_update_failed")
-			return
-		}
-		r.observeUpload(item, "forwarded", "")
-		return
-	case cache.CAS:
-		ctx, cancel := uploadContext(item)
-		defer cancel()
-		stream, err := r.clients.bs.Write(ctx)
-		if err != nil {
-			logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
-			r.observeUpload(item, "error", "backend_write_failed")
-			return
-		}
-
-		bufSize := item.SizeOnDisk
-		if bufSize > maxChunkSize {
-			bufSize = maxChunkSize
-		}
-		buf := make([]byte, bufSize)
-
-		template := "uploads/%s/blobs/%s/%d"
-		if r.v2mode {
-			template = "uploads/%s/compressed-blobs/zstd/%s/%d"
-		}
-		resourceName := fmt.Sprintf(template, uuid.New().String(), item.Hash, item.LogicalSize)
-
-		firstIteration := true
-		for {
-			n, err := item.Rc.Read(buf)
-			if err != nil && err != io.EOF {
-				logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
-				err := stream.CloseSend()
-				if err != nil {
-					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
-				}
-				r.observeUpload(item, "error", "local_read_failed")
-				return
-			}
-			if n > 0 {
-				rn := ""
-				if firstIteration {
-					firstIteration = false
-					rn = resourceName
-				}
-				req := &bs.WriteRequest{
-					ResourceName: rn,
-					Data:         buf[:n],
-				}
-				err := stream.Send(req)
-				if err != nil {
-					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
-					r.observeUpload(item, "error", "backend_write_failed")
-					return
-				}
-			} else {
-				_, err = stream.CloseAndRecv()
-				if err != nil {
-					logResponse(r.errorLogger, "Write", err.Error(), item.Kind, item.Hash)
-					r.observeUpload(item, "error", "backend_write_failed")
-					return
-				}
-				logResponse(r.accessLogger, "Write", "Success", item.Kind, item.Hash)
-				r.observeUpload(item, "forwarded", "")
-				return
-			}
-		}
-	default:
-		logResponse(r.errorLogger, "Write", "Unexpected kind", item.Kind, item.Hash)
-		r.observeUpload(item, "error", "unexpected_kind")
-		return
-	}
-}
-
-func (r *remoteGrpcProxyCache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
-	if r.uploadQueue == nil {
-		_ = rc.Close()
-		return
-	}
-
-	// Capture the request-scoped storage prefix, backend selection and
-	// metrics labels at enqueue time; uploads are asynchronous and the
-	// request context is gone when workers run.
-	prefix, requestScoped := cache.StoragePrefixFromContext(ctx)
-	s3Backend, _ := cache.S3BackendFromContext(ctx)
-	labels, _ := cache.MetricsLabelsFromContext(ctx)
-
-	item := backendproxy.UploadReq{
-		Hash:                       hash,
-		LogicalSize:                logicalSize,
-		SizeOnDisk:                 sizeOnDisk,
-		Kind:                       kind,
-		Rc:                         rc,
-		StoragePrefix:              prefix,
-		RequestScopedStoragePrefix: requestScoped,
-		RequireStoragePrefix:       cache.StoragePrefixRequiredFromContext(ctx),
-		S3Backend:                  s3Backend,
-		MetricsLabels:              labels,
-	}
-
-	select {
-	case r.uploadQueue <- item:
-		uploadQueueDepth.Set(float64(len(r.uploadQueue)))
-	default:
-		r.errorLogger.Printf("too many uploads queued")
-		r.observeUpload(item, "dropped", "upload_queue_full")
-		_ = rc.Close()
-	}
 }
 
 func (r *remoteGrpcProxyCache) fetchBlobDigest(ctx context.Context, hash string) (*pb.Digest, error) {

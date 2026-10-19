@@ -14,7 +14,6 @@ import (
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
-	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -45,12 +44,11 @@ type s3Cache struct {
 	// carry no request-scoped bucket (selector-less HTTP side-door traffic,
 	// single-backend deployments). Requests whose context carries a
 	// validated (endpoint, bucket) selection use that bucket instead — the
-	// minio client and upload queue are per endpoint, but the bucket is per
+	// minio client is per endpoint, but the bucket is per
 	// request (see cache.S3BucketGRPCMetadataKey).
-	bucket      string
-	uploadQueue chan<- backendproxy.UploadReq
+	bucket string
 	// breaker guards every MinIO call this backend makes (read fall-through,
-	// existence checks, write-through PUTs). Per backend by construction: in
+	// existence checks). Per backend by construction: in
 	// multi-backend map mode a sick shard trips only its own breaker and
 	// must not blind the healthy shards.
 	breaker          *breaker
@@ -60,9 +58,8 @@ type s3Cache struct {
 	v2mode           bool
 	updateTimestamps bool
 	// disconnectedTools severs the named build tools from this backend
-	// entirely: Get and Contains answer clean misses, Put drops the
-	// write-through before the upload queue, and LRU artifacts are skipped,
-	// leaving the local disk cache as the only tier for those tools. Nil
+	// entirely: Get and Contains answer clean misses and LRU artifacts are
+	// skipped, leaving the local disk cache as the only tier for those tools. Nil
 	// disconnects nothing. Canary toggle — flipping the env var is the whole
 	// roll-in/roll-out.
 	//
@@ -122,33 +119,10 @@ var (
 		Name: "bazel_remote_s3_backend_lookups_skipped_total",
 		Help: "S3 backend Get/Contains lookups skipped without dialing MinIO.",
 	}, []string{"backend", "reason"})
-	backendUploadsSkipped = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "bazel_remote_s3_backend_uploads_skipped_total",
-		Help: "S3 backend write-through uploads skipped by policy before enqueueing.",
-	}, []string{"backend", "reason"})
-	uploadQueueDropped = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "bazel_remote_s3_upload_queue_dropped_total",
-		Help: "Backend uploads dropped because the S3 upload queue was full.",
-	}, []string{"backend"})
-	uploadQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "bazel_remote_s3_upload_queue_depth",
-		Help: "Queued backend uploads awaiting an S3 upload worker.",
-	}, []string{"backend"})
 	prefixMissing = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_prefix_missing_total",
 		Help: "Requests that required a request-scoped storage prefix but carried none (configured fallback prefix used).",
 	}, []string{"operation"})
-	// uploadOutcomes is the native terminal-outcome counter for write-through
-	// uploads, independent of any installed OperationObserver: standalone
-	// (L1-node) deployments install no observer, and without this series a
-	// sustained run of failed PUTs drains the queue while every queue-drop
-	// alert stays green. Labels are bounded: status/reason come from
-	// classifyUploadOutcome (created | already_exists/precondition_failed |
-	// error/s3_put_failed).
-	uploadOutcomes = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "bazel_remote_s3_upload_outcomes_total",
-		Help: "Terminal S3 write-through upload outcomes per backend (created, already_exists, error).",
-	}, []string{"backend", "status", "reason"})
 )
 
 // PrometheusMetrics returns a Metrics implementation backed by this package's
@@ -273,21 +247,6 @@ func breakerReadOutcome(parent context.Context, err error) breakerOutcome {
 	return outcomeFailure
 }
 
-// breakerUploadOutcome classifies a write-path minio result for the
-// breaker. A precondition failure means the object already exists — MinIO
-// answered, so the backend is healthy (mirrors classifyUploadOutcome's
-// already_exists mapping).
-func breakerUploadOutcome(err error) breakerOutcome {
-	if err == nil {
-		return outcomeSuccess
-	}
-	switch minio.ToErrorResponse(err).StatusCode {
-	case http.StatusPreconditionFailed, http.StatusNotModified:
-		return outcomeSuccess
-	}
-	return outcomeFailure
-}
-
 // bodyOutcomeReadCloser releases the readDeadline timer when the caller
 // finishes with a streamed GET body, and reports the body's TERMINAL state
 // to the breaker — the streamed read's ONLY breaker outcome. Headers alone
@@ -348,7 +307,7 @@ func (c *bodyOutcomeReadCloser) Close() error {
 
 func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval time.Duration,
 	storageMode string, accessLogger cache.Logger, errorLogger cache.Logger,
-	numUploaders, maxQueuedUploads int, metrics Metrics, options ...Option) (*s3Cache, error) {
+	metrics Metrics, options ...Option) (*s3Cache, error) {
 
 	if spec.Credentials == nil {
 		return nil, fmt.Errorf("failed to determine s3proxy credentials for backend %q", spec.Key)
@@ -440,8 +399,6 @@ func newBackend(spec BackendSpec, updateTimestamps bool, connRecycleInterval tim
 		c.objectKey = objectKeyV1
 	}
 
-	c.uploadQueue = backendproxy.StartUploaders(c, numUploaders, maxQueuedUploads)
-
 	return c, nil
 }
 
@@ -460,7 +417,7 @@ func New(
 	ConnRecycleInterval time.Duration,
 
 	storageMode string, accessLogger cache.Logger,
-	errorLogger cache.Logger, numUploaders, maxQueuedUploads int,
+	errorLogger cache.Logger,
 	metrics Metrics, options ...Option) cache.Proxy {
 
 	fmt.Println("Using S3 backend.")
@@ -474,8 +431,7 @@ func New(
 		DisableSSL:       DisableSSL,
 		Region:           Region,
 		MaxIdleConns:     MaxIdleConns,
-	}, UpdateTimestamps, ConnRecycleInterval, storageMode, accessLogger, errorLogger,
-		numUploaders, maxQueuedUploads, metrics, options...)
+	}, UpdateTimestamps, ConnRecycleInterval, storageMode, accessLogger, errorLogger, metrics, options...)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -561,162 +517,6 @@ func logResponse(log cache.Logger, method, bucket, key string, err error) {
 	}
 
 	log.Printf("S3 %s %s %s %s", method, bucket, key, status)
-}
-
-func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
-	prefix := item.StoragePrefix
-	requestScopedPrefix := item.RequestScopedStoragePrefix
-	requirePrefix := item.RequireStoragePrefix
-	if item.Kind == cache.RAW {
-		prefix = c.prefix
-		requestScopedPrefix = false
-		requirePrefix = false
-	}
-	if prefix == "" {
-		prefix = c.prefix
-	}
-	if requirePrefix && !requestScopedPrefix {
-		c.logMissingRequiredStoragePrefix("UPLOAD", item.Kind, item.Hash)
-	}
-	objectKey := c.objectKeyForPrefix(prefix, item.Hash, item.Kind)
-
-	// The bucket captured at enqueue time, like the storage prefix above:
-	// uploads are asynchronous, so the routing decision must travel with the
-	// item. An empty capture (selector-less traffic) means the default bucket.
-	bucket := item.S3Backend.Bucket
-	if bucket == "" {
-		bucket = c.bucket
-	}
-
-	opts := minio.PutObjectOptions{
-		UserMetadata: map[string]string{
-			"Content-Type": "application/octet-stream",
-		},
-	}
-	// Create-if-absent: a backend upload only counts toward the storage footprint
-	// when it stores a net-new object. If the object already exists, MinIO rejects
-	// the conditional PUT with a precondition failure and we classify it as
-	// already_exists instead of created.
-	opts.SetMatchETagExcept("*")
-
-	// Uploads run on background workers with no request deadline; the
-	// timeout reclaims a worker pinned by a hung MinIO connection. No
-	// tighter deadline here: large CAS blobs may legitimately take long,
-	// and the breaker covers the sick-MinIO case.
-	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
-	defer cancel()
-
-	// NoProbe: a PutObject bounded only by uploadTimeout must not become
-	// the half-open recovery probe (see ExecuteNoProbe).
-	var putErr error
-	berr := c.breaker.ExecuteNoProbe(func() breakerOutcome {
-		_, err := c.mcore.PutObject(
-			ctx,
-			bucket,          // bucketName
-			objectKey,       // objectName
-			item.Rc,         // reader
-			item.SizeOnDisk, // objectSize
-			"",              // md5base64
-			"",              // sha256
-			opts,            // metadata
-		)
-		putErr = err
-		return breakerUploadOutcome(err)
-	})
-
-	var status, reason string
-	if berr != nil {
-		// The breaker refused the call without dialing MinIO: fail the item
-		// fast with its own terminal outcome so dashboards can tell a sick
-		// backend (breaker_open) from failing PUTs (s3_put_failed).
-		logResponse(c.accessLogger, "UPLOAD", bucket, objectKey, berr)
-		status, reason = "error", "breaker_open"
-	} else {
-		logResponse(c.accessLogger, "UPLOAD", bucket, objectKey, putErr)
-		status, reason = classifyUploadOutcome(putErr)
-	}
-	uploadOutcomes.WithLabelValues(c.key, status, reason).Inc()
-	c.observeUpload(context.Background(), item, status, reason)
-	uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
-
-	_ = item.Rc.Close()
-}
-
-// classifyUploadOutcome maps a create-if-absent backend PutObject result to a
-// terminal storage-accounting status. Only a net-new object (no error) is
-// "created" and counts toward the footprint. A precondition failure means the
-// object already existed: RFC-compliant servers return 412 PreconditionFailed,
-// while some older MinIO releases return 304 NotModified, so both map to
-// already_exists. Anything else is a genuine failure.
-//
-// The failure status is "error" (not "failed") to match the shared build-cache
-// status taxonomy: FA emits "error" (buildCacheStatusError) and the web reader
-// counts status IN ('error', 'rejected', 'dropped') as failures
-// (BuildCacheMetricsService::FAILURE_STATUSES). A divergent "failed" would be
-// silently dropped by those consumers.
-func classifyUploadOutcome(err error) (status string, reason string) {
-	if err == nil {
-		return "created", ""
-	}
-	switch minio.ToErrorResponse(err).StatusCode {
-	case http.StatusPreconditionFailed, http.StatusNotModified:
-		return "already_exists", "precondition_failed"
-	default:
-		return "error", "s3_put_failed"
-	}
-}
-
-func (c *s3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
-	if reason, disconnected := c.disconnectReason(ctx); disconnected {
-		// Drop the write-through before the upload queue. Deliberately NO
-		// ObserveOperation outcome: the web-side accounting counts the
-		// dropped/error/rejected statuses as failures (see
-		// classifyUploadOutcome), and this skip is policy, not a failure —
-		// the Prometheus counter is the signal.
-		backendUploadsSkipped.WithLabelValues(c.key, reason).Inc()
-		_ = rc.Close()
-		return
-	}
-	if c.uploadQueue == nil {
-		_ = rc.Close()
-		return
-	}
-	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
-	labels, _ := cache.MetricsLabelsFromContext(ctx)
-	// Capture the (endpoint, bucket) selection at enqueue time for the same
-	// reason as the storage prefix: the request context is gone when upload
-	// workers run, and the bucket is per request. (The endpoint half is
-	// already settled — this backend's queue IS the endpoint routing
-	// decision — but the pair travels together.)
-	selection, _ := cache.S3BackendFromContext(ctx)
-
-	select {
-	case c.uploadQueue <- backendproxy.UploadReq{
-		Hash:                       hash,
-		LogicalSize:                logicalSize,
-		SizeOnDisk:                 sizeOnDisk,
-		Kind:                       kind,
-		Rc:                         rc,
-		StoragePrefix:              prefix,
-		RequestScopedStoragePrefix: requestScopedPrefix,
-		RequireStoragePrefix:       requirePrefix,
-		S3Backend:                  selection,
-		MetricsLabels:              labels,
-	}:
-		uploadQueueDepth.WithLabelValues(c.key).Set(float64(len(c.uploadQueue)))
-	default:
-		c.errorLogger.Printf("too many uploads queued for S3 backend %s\n", c.key)
-		uploadQueueDropped.WithLabelValues(c.key).Inc()
-		cache.ObserveOperation(ctx, c.observer, cache.OperationOutcome{
-			Method: "backend_upload",
-			Kind:   kind.String(),
-			Status: "dropped",
-			Reason: "upload_queue_full",
-			Ops:    1,
-			Bytes:  nonNegativeUint64(sizeOnDisk),
-		})
-		_ = rc.Close()
-	}
 }
 
 func (c *s3Cache) UpdateModificationTimestamp(ctx context.Context, bucket string, object string) {
@@ -952,19 +752,6 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	logResponse(c.accessLogger, "CONTAINS", bucket, objectKey, err)
 
 	return exists, size
-}
-
-func (c *s3Cache) observeUpload(ctx context.Context, item backendproxy.UploadReq, status string, reason string) {
-	// SizeOnDisk is the compressed/stored byte count, matching what MinIO actually
-	// persists; the footprint accumulator and the MinIO drift scan share this unit.
-	cache.ObserveOperation(cache.WithMetricsLabels(ctx, item.MetricsLabels), c.observer, cache.OperationOutcome{
-		Method: "backend_upload",
-		Kind:   item.Kind.String(),
-		Status: status,
-		Reason: reason,
-		Ops:    1,
-		Bytes:  nonNegativeUint64(item.SizeOnDisk),
-	})
 }
 
 func nonNegativeUint64(value int64) uint64 {

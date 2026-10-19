@@ -91,51 +91,41 @@ func (c *URLBackendConfig) validate(protocol string) error {
 
 // Config holds the top-level configuration for bazel-remote.
 type Config struct {
-	HTTPAddress               string                    `yaml:"http_address"`
-	GRPCAddress               string                    `yaml:"grpc_address"`
-	ProfileAddress            string                    `yaml:"profile_address"`
-	Dir                       string                    `yaml:"dir"`
-	MaxSize                   int                       `yaml:"max_size"`
-	MaxSizeHardLimit          int                       `yaml:"max_size_hard_limit"`
-	MaxEntries                int64                     `yaml:"max_entries"`
-	StorageMode               string                    `yaml:"storage_mode"`
-	ZstdImplementation        string                    `yaml:"zstd_implementation"`
-	HtpasswdFile              string                    `yaml:"htpasswd_file"`
-	LDAP                      *LDAPConfig               `yaml:"ldap,omitempty"`
-	MinTLSVersion             string                    `yaml:"min_tls_version"`
-	TLSCaFile                 string                    `yaml:"tls_ca_file"`
-	TLSCertFile               string                    `yaml:"tls_cert_file"`
-	TLSKeyFile                string                    `yaml:"tls_key_file"`
-	AllowUnauthenticatedReads bool                      `yaml:"allow_unauthenticated_reads"`
-	S3CloudStorage            *S3CloudStorageConfig     `yaml:"s3_proxy,omitempty"`
-	AzBlobConfig              *AzBlobStorageConfig      `yaml:"azblob_proxy,omitempty"`
-	GoogleCloudStorage        *GoogleCloudStorageConfig `yaml:"gcs_proxy,omitempty"`
-	HTTPBackend               *URLBackendConfig         `yaml:"http_proxy,omitempty"`
-	GRPCBackend               *URLBackendConfig         `yaml:"grpc_proxy,omitempty"`
-	NumUploaders              int                       `yaml:"num_uploaders"`
-	MaxQueuedUploads          int                       `yaml:"max_queued_uploads"`
-	// NumUploadersExplicit / MaxQueuedUploadsExplicit record whether the
-	// operator supplied the value (CLI flag set, or key present in the YAML
-	// file) as opposed to inheriting the default. perBackendUploadLimits
-	// needs presence, not value: an explicit `--num_uploaders 100` happens
-	// to equal defaultNumUploaders, and treating it as "unset" silently
-	// quarters the configured worker pool in multi-backend mode.
-	NumUploadersExplicit        bool          `yaml:"-"`
-	MaxQueuedUploadsExplicit    bool          `yaml:"-"`
-	IdleTimeout                 time.Duration `yaml:"idle_timeout"`
-	DisableHTTPACValidation     bool          `yaml:"disable_http_ac_validation"`
-	DisableGRPCACDepsCheck      bool          `yaml:"disable_grpc_ac_deps_check"`
-	EnableACKeyInstanceMangling bool          `yaml:"enable_ac_key_instance_mangling"`
-	EnableEndpointMetrics       bool          `yaml:"enable_endpoint_metrics"`
-	MetricsDurationBuckets      []float64     `yaml:"endpoint_metrics_duration_buckets"`
-	HttpMetricsPrefix           bool          `yaml:"http_metrics_prefix"`
-	ExperimentalRemoteAssetAPI  bool          `yaml:"experimental_remote_asset_api"`
-	HTTPReadTimeout             time.Duration `yaml:"http_read_timeout"`
-	HTTPWriteTimeout            time.Duration `yaml:"http_write_timeout"`
-	AccessLogLevel              string        `yaml:"access_log_level"`
-	LogTimezone                 string        `yaml:"log_timezone"`
-	MaxBlobSize                 int64         `yaml:"max_blob_size"`
-	MaxProxyBlobSize            int64         `yaml:"max_proxy_blob_size"`
+	HTTPAddress                 string                    `yaml:"http_address"`
+	GRPCAddress                 string                    `yaml:"grpc_address"`
+	ProfileAddress              string                    `yaml:"profile_address"`
+	Dir                         string                    `yaml:"dir"`
+	MaxSize                     int                       `yaml:"max_size"`
+	MaxSizeHardLimit            int                       `yaml:"max_size_hard_limit"`
+	MaxEntries                  int64                     `yaml:"max_entries"`
+	StorageMode                 string                    `yaml:"storage_mode"`
+	ZstdImplementation          string                    `yaml:"zstd_implementation"`
+	HtpasswdFile                string                    `yaml:"htpasswd_file"`
+	LDAP                        *LDAPConfig               `yaml:"ldap,omitempty"`
+	MinTLSVersion               string                    `yaml:"min_tls_version"`
+	TLSCaFile                   string                    `yaml:"tls_ca_file"`
+	TLSCertFile                 string                    `yaml:"tls_cert_file"`
+	TLSKeyFile                  string                    `yaml:"tls_key_file"`
+	AllowUnauthenticatedReads   bool                      `yaml:"allow_unauthenticated_reads"`
+	S3CloudStorage              *S3CloudStorageConfig     `yaml:"s3_proxy,omitempty"`
+	AzBlobConfig                *AzBlobStorageConfig      `yaml:"azblob_proxy,omitempty"`
+	GoogleCloudStorage          *GoogleCloudStorageConfig `yaml:"gcs_proxy,omitempty"`
+	HTTPBackend                 *URLBackendConfig         `yaml:"http_proxy,omitempty"`
+	GRPCBackend                 *URLBackendConfig         `yaml:"grpc_proxy,omitempty"`
+	IdleTimeout                 time.Duration             `yaml:"idle_timeout"`
+	DisableHTTPACValidation     bool                      `yaml:"disable_http_ac_validation"`
+	DisableGRPCACDepsCheck      bool                      `yaml:"disable_grpc_ac_deps_check"`
+	EnableACKeyInstanceMangling bool                      `yaml:"enable_ac_key_instance_mangling"`
+	EnableEndpointMetrics       bool                      `yaml:"enable_endpoint_metrics"`
+	MetricsDurationBuckets      []float64                 `yaml:"endpoint_metrics_duration_buckets"`
+	HttpMetricsPrefix           bool                      `yaml:"http_metrics_prefix"`
+	ExperimentalRemoteAssetAPI  bool                      `yaml:"experimental_remote_asset_api"`
+	HTTPReadTimeout             time.Duration             `yaml:"http_read_timeout"`
+	HTTPWriteTimeout            time.Duration             `yaml:"http_write_timeout"`
+	AccessLogLevel              string                    `yaml:"access_log_level"`
+	LogTimezone                 string                    `yaml:"log_timezone"`
+	MaxBlobSize                 int64                     `yaml:"max_blob_size"`
+	MaxProxyBlobSize            int64                     `yaml:"max_proxy_blob_size"`
 	// ReadChunkSizeBytes is the maximum ByteStream Read response payload.
 	// Zero keeps bazel-remote's 2 MiB default (server.maxChunkSize).
 	ReadChunkSizeBytes int64 `yaml:"read_chunk_size"`
@@ -163,20 +153,7 @@ type YamlConfig struct {
 
 const disabledGRPCListener = "none"
 
-// Proxy-backend upload-pool defaults. The single-backend defaults are
-// bazel-remote's historical ones (also mirrored by the CLI flag defaults in
-// utils/flags). In multi-backend S3 mode the pool is per backend and the
-// queue preallocates (~200B/slot), so the historical defaults would cost
-// ~200MB + 100 goroutines per map entry; multi-backend mode therefore
-// lowers the per-backend defaults, and an explicit top-level
-// num_uploaders/max_queued_uploads setting still applies per backend.
 const (
-	defaultNumUploaders     = 100
-	defaultMaxQueuedUploads = 1000000
-
-	multiBackendNumUploaders     = 25
-	multiBackendMaxQueuedUploads = 100000
-
 	// Must match server.maxChunkSize: the largest ByteStream Read Send
 	// the gRPC server will emit. Config cannot import server.
 	maxReadChunkSizeBytes = 2 * 1024 * 1024
@@ -190,8 +167,6 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 	httpAddress string, grpcAddress string,
 	profileAddress string,
 	htpasswdFile string,
-	maxQueuedUploads int,
-	numUploaders int,
 	minTLSVersion string,
 	tlsCaFile string,
 	tlsCertFile string,
@@ -231,8 +206,6 @@ func newFromArgs(dir string, maxSize int, storageMode string, zstdImplementation
 		StorageMode:                 storageMode,
 		ZstdImplementation:          zstdImplementation,
 		HtpasswdFile:                htpasswdFile,
-		MaxQueuedUploads:            maxQueuedUploads,
-		NumUploaders:                numUploaders,
 		MinTLSVersion:               minTLSVersion,
 		TLSCaFile:                   tlsCaFile,
 		TLSCertFile:                 tlsCertFile,
@@ -291,9 +264,7 @@ func NewFromYaml(data []byte) (*Config, error) {
 		Config: Config{
 			StorageMode:            "zstd",
 			ZstdImplementation:     "go",
-			NumUploaders:           defaultNumUploaders,
 			MinTLSVersion:          "1.0",
-			MaxQueuedUploads:       defaultMaxQueuedUploads,
 			MaxBlobSize:            math.MaxInt64,
 			MaxProxyBlobSize:       math.MaxInt64,
 			MetricsDurationBuckets: defaultDurationBuckets,
@@ -307,19 +278,6 @@ func NewFromYaml(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse YAML config: %v", err)
 	}
 	c := yc.Config
-
-	// Presence probe: a second, minimal unmarshal with pointer fields
-	// distinguishes "key present in the file" from "inherited the seeded
-	// default" — required because perBackendUploadLimits must not treat an
-	// explicit value that equals the default as unset.
-	var presence struct {
-		NumUploaders     *int `yaml:"num_uploaders"`
-		MaxQueuedUploads *int `yaml:"max_queued_uploads"`
-	}
-	if err := yaml.Unmarshal(data, &presence); err == nil {
-		c.NumUploadersExplicit = presence.NumUploaders != nil
-		c.MaxQueuedUploadsExplicit = presence.MaxQueuedUploads != nil
-	}
 
 	if c.HTTPAddress == "" {
 		c.HTTPAddress = net.JoinHostPort(yc.Host, strconv.Itoa(yc.Port))
@@ -587,26 +545,6 @@ func validateConfig(c *Config) error {
 	return nil
 }
 
-// perBackendUploadLimits resolves the upload-pool sizing for one backend of
-// a multi-backend S3 proxy. num_uploaders/max_queued_uploads apply per
-// backend (queue isolation is the point), so when they are left unset the
-// multi-backend defaults take over — the historical defaults preallocate
-// ~200MB of queue and 100 goroutines per map entry. Any explicitly
-// configured value is inherited unchanged by every backend, even when it
-// happens to equal the single-backend default (presence-aware: see the
-// *Explicit fields — value equality must not be read as "unset").
-func (c *Config) perBackendUploadLimits() (numUploaders, maxQueuedUploads int) {
-	numUploaders = c.NumUploaders
-	if !c.NumUploadersExplicit {
-		numUploaders = multiBackendNumUploaders
-	}
-	maxQueuedUploads = c.MaxQueuedUploads
-	if !c.MaxQueuedUploadsExplicit {
-		maxQueuedUploads = multiBackendMaxQueuedUploads
-	}
-	return numUploaders, maxQueuedUploads
-}
-
 func Get(ctx *cli.Context) (*Config, error) {
 	// Get a Config with all the basic fields set.
 	cfg, err := get(ctx)
@@ -758,8 +696,6 @@ func get(ctx *cli.Context) (*Config, error) {
 		grpcAddress,
 		profileAddress,
 		ctx.String("htpasswd_file"),
-		ctx.Int("max_queued_uploads"),
-		ctx.Int("num_uploaders"),
 		ctx.String("min_tls_version"),
 		ctx.String("tls_ca_file"),
 		ctx.String("tls_cert_file"),
@@ -791,10 +727,5 @@ func get(ctx *cli.Context) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Flag-path presence: urfave/cli knows whether the operator passed the
-	// flag; value equality with the default must not be read as "unset"
-	// (see perBackendUploadLimits).
-	cfg.NumUploadersExplicit = ctx.IsSet("num_uploaders")
-	cfg.MaxQueuedUploadsExplicit = ctx.IsSet("max_queued_uploads")
 	return cfg, nil
 }

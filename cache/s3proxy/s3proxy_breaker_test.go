@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
-	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
@@ -141,41 +140,6 @@ func TestBreakerTripsAndReadsFailFastWhenOpen(t *testing.T) {
 	}
 	if !strings.Contains(errBuf.String(), "closed -> open") {
 		t.Fatalf("state-change log missing, got %q", errBuf.String())
-	}
-}
-
-// TestBreakerOpenClassifiesUploadBreakerOpen pins the write-path contract:
-// with the breaker open, an upload item fails fast without dialing MinIO
-// and lands in the terminal-outcome counter and the OperationObserver with
-// the distinct breaker_open reason.
-func TestBreakerOpenClassifiesUploadBreakerOpen(t *testing.T) {
-	ts, requests := failingServer(t)
-	observer := &recordingObserver{}
-	name := "breaker-upload-test/test-bucket"
-	c := breakerCache(t, coreFor(t, ts, 1), name, nil)
-	c.observer = observer
-	tripBreaker(t, c.breaker)
-
-	before := testutil.ToFloat64(uploadOutcomes.WithLabelValues(name, "error", "breaker_open"))
-	c.UploadFile(backendproxy.UploadReq{
-		Hash:       testHash,
-		Kind:       cache.CAS,
-		SizeOnDisk: 4,
-		Rc:         io.NopCloser(strings.NewReader("blob")),
-	})
-
-	if got := requests.Load(); got != 0 {
-		t.Fatalf("open-breaker UploadFile dialed the backend (%d requests)", got)
-	}
-	if got := testutil.ToFloat64(uploadOutcomes.WithLabelValues(name, "error", "breaker_open")) - before; got != 1 {
-		t.Fatalf("uploadOutcomes{error,breaker_open} delta = %v, want 1", got)
-	}
-	if len(observer.outcomes) != 1 {
-		t.Fatalf("observer outcomes len = %d, want 1", len(observer.outcomes))
-	}
-	outcome := observer.outcomes[0]
-	if outcome.Method != "backend_upload" || outcome.Status != "error" || outcome.Reason != "breaker_open" {
-		t.Fatalf("unexpected outcome: %+v", outcome)
 	}
 }
 
@@ -556,65 +520,6 @@ func TestBodyAbandonmentDoesNotCountAgainstBreaker(t *testing.T) {
 	}
 }
 
-// TestUploadNeverClaimsHalfOpenProbe pins ExecuteNoProbe: a write-through
-// PutObject (bounded only by the 10m uploadTimeout) must not become the
-// half-open recovery probe — it fails fast, leaving the probe slot for the
-// tightly-bounded read path — and while merely half-open the breaker's
-// state is not advanced by upload traffic.
-func TestUploadNeverClaimsHalfOpenProbe(t *testing.T) {
-	oldTimeout := breakerTimeout
-	breakerTimeout = 50 * time.Millisecond
-	defer func() { breakerTimeout = oldTimeout }()
-
-	backend := s3mem.New()
-	if err := backend.CreateBucket("test-bucket"); err != nil {
-		t.Fatal(err)
-	}
-	ts := httptest.NewServer(gofakes3.New(backend).Server())
-	t.Cleanup(ts.Close)
-	core := coreFor(t, ts, 1)
-	name := "breaker-uploadprobe-test"
-	c := breakerCache(t, core, name, nil)
-
-	content := []byte("blob")
-	key := objectKeyV1("", testHash, cache.CAS)
-	if _, err := core.PutObject(context.Background(), "test-bucket", key,
-		bytes.NewReader(content), int64(len(content)), "", "", minio.PutObjectOptions{}); err != nil {
-		t.Fatal(err)
-	}
-
-	tripBreaker(t, c.breaker)
-	time.Sleep(breakerTimeout + 20*time.Millisecond)
-
-	// Past the open window: an upload must NOT be admitted as the probe.
-	before := testutil.ToFloat64(uploadOutcomes.WithLabelValues(name, "error", "breaker_open"))
-	c.UploadFile(backendproxy.UploadReq{
-		Hash:       testHash,
-		Kind:       cache.CAS,
-		SizeOnDisk: 4,
-		Rc:         io.NopCloser(strings.NewReader("blob")),
-	})
-	if got := testutil.ToFloat64(uploadOutcomes.WithLabelValues(name, "error", "breaker_open")) - before; got != 1 {
-		t.Fatalf("uploadOutcomes{error,breaker_open} delta = %v, want 1 (upload must fail fast, not probe)", got)
-	}
-	if c.breaker.State() != breakerOpen {
-		t.Fatalf("breaker state after refused upload = %v, want still open", c.breaker.State())
-	}
-
-	// The read path still probes and recovers as designed.
-	rc, _, err := c.Get(context.Background(), cache.CAS, testHash, -1)
-	if err != nil || rc == nil {
-		t.Fatalf("read probe Get = (%v, %v), want hit", rc, err)
-	}
-	if _, err := io.ReadAll(rc); err != nil {
-		t.Fatalf("read probe body: %v", err)
-	}
-	_ = rc.Close()
-	if c.breaker.State() != breakerClosed {
-		t.Fatalf("breaker state after successful read probe = %v, want closed", c.breaker.State())
-	}
-}
-
 // TestCorruptCasblobExtractReleasesBody pins the v2mode extract-failure
 // path: a malformed casblob header must close the body (releasing the
 // deadline timer AND the breaker's half-open probe slot) and must not count
@@ -706,7 +611,7 @@ func TestNewBackendCapsMinioRetries(t *testing.T) {
 		// A fixed region skips minio-go's bucket-location lookup, so every
 		// counted request is a real GET attempt.
 		Region: "us-east-1",
-	}, false, -1, "uncompressed", stdlog.New(&bytes.Buffer{}, "", 0), nil, 0, 0, nil)
+	}, false, -1, "uncompressed", stdlog.New(&bytes.Buffer{}, "", 0), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

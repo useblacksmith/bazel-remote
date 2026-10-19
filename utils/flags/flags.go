@@ -191,12 +191,6 @@ func GetCliFlags() []cli.Flag {
 			DefaultText: "0s, ie disabled",
 			EnvVars:     []string{"BAZEL_REMOTE_IDLE_TIMEOUT"},
 		},
-		&cli.IntFlag{
-			Name:    "max_queued_uploads",
-			Value:   1000000,
-			Usage:   "When using proxy backends, sets the maximum number of objects in queue for upload. If the queue is full, uploads will be skipped until the queue has space again.",
-			EnvVars: []string{"BAZEL_REMOTE_MAX_QUEUED_UPLOADS"},
-		},
 		&cli.Int64Flag{
 			Name:        "max_blob_size",
 			Value:       math.MaxInt64,
@@ -218,12 +212,6 @@ func GetCliFlags() []cli.Flag {
 				"Must not exceed 2 MiB. Smaller chunks reduce per-stream memory on a gRPC proxy whose " +
 				"downstream window is smaller than the default chunk (the FA L1→shim path).",
 			EnvVars: []string{"BAZEL_REMOTE_READ_CHUNK_SIZE"},
-		},
-		&cli.IntFlag{
-			Name:    "num_uploaders",
-			Value:   100,
-			Usage:   "When using proxy backends, sets the number of Goroutines to process parallel uploads to backend.",
-			EnvVars: []string{"BAZEL_REMOTE_NUM_UPLOADERS"},
 		},
 		&cli.StringFlag{
 			Name:    "grpc_proxy.url",

@@ -501,17 +501,6 @@ func (c *diskCache) put(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	r = nil // We read all the data from r.
 
-	// Unverified blobs reach the proxy only after verification.
-	if c.proxy != nil && verbatim == nil {
-		rc, err := os.Open(blobFile)
-		if err != nil {
-			log.Println("Failed to proxy Put:", err)
-		} else {
-			// Doesn't block, should be fast.
-			c.proxy.Put(ctx, kind, hash, size, sizeOnDisk, rc)
-		}
-	}
-
 	unreserve, removeTempfile, err = c.commit(key, legacy, blobFile, size, size, sizeOnDisk, random)
 	if err != nil {
 		return internalErr(err)

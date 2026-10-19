@@ -11,7 +11,6 @@ import (
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
-	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
@@ -39,31 +38,10 @@ type azBlobCache struct {
 	container        string
 	prefix           string
 	v2mode           bool
-	uploadQueue      chan<- backendproxy.UploadReq
 	accessLogger     cache.Logger
 	errorLogger      cache.Logger
 	objectKey        func(hash string, kind cache.EntryKind) string
 	updateTimestamps bool
-}
-
-func (c *azBlobCache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
-	if c.uploadQueue == nil {
-		_ = rc.Close()
-		return
-	}
-
-	select {
-	case c.uploadQueue <- backendproxy.UploadReq{
-		Hash:        hash,
-		LogicalSize: logicalSize,
-		SizeOnDisk:  sizeOnDisk,
-		Kind:        kind,
-		Rc:          rc,
-	}:
-	default:
-		c.errorLogger.Printf("too many uploads queued\n")
-		_ = rc.Close()
-	}
 }
 
 func (c *azBlobCache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (rc io.ReadCloser, size int64, err error) {
@@ -156,7 +134,7 @@ func New(
 	sharedKey string,
 	UpdateTimestamps bool,
 	storageMode string, accessLogger cache.Logger,
-	errorLogger cache.Logger, numUploaders, maxQueuedUploads int,
+	errorLogger cache.Logger,
 ) cache.Proxy {
 	url := fmt.Sprintf("https://%s.blob.core.windows.net/", storageAccount)
 
@@ -205,23 +183,7 @@ func New(
 		}
 	}
 
-	c.uploadQueue = backendproxy.StartUploaders(c, numUploaders, maxQueuedUploads)
-
 	return c
-}
-
-func (c *azBlobCache) UploadFile(item backendproxy.UploadReq) {
-	defer func() { _ = item.Rc.Close() }()
-
-	key := c.objectKey(item.Hash, item.Kind)
-	if c.prefix != "" {
-		key = c.prefix + "/" + key
-	}
-
-	client := c.containerClient.NewBlockBlobClient(key)
-	_, err := client.Upload(context.Background(), item.Rc.(io.ReadSeekCloser), nil)
-
-	logResponse(c.accessLogger, "UPLOAD", c.storageAccount, c.container, key, err)
 }
 
 func (c *azBlobCache) UpdateModificationTimestamp(ctx context.Context, key string) {

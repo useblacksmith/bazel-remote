@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"syscall"
 
 	"github.com/buchgr/bazel-remote/v2/cache/azblobproxy"
 	"github.com/buchgr/bazel-remote/v2/cache/gcsproxy"
@@ -26,33 +25,6 @@ import (
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	prom "github.com/prometheus/client_golang/prometheus"
 )
-
-// aggregateUploadFDBudgetFraction caps how much of the process's soft
-// RLIMIT_NOFILE the multi-backend upload queues may collectively pin in the
-// worst case. Half is deliberately conservative: the other half must stay
-// free for the serving path (client connections, disk cache FDs), which is
-// the tier that must never lose to background write-through.
-const aggregateUploadFDBudgetFraction = 0.5
-
-// assertAggregateUploadFDBudget fails startup when the worst-case FD
-// consumption of the per-backend upload queues (backends × queue slots, one
-// open reader each) exceeds the budget fraction of the soft NOFILE limit.
-func assertAggregateUploadFDBudget(backendCount, maxQueuedUploadsPerBackend int) error {
-	var rlimit syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlimit); err != nil {
-		// No limit visible (unusual platform) — nothing to assert against.
-		return nil
-	}
-	budget := uint64(float64(rlimit.Cur) * aggregateUploadFDBudgetFraction)
-	aggregate := uint64(backendCount) * uint64(maxQueuedUploadsPerBackend)
-	if aggregate > budget {
-		return fmt.Errorf(
-			"aggregate upload-queue FD budget exceeded: %d backends × %d max_queued_uploads = %d worst-case open readers, over %d (%.0f%% of soft RLIMIT_NOFILE %d); lower max_queued_uploads (it applies PER backend) or raise LimitNOFILE",
-			backendCount, maxQueuedUploadsPerBackend, aggregate,
-			budget, aggregateUploadFDBudgetFraction*100, rlimit.Cur)
-	}
-	return nil
-}
 
 func getTLSConfig(certFile, keyFile, caFile string) (*tls.Config, error) {
 	config := &tls.Config{}
@@ -82,7 +54,7 @@ func (c *Config) setProxy() error {
 	if c.GoogleCloudStorage != nil {
 		proxyCache, err := gcsproxy.New(c.GoogleCloudStorage.Bucket,
 			c.GoogleCloudStorage.UseDefaultCredentials, c.GoogleCloudStorage.JSONCredentialsFile,
-			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads)
+			c.StorageMode, c.AccessLogger, c.ErrorLogger)
 		if err != nil {
 			return err
 		}
@@ -135,7 +107,7 @@ func (c *Config) setProxy() error {
 			return err
 		}
 		proxy := grpcproxy.New(clients, c.StorageMode,
-			c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads)
+			c.AccessLogger, c.ErrorLogger)
 
 		c.ProxyBackend = proxy
 	}
@@ -152,7 +124,7 @@ func (c *Config) setProxy() error {
 		}
 
 		proxyCache, err := httpproxy.New(c.HTTPBackend.BaseURL, c.StorageMode,
-			httpClient, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads)
+			httpClient, c.AccessLogger, c.ErrorLogger)
 		if err != nil {
 			return err
 		}
@@ -165,15 +137,15 @@ func (c *Config) setProxy() error {
 		// Canary toggle, read once at construction and threaded to every
 		// backend so it covers single-backend and map mode alike: Go-cache
 		// traffic bypasses the S3 backend entirely (reads answer clean
-		// misses, write-throughs are dropped).
+		// misses).
 		disconnectTools := backendDisconnectTools()
 		if len(disconnectTools) > 0 {
-			log.Printf("S3 backend disconnect enabled for build tools %s: that traffic will neither read from nor write to the S3 backend",
+			log.Printf("S3 backend disconnect enabled for build tools %s: that traffic will not read from the S3 backend",
 				strings.Join(disconnectTools, ", "))
 		}
 
 		// Multi-backend mode: an allowlisted selector → backend map, one
-		// s3proxy backend (own minio client, transport, upload queue) per
+		// s3proxy backend (own minio client, transport) per
 		// entry, routed per-request from the validated gRPC metadata
 		// selector on the context.
 		if len(c.S3CloudStorage.Backends) > 0 {
@@ -181,23 +153,11 @@ func (c *Config) setProxy() error {
 			if err != nil {
 				return err
 			}
-			// Upload pools are per backend; resolve the (lower) multi-backend
-			// defaults unless explicitly overridden at the top level.
-			numUploaders, maxQueuedUploads := c.perBackendUploadLimits()
-			// The queue limits are PER BACKEND and every queued upload holds
-			// an open file descriptor (the reader is opened before enqueue),
-			// so the process-wide worst case is len(backends) × queue size.
-			// Assert that aggregate against the process's actual FD budget at
-			// startup — a config that could exhaust NOFILE under write
-			// pressure must fail the converge, not the serving path later.
-			if err := assertAggregateUploadFDBudget(len(specs), maxQueuedUploads); err != nil {
-				return err
-			}
 			proxy, err := s3proxy.NewMulti(
 				specs,
 				c.S3CloudStorage.UpdateTimestamps,
 				c.S3CloudStorage.ConnRecycleInterval,
-				c.StorageMode, c.AccessLogger, c.ErrorLogger, numUploaders, maxQueuedUploads,
+				c.StorageMode, c.AccessLogger, c.ErrorLogger,
 				s3proxy.PrometheusMetrics(),
 				s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout),
 				s3proxy.WithBackendDisconnectTools(disconnectTools))
@@ -231,7 +191,7 @@ func (c *Config) setProxy() error {
 			c.S3CloudStorage.Region,
 			c.S3CloudStorage.MaxIdleConns,
 			c.S3CloudStorage.ConnRecycleInterval,
-			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
+			c.StorageMode, c.AccessLogger, c.ErrorLogger,
 			s3proxy.PrometheusMetrics(),
 			s3proxy.WithReadDeadline(c.S3CloudStorage.ReadTimeout),
 			s3proxy.WithBackendDisconnectTools(disconnectTools))
@@ -251,7 +211,7 @@ func (c *Config) setProxy() error {
 			creds,
 			c.AzBlobConfig.SharedKey,
 			c.AzBlobConfig.UpdateTimestamps,
-			c.StorageMode, c.AccessLogger, c.ErrorLogger, c.NumUploaders, c.MaxQueuedUploads,
+			c.StorageMode, c.AccessLogger, c.ErrorLogger,
 		)
 		return nil
 	}

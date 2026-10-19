@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk"
@@ -119,7 +118,7 @@ func TestEverything(t *testing.T) {
 	t.Log("cas HASH:", hash)
 	acData := []byte{1, 2, 3, 4}
 
-	proxyCache, err := New(url, "zstd", &http.Client{}, accessLogger, errorLogger, 100, 10000)
+	proxyCache, err := New(url, "zstd", &http.Client{}, accessLogger, errorLogger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,162 +129,36 @@ func TestEverything(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// PUT two different values with the same key in ac and cas.
-
-	err = diskCache.Put(ctx, cache.AC, hash, int64(len(acData)), bytes.NewReader(acData))
+	// Seed the backend directly: AC entries are stored raw, CAS entries as
+	// zstd casblobs, exactly what the proxy expects to download.
+	tmpfile, err := os.CreateTemp("", "bazel-remote-httpproxy-test")
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-
-	time.Sleep(time.Second)
-	s.mu.Lock()
-	if len(s.ac) != 1 {
-		t.Fatalf("Expected 1 item in the AC cache on the backend, found: %d",
-			len(s.ac))
-	}
-	if len(s.cas) != 0 {
-		t.Fatalf("Expected 0 items in the CAS cache on the backend, found: %d",
-			len(s.cas))
-	}
-	s.mu.Unlock()
-
-	err = diskCache.Put(ctx, cache.CAS, hash, int64(len(casData)), bytes.NewReader(casData))
+	defer func() { _ = os.Remove(tmpfile.Name()) }()
+	zi, err := zstdimpl.Get("go")
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
-
-	time.Sleep(time.Second)
+	if _, err = casblob.WriteAndClose(zi, bytes.NewReader(casData), tmpfile,
+		casblob.Zstandard, hash, int64(len(casData))); err != nil {
+		t.Fatal(err)
+	}
+	casBlob, err := os.ReadFile(tmpfile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
 	s.mu.Lock()
-	if len(s.ac) != 1 {
-		t.Fatalf("Expected 1 item in the AC cache on the backend, found: %d",
-			len(s.ac))
-	}
-	if len(s.cas) != 1 {
-		t.Fatalf("Expected 1 item in the CAS cache on the backend, found: %d",
-			len(s.cas))
-	}
-
-	for _, v := range s.ac {
-		if !bytes.Equal(v, acData) {
-			t.Fatal("Proxied AC value does not match")
-		}
-	}
-
-	for _, v := range s.cas {
-
-		// TODO: tweak the GetUncompressedReadCloser API to accept more than os.File.
-
-		tmpfile, err := os.CreateTemp("", "bazel-remote-httpproxy-test")
-		if err != nil {
-			t.Fatal(err)
-		}
-		tfn := tmpfile.Name()
-		defer func() { _ = os.Remove(tfn) }()
-
-		_, err = io.Copy(tmpfile, bytes.NewReader(v))
-		if err != nil {
-			t.Fatal(err)
-		}
-		tmpfile2, err := os.Open(tfn)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = os.Remove(tmpfile2.Name()) }()
-
-		var zi zstdimpl.ZstdImpl
-		zi, err = zstdimpl.Get("go")
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		rc, err := casblob.GetUncompressedReadCloser(
-			zi, tmpfile2, int64(len(casData)), 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = rc.Close() }()
-		vData, err := io.ReadAll(rc)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if !bytes.Equal(vData, casData) {
-			t.Fatal("Proxied CAS value does not match")
-		}
-	}
-
+	s.ac[hash] = acData
+	s.cas[hash] = casBlob
 	s.mu.Unlock()
-
-	// Confirm that we can HEAD both values successfully.
 
 	var found bool
 	var size int64
-
-	found, size = diskCache.Contains(ctx, cache.AC, hash, int64(len(acData)))
-	if !found {
-		t.Fatalf("Expected to find AC item %s", hash)
-	}
-	if size != int64(len(acData)) {
-		t.Fatalf("Expected to find AC item with size %d, got %d",
-			len(acData), size)
-	}
-
-	found, size = diskCache.Contains(ctx, cache.CAS, hash, int64(len(casData)))
-	if !found {
-		t.Fatalf("Expected to find CAS item %s", hash)
-	}
-	if size != int64(len(casData)) {
-		t.Fatalf("Expected to find CAS item with size %d, got %d",
-			len(casData), size)
-	}
-
-	// Confirm that we can GET both values successfully.
-
 	var data []byte
 	var rc io.ReadCloser
 
-	rc, size, err = diskCache.Get(ctx, cache.AC, hash, int64(len(acData)), 0)
-	if err != nil {
-		t.Error(err)
-	}
-
-	if size != int64(len(acData)) {
-		t.Fatalf("Expected to find AC item with size %d, got %d",
-			len(acData), size)
-	}
-
-	data, err = io.ReadAll(rc)
-	if err != nil {
-		t.Error(err)
-	}
-
-	if !bytes.Equal(data, acData) {
-		t.Error("Different AC data returned")
-	}
-	_ = rc.Close()
-
-	rc, size, err = diskCache.Get(ctx, cache.CAS, hash, int64(len(casData)), 0)
-	if err != nil {
-		t.Error(err)
-	}
-
-	if size != int64(len(casData)) {
-		t.Fatalf("Expected to find CAS item with size %d, got %d",
-			len(casData), size)
-	}
-
-	data, err = io.ReadAll(rc)
-	if err != nil {
-		t.Error(err)
-	}
-
-	if !bytes.Equal(data, casData) {
-		t.Error("Different CAS data returned")
-	}
-	_ = rc.Close()
-
-	// Create a new empty cache, and check that we can fill it
-	// from the backend.
+	// Check that an empty cache fills from the backend.
 
 	cacheDir2 := testutils.TempDir(t)
 	defer func() { _ = os.RemoveAll(cacheDir2) }()

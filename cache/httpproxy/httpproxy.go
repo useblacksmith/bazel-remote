@@ -14,7 +14,6 @@ import (
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
-	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -23,7 +22,6 @@ import (
 type remoteHTTPProxyCache struct {
 	remote       *http.Client
 	baseURL      string
-	uploadQueue  chan<- backendproxy.UploadReq
 	accessLogger cache.Logger
 	errorLogger  cache.Logger
 	requestURL   func(hash string, kind cache.EntryKind) string
@@ -41,64 +39,12 @@ var (
 	})
 )
 
-func (r *remoteHTTPProxyCache) UploadFile(item backendproxy.UploadReq) {
-
-	if item.LogicalSize == 0 {
-		_ = item.Rc.Close()
-		// See https://github.com/golang/go/issues/20257#issuecomment-299509391
-		item.Rc = http.NoBody
-	}
-
-	url := r.requestURL(item.Hash, item.Kind)
-
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, url, nil)
-	if err != nil {
-		r.errorLogger.Printf("INTERNAL ERROR, FAILED TO SETUP HTTP PROXY UPLOAD %s: %s", url, err)
-		_ = item.Rc.Close()
-		return
-	}
-
-	rsp, err := r.remote.Do(req)
-	if err == nil && rsp.StatusCode == http.StatusOK {
-		r.accessLogger.Printf("SKIP UPLOAD %s", item.Hash)
-		_ = item.Rc.Close()
-		return
-	}
-
-	req, err = http.NewRequestWithContext(context.Background(), http.MethodPut, url, item.Rc)
-	if err != nil {
-		r.errorLogger.Printf("INTERNAL ERROR, FAILED TO SETUP HTTP PROXY UPLOAD %s: %s", url, err)
-
-		// item.Rc will be closed if we call req.Do(), but not if we
-		// return earlier.
-		_ = item.Rc.Close()
-
-		return
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = item.SizeOnDisk
-
-	rsp, err = r.remote.Do(req)
-	if err != nil {
-		r.errorLogger.Printf("HTTP %s UPLOAD: %s", url, err.Error())
-		return
-	}
-	_, err = io.Copy(io.Discard, rsp.Body)
-	if err != nil {
-		r.errorLogger.Printf("HTTP %s UPLOAD: %s", url, err.Error())
-		return
-	}
-	_ = rsp.Body.Close()
-
-	logResponse(r.accessLogger, "UPLOAD", rsp.StatusCode, url)
-}
-
 // New creates a cache that proxies requests to a HTTP remote cache.
 // `storageMode` must be one of "uncompressed" (which expects legacy
 // CAS blobs) or "zstd" (which expects cas.v2 blobs).
 func New(baseURL *url.URL, storageMode string, remote *http.Client,
 	accessLogger cache.Logger, errorLogger cache.Logger,
-	numUploaders, maxQueuedUploads int) (cache.Proxy, error) {
+) (cache.Proxy, error) {
 
 	proxy := &remoteHTTPProxyCache{
 		remote:       remote,
@@ -125,36 +71,12 @@ func New(baseURL *url.URL, storageMode string, remote *http.Client,
 		return nil, fmt.Errorf("invalid http_proxy.mode specified: %q", storageMode)
 	}
 
-	proxy.uploadQueue = backendproxy.StartUploaders(proxy, numUploaders, maxQueuedUploads)
-
 	return proxy, nil
 }
 
 // Helper function for logging responses
 func logResponse(logger cache.Logger, method string, code int, url string) {
 	logger.Printf("HTTP %s %d %s", method, code, url)
-}
-
-func (r *remoteHTTPProxyCache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
-	if r.uploadQueue == nil {
-		_ = rc.Close()
-		return
-	}
-
-	item := backendproxy.UploadReq{
-		Hash:        hash,
-		LogicalSize: logicalSize,
-		SizeOnDisk:  sizeOnDisk,
-		Kind:        kind,
-		Rc:          rc,
-	}
-
-	select {
-	case r.uploadQueue <- item:
-	default:
-		r.errorLogger.Printf("too many uploads queued")
-		_ = rc.Close()
-	}
 }
 
 func (r *remoteHTTPProxyCache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (io.ReadCloser, int64, error) {

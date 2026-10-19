@@ -19,9 +19,8 @@ import (
 // each operation to the backend matching the request-scoped selection's
 // endpoint (the tenant's pinned backing-store endpoint, lifted from validated
 // gRPC metadata by the server interceptor). Each backend is a full s3Cache —
-// own minio client, transport, and upload queue — so dispatch happens once,
-// at the top, and write-through queue membership is the captured routing
-// decision. The selection's bucket is NOT a dispatch input: connections are
+// own minio client and transport — so dispatch happens once, at the top.
+// The selection's bucket is NOT a dispatch input: connections are
 // per endpoint, the bucket is applied per request inside the chosen backend
 // (see s3Cache.bucketForContext).
 
@@ -49,11 +48,6 @@ var (
 // touching the wrong shard.
 var errUnknownBackend = errors.New("unknown S3 backend selector")
 
-// uploadQueueSlotBytes approximates the resident cost of one preallocated
-// upload-queue slot (a backendproxy.UploadReq: several strings, an
-// interface, sizes), for the startup aggregate-footprint log.
-const uploadQueueSlotBytes = 200
-
 // BackendSpec describes one S3 backend of a multi-backend proxy.
 type BackendSpec struct {
 	// Key is the tenant-facing selector this backend is registered under
@@ -76,8 +70,7 @@ type BackendSpec struct {
 }
 
 // NewMulti returns a cache.Proxy that dispatches over a map of allowlisted S3
-// backends. Each backend gets its own minio client, transport, and upload
-// queue (numUploaders/maxQueuedUploads apply per backend). Requests carrying
+// backends. Each backend gets its own minio client and transport. Requests carrying
 // a backend selector on the context (lifted from validated gRPC metadata by
 // the server interceptor) route to the matching backend; requests without a
 // selector route to the designated default backend.
@@ -87,7 +80,7 @@ type BackendSpec struct {
 // enforces what config cannot express: exactly one default backend.
 func NewMulti(specs []BackendSpec, updateTimestamps bool, connRecycleInterval time.Duration,
 	storageMode string, accessLogger cache.Logger, errorLogger cache.Logger,
-	numUploaders, maxQueuedUploads int, metrics Metrics, options ...Option) (cache.Proxy, error) {
+	metrics Metrics, options ...Option) (cache.Proxy, error) {
 
 	m := &multiS3Cache{
 		backends:    make(map[string]*s3Cache, len(specs)),
@@ -95,7 +88,7 @@ func NewMulti(specs []BackendSpec, updateTimestamps bool, connRecycleInterval ti
 	}
 	for _, spec := range specs {
 		backend, err := newBackend(spec, updateTimestamps, connRecycleInterval, storageMode,
-			accessLogger, errorLogger, numUploaders, maxQueuedUploads, metrics, options...)
+			accessLogger, errorLogger, metrics, options...)
 		if err != nil {
 			return nil, err
 		}
@@ -111,14 +104,7 @@ func NewMulti(specs []BackendSpec, updateTimestamps bool, connRecycleInterval ti
 		return nil, errors.New("no S3 backend marked as default")
 	}
 
-	// Upload queues preallocate and uploaders are goroutine pools, both per
-	// backend; surface the aggregate so an oversized per-backend setting in
-	// a many-backend map is visible at startup instead of as an OOM.
-	backends := len(m.backends)
-	totalSlots := backends * maxQueuedUploads
-	log.Printf("Using S3 backend map with %d backends (default: %s): per backend %d queued-upload slots / %d uploaders; aggregate %d slots (~%d MiB) and %d uploader goroutines.",
-		backends, m.def.key, maxQueuedUploads, numUploaders,
-		totalSlots, totalSlots*uploadQueueSlotBytes/(1<<20), backends*numUploaders)
+	log.Printf("Using S3 backend map with %d backends (default: %s).", len(m.backends), m.def.key)
 
 	return m, nil
 }
@@ -154,15 +140,6 @@ func (m *multiS3Cache) backendFor(ctx context.Context, operation string) *s3Cach
 		return nil
 	}
 	return backend
-}
-
-func (m *multiS3Cache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
-	backend := m.backendFor(ctx, "UPLOAD")
-	if backend == nil {
-		_ = rc.Close()
-		return
-	}
-	backend.Put(ctx, kind, hash, logicalSize, sizeOnDisk, rc)
 }
 
 func (m *multiS3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64) (io.ReadCloser, int64, error) {

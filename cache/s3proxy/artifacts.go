@@ -48,8 +48,7 @@ func (c *s3Cache) PutArtifact(ctx context.Context, key string, body []byte) erro
 	// "a disconnected tool produces zero S3 ops" is the cut's whole contract.
 	// A skipped advisory upload is a successful no-op, not an error —
 	// failing it would make the flusher log every pass.
-	if reason, disconnected := c.disconnectedArtifactReason(key); disconnected {
-		backendUploadsSkipped.WithLabelValues(c.key, reason).Inc()
+	if _, disconnected := c.disconnectedArtifactReason(key); disconnected {
 		return nil
 	}
 	if !c.breaker.isClosed() {

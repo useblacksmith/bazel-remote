@@ -1115,7 +1115,7 @@ func (s *testServer) handler(w http.ResponseWriter, r *http.Request) {
 	switch fields[1] {
 	case "ac":
 		kindMap = s.ac
-	case "cas":
+	case "cas", "cas.v2":
 		kindMap = s.cas
 	}
 	hash := fields[2]
@@ -1181,7 +1181,7 @@ func TestHttpProxyBackend(t *testing.T) {
 	accessLogger := testutils.NewSilentLogger()
 	errorLogger := testutils.NewSilentLogger()
 
-	proxy, err := httpproxy.New(url, "zstd", &http.Client{}, accessLogger, errorLogger, 100, 1000000)
+	proxy, err := httpproxy.New(url, "zstd", &http.Client{}, accessLogger, errorLogger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1214,19 +1214,28 @@ func TestHttpProxyBackend(t *testing.T) {
 		t.Fatal("Expected empty backend")
 	}
 
-	err = testCache.Put(ctx, cache.CAS, casHash, int64(len(blob)),
-		bytes.NewReader(blob))
+	// Seed the backend with the blob as a zstd casblob, the format the
+	// proxy downloads.
+	tmpfile, err := os.CreateTemp("", "bazel-remote-disk-test")
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	time.Sleep(time.Second) // Proxying to the backend is async.
-
-	if backend.numItems() != 1 {
-		// If this fails, check the time.Sleep call above...
-		t.Fatal("Expected Put to be proxied to the backend",
-			backend.numItems())
+	defer func() { _ = os.Remove(tmpfile.Name()) }()
+	zi, err := zstdimpl.Get("go")
+	if err != nil {
+		t.Fatal(err)
 	}
+	if _, err = casblob.WriteAndClose(zi, bytes.NewReader(blob), tmpfile,
+		casblob.Zstandard, casHash, blobSize); err != nil {
+		t.Fatal(err)
+	}
+	casBlob, err := os.ReadFile(tmpfile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.mu.Lock()
+	backend.cas[casHash] = casBlob
+	backend.mu.Unlock()
 
 	// Create a new (empty) testCache, without a proxy backend.
 	cacheDir = testutils.TempDir(t)
