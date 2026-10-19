@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
-	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	"github.com/minio/minio-go/v7"
@@ -145,362 +144,33 @@ func TestObjectKeyForContextUsesRequestScopedPrefixForACAndCAS(t *testing.T) {
 	}
 }
 
-func TestPutCapturesRequestScopedPrefixForAsyncUpload(t *testing.T) {
-	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	requestPrefix := "minio-prefix/bazel/production/us-east-1/42/987654/v0"
-	uploadQueue := make(chan backendproxy.UploadReq, 1)
-	c := &s3Cache{
-		prefix:      "minio-prefix/buck2/production/us-east-1",
-		uploadQueue: uploadQueue,
-	}
-
-	rc := io.NopCloser(strings.NewReader("blob"))
-	c.Put(cache.WithStoragePrefix(context.Background(), requestPrefix), cache.CAS, hash, 4, 4, rc)
-
-	item := <-uploadQueue
-	defer item.Rc.Close()
-	if item.StoragePrefix != requestPrefix {
-		t.Fatalf("queued upload StoragePrefix = %q, want %q", item.StoragePrefix, requestPrefix)
-	}
-	if !item.RequestScopedStoragePrefix {
-		t.Fatal("queued upload RequestScopedStoragePrefix = false, want true")
-	}
-	if item.RequireStoragePrefix {
-		t.Fatal("queued upload RequireStoragePrefix = true, want false")
-	}
-}
-
-func TestPutCapturesRequestScopedPrefixForActionCacheAsyncUpload(t *testing.T) {
-	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	requestPrefix := "minio-prefix/bazel/production/us-east-1/42/987654/v0"
-	uploadQueue := make(chan backendproxy.UploadReq, 1)
-	c := &s3Cache{
-		prefix:      "minio-prefix/buck2/production/us-east-1",
-		uploadQueue: uploadQueue,
-	}
-
-	ctx := cache.WithRequiredStoragePrefix(cache.WithStoragePrefix(context.Background(), requestPrefix))
-	rc := io.NopCloser(strings.NewReader("blob"))
-	c.Put(ctx, cache.AC, hash, 4, 4, rc)
-
-	item := <-uploadQueue
-	defer item.Rc.Close()
-	if item.StoragePrefix != requestPrefix {
-		t.Fatalf("queued upload StoragePrefix = %q, want %q", item.StoragePrefix, requestPrefix)
-	}
-	if !item.RequestScopedStoragePrefix {
-		t.Fatal("queued upload RequestScopedStoragePrefix = false, want true")
-	}
-	if !item.RequireStoragePrefix {
-		t.Fatal("queued upload RequireStoragePrefix = false, want true")
-	}
-}
-
-func TestPutCapturesMissingRequiredRequestScopedPrefixForAsyncUpload(t *testing.T) {
-	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	configuredPrefix := "minio-prefix/buck2/production/us-east-1"
-	uploadQueue := make(chan backendproxy.UploadReq, 1)
-	c := &s3Cache{
-		prefix:      configuredPrefix,
-		uploadQueue: uploadQueue,
-	}
-
-	rc := io.NopCloser(strings.NewReader("blob"))
-	c.Put(cache.WithRequiredStoragePrefix(context.Background()), cache.CAS, hash, 4, 4, rc)
-
-	item := <-uploadQueue
-	defer item.Rc.Close()
-	if item.StoragePrefix != configuredPrefix {
-		t.Fatalf("queued upload StoragePrefix = %q, want %q", item.StoragePrefix, configuredPrefix)
-	}
-	if item.RequestScopedStoragePrefix {
-		t.Fatal("queued upload RequestScopedStoragePrefix = true, want false")
-	}
-	if !item.RequireStoragePrefix {
-		t.Fatal("queued upload RequireStoragePrefix = false, want true")
-	}
-}
-
-func TestPutRecordsUploadQueueDrop(t *testing.T) {
-	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	uploadQueue := make(chan backendproxy.UploadReq, 1)
-	uploadQueue <- backendproxy.UploadReq{Hash: "queued", Rc: io.NopCloser(strings.NewReader("queued"))}
-	observer := &recordingObserver{}
-	var errBuf bytes.Buffer
-	c := &s3Cache{
-		key:         backendKeyA,
-		prefix:      "minio-prefix/staging/10/717982840/v0/bazel",
-		uploadQueue: uploadQueue,
-		errorLogger: stdlog.New(&errBuf, "", 0),
-		observer:    observer,
-	}
-
-	ctx := cache.WithMetricsLabels(context.Background(), cache.MetricsLabels{
-		InstallationID: "10",
-		RepositoryID:   "717982840",
-		Generation:     "v0",
-		BuildToolID:    "bazel",
-		VMID:           "vm-123",
-		JobID:          "job-456",
-	})
-	// Put is called with logicalSize=4, sizeOnDisk=4; the dropped outcome now
-	// reports SizeOnDisk bytes.
-	c.Put(ctx, cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
-
-	if len(observer.outcomes) != 1 {
-		t.Fatalf("observer outcomes len = %d, want 1", len(observer.outcomes))
-	}
-	outcome := observer.outcomes[0]
-	if outcome.Method != "backend_upload" || outcome.Status != "dropped" || outcome.Reason != "upload_queue_full" {
-		t.Fatalf("unexpected outcome: %+v", outcome)
-	}
-	if outcome.Bytes != 4 {
-		t.Fatalf("dropped outcome bytes = %d, want 4 (SizeOnDisk)", outcome.Bytes)
-	}
-	if outcome.Labels.RepositoryID != "717982840" || outcome.Labels.JobID != "job-456" {
-		t.Fatalf("unexpected labels: %+v", outcome.Labels)
-	}
-	// The overflow log names the backend so a multi-backend L1's logs
-	// identify which shard's queue is saturated.
-	if !strings.Contains(errBuf.String(), backendKeyA) {
-		t.Fatalf("queue-full log %q does not name the backend key", errBuf.String())
-	}
-}
-
-func TestObserveUploadReportsSizeOnDisk(t *testing.T) {
-	observer := &recordingObserver{}
-	c := &s3Cache{observer: observer}
-	c.observeUpload(context.Background(), backendproxy.UploadReq{
-		// LogicalSize must be ignored; only SizeOnDisk (stored bytes) is reported.
-		LogicalSize: 99,
-		SizeOnDisk:  12,
-		Kind:        cache.CAS,
-		MetricsLabels: cache.MetricsLabels{
-			RepositoryID: "717982840",
-			JobID:        "job-456",
-		},
-	}, "error", "s3_put_failed")
-
-	if len(observer.outcomes) != 1 {
-		t.Fatalf("observer outcomes len = %d, want 1", len(observer.outcomes))
-	}
-	outcome := observer.outcomes[0]
-	if outcome.Method != "backend_upload" || outcome.Status != "error" || outcome.Reason != "s3_put_failed" {
-		t.Fatalf("unexpected outcome: %+v", outcome)
-	}
-	if outcome.Bytes != 12 {
-		t.Fatalf("outcome bytes = %d, want 12 (SizeOnDisk, not LogicalSize)", outcome.Bytes)
-	}
-	if outcome.Labels.RepositoryID != "717982840" || outcome.Labels.JobID != "job-456" {
-		t.Fatalf("unexpected labels: %+v", outcome.Labels)
-	}
-}
-
-func TestClassifyUploadOutcome(t *testing.T) {
-	testCases := []struct {
-		name           string
-		err            error
-		expectedStatus string
-		expectedReason string
-	}{
-		{"net-new object", nil, "created", ""},
-		{"precondition failed 412", minio.ErrorResponse{StatusCode: http.StatusPreconditionFailed}, "already_exists", "precondition_failed"},
-		{"not modified 304 (older minio)", minio.ErrorResponse{StatusCode: http.StatusNotModified}, "already_exists", "precondition_failed"},
-		{"server error", minio.ErrorResponse{StatusCode: http.StatusInternalServerError}, "error", "s3_put_failed"},
-		{"non-minio error", errNotFound, "error", "s3_put_failed"},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			status, reason := classifyUploadOutcome(tc.err)
-			if status != tc.expectedStatus || reason != tc.expectedReason {
-				t.Fatalf("classifyUploadOutcome(%v) = (%q, %q), want (%q, %q)",
-					tc.err, status, reason, tc.expectedStatus, tc.expectedReason)
-			}
-		})
-	}
-}
-
 const (
 	backendKeyA = "http://minio-a.example.com:9000"
 	backendKeyB = "https://minio-b.example.com:9000"
 )
 
-// twoBackendMulti builds a multiS3Cache over two hand-constructed backends
-// with observable upload queues, avoiding any real minio client.
-func twoBackendMulti(t *testing.T) (*multiS3Cache, chan backendproxy.UploadReq, chan backendproxy.UploadReq) {
+// twoBackendMulti builds a multiS3Cache over two hand-constructed backends,
+// avoiding any real minio client.
+func twoBackendMulti(t *testing.T) *multiS3Cache {
 	t.Helper()
-	queueA := make(chan backendproxy.UploadReq, 1)
-	queueB := make(chan backendproxy.UploadReq, 1)
-	backendA := &s3Cache{key: backendKeyA, prefix: "prefix-a", uploadQueue: queueA}
-	backendB := &s3Cache{key: backendKeyB, prefix: "prefix-b", uploadQueue: queueB}
-	m := &multiS3Cache{
+	backendA := &s3Cache{key: backendKeyA, prefix: "prefix-a"}
+	backendB := &s3Cache{key: backendKeyB, prefix: "prefix-b"}
+	return &multiS3Cache{
 		backends: map[string]*s3Cache{
 			backendKeyA: backendA,
 			backendKeyB: backendB,
 		},
 		def: backendA,
 	}
-	return m, queueA, queueB
-}
-
-func TestMultiBackendPutRoutesToSelectedBackend(t *testing.T) {
-	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	m, queueA, queueB := twoBackendMulti(t)
-
-	// Selector B routes the async upload to backend B's queue.
-	ctxB := cache.WithS3Backend(context.Background(), cache.S3BackendSelection{Endpoint: backendKeyB})
-	m.Put(ctxB, cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
-	select {
-	case item := <-queueB:
-		_ = item.Rc.Close()
-	default:
-		t.Fatal("expected upload in backend B's queue")
-	}
-	select {
-	case <-queueA:
-		t.Fatal("upload leaked into backend A's queue")
-	default:
-	}
-
-	// Selector A routes to backend A's queue.
-	ctxA := cache.WithS3Backend(context.Background(), cache.S3BackendSelection{Endpoint: backendKeyA})
-	m.Put(ctxA, cache.AC, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
-	select {
-	case item := <-queueA:
-		_ = item.Rc.Close()
-	default:
-		t.Fatal("expected upload in backend A's queue")
-	}
-}
-
-func TestMultiBackendMissingSelectorRoutesToDefault(t *testing.T) {
-	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	m, queueA, queueB := twoBackendMulti(t)
-
-	// The fallback is metered: it is the HTTP-side-door / lost-selector
-	// signal on a multi-backend node.
-	before := testutil.ToFloat64(defaultBackendFallback.WithLabelValues("UPLOAD"))
-	m.Put(context.Background(), cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
-	select {
-	case item := <-queueA:
-		_ = item.Rc.Close()
-	default:
-		t.Fatal("expected upload in the default backend's queue")
-	}
-	select {
-	case <-queueB:
-		t.Fatal("upload leaked into the non-default backend's queue")
-	default:
-	}
-	if got := testutil.ToFloat64(defaultBackendFallback.WithLabelValues("UPLOAD")) - before; got != 1 {
-		t.Fatalf("defaultBackendFallback{UPLOAD} delta = %v, want 1", got)
-	}
-
-	// A selector-carrying request does not touch the fallback meter.
-	before = testutil.ToFloat64(defaultBackendFallback.WithLabelValues("UPLOAD"))
-	m.Put(cache.WithS3Backend(context.Background(), cache.S3BackendSelection{Endpoint: backendKeyB}), cache.CAS, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
-	if item := <-queueB; item.Rc != nil {
-		_ = item.Rc.Close()
-	}
-	if got := testutil.ToFloat64(defaultBackendFallback.WithLabelValues("UPLOAD")) - before; got != 0 {
-		t.Fatalf("defaultBackendFallback{UPLOAD} delta = %v, want 0", got)
-	}
-}
-
-// TestUploadFileDeadlineReclaimsWorkerFromHungBackend pins the upload
-// deadline seam: a PutObject against a backend that never responds must
-// return once uploadTimeout elapses (reporting an error outcome) instead of
-// pinning the upload worker forever.
-func TestUploadFileDeadlineReclaimsWorkerFromHungBackend(t *testing.T) {
-	hung := make(chan struct{})
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-hung // Hold every request open until the test finishes.
-	}))
-	defer ts.Close()
-	defer close(hung)
-
-	u, err := url.Parse(ts.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	core, err := minio.NewCore(u.Host, &minio.Options{
-		Creds:        credentials.NewStaticV4("KEY", "SECRET", ""),
-		Secure:       false,
-		BucketLookup: minio.BucketLookupPath,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	oldTimeout := uploadTimeout
-	uploadTimeout = 100 * time.Millisecond
-	defer func() { uploadTimeout = oldTimeout }()
-
-	observer := &recordingObserver{}
-	c := &s3Cache{
-		key:          backendKeyA,
-		mcore:        core,
-		bucket:       "test-bucket",
-		breaker:      newBreaker("test-upload-deadline", nil),
-		objectKey:    objectKeyV2,
-		accessLogger: stdlog.New(&bytes.Buffer{}, "", 0),
-		observer:     observer,
-	}
-
-	done := make(chan struct{})
-	go func() {
-		c.UploadFile(backendproxy.UploadReq{
-			Hash:       "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-			Kind:       cache.CAS,
-			SizeOnDisk: 4,
-			Rc:         io.NopCloser(strings.NewReader("blob")),
-		})
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("UploadFile did not return: the upload deadline is not applied")
-	}
-	if len(observer.outcomes) != 1 || observer.outcomes[0].Status != "error" {
-		t.Fatalf("expected one error outcome, got %+v", observer.outcomes)
-	}
-}
-
-// closeRecorder observes that the router closed the payload reader when it
-// refused the operation.
-type closeRecorder struct {
-	io.Reader
-	closed bool
-}
-
-func (c *closeRecorder) Close() error {
-	c.closed = true
-	return nil
 }
 
 func TestMultiBackendUnknownSelectorRefusesOperations(t *testing.T) {
 	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	var errBuf bytes.Buffer
-	m, queueA, queueB := twoBackendMulti(t)
+	m := twoBackendMulti(t)
 	m.errorLogger = stdlog.New(&errBuf, "", 0)
 
 	ctx := cache.WithS3Backend(context.Background(), cache.S3BackendSelection{Endpoint: "http://rogue.example.com:9000"})
-
-	rc := &closeRecorder{Reader: strings.NewReader("blob")}
-	m.Put(ctx, cache.CAS, hash, 4, 4, rc)
-	if !rc.closed {
-		t.Fatal("expected refused Put to close the reader")
-	}
-	select {
-	case <-queueA:
-		t.Fatal("refused Put reached backend A")
-	case <-queueB:
-		t.Fatal("refused Put reached backend B")
-	default:
-	}
 
 	if _, _, err := m.Get(ctx, cache.CAS, hash, 4); err != errUnknownBackend {
 		t.Fatalf("Get err = %v, want errUnknownBackend", err)
@@ -532,25 +202,25 @@ func TestNewMultiValidation(t *testing.T) {
 		}
 	}
 
-	if _, err := NewMulti(nil, false, -1, "uncompressed", nil, nil, 0, 0, nil); err == nil ||
+	if _, err := NewMulti(nil, false, -1, "uncompressed", nil, nil, nil); err == nil ||
 		!strings.Contains(err.Error(), "no S3 backend marked as default") {
 		t.Fatal("expected no-default error for empty backend list")
 	}
 
 	if _, err := NewMulti([]BackendSpec{spec(backendKeyA, false)},
-		false, -1, "uncompressed", nil, nil, 0, 0, nil); err == nil ||
+		false, -1, "uncompressed", nil, nil, nil); err == nil ||
 		!strings.Contains(err.Error(), "no S3 backend marked as default") {
 		t.Fatal("expected error when no backend is default")
 	}
 
 	if _, err := NewMulti([]BackendSpec{spec(backendKeyA, true), spec(backendKeyB, true)},
-		false, -1, "uncompressed", nil, nil, 0, 0, nil); err == nil ||
+		false, -1, "uncompressed", nil, nil, nil); err == nil ||
 		!strings.Contains(err.Error(), "multiple S3 backends marked as default") {
 		t.Fatal("expected error for multiple default backends")
 	}
 
 	proxy, err := NewMulti([]BackendSpec{spec(backendKeyA, true), spec(backendKeyB, false)},
-		false, -1, "uncompressed", nil, nil, 0, 0, nil)
+		false, -1, "uncompressed", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -640,10 +310,9 @@ func seedS3Object(t *testing.T, c *s3Cache, prefix string, kind cache.EntryKind,
 }
 
 // TestPerRequestBucketRouting pins the v2 routing semantics: one endpoint,
-// one minio client — but the bucket comes from the request. Uploads captured
-// with different buckets on the same backend must land in their own buckets,
-// reads must only see their own bucket's objects, and selector-less traffic
-// must use the default bucket.
+// one minio client — but the bucket comes from the request. Reads must only
+// see their own bucket's objects, and selector-less traffic must use the
+// default bucket.
 func TestPerRequestBucketRouting(t *testing.T) {
 	hashTenant := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	hashDefault := "1234560123456789abcdef0123456789abcdef0123456789abcdef0123456789"
@@ -654,15 +323,13 @@ func TestPerRequestBucketRouting(t *testing.T) {
 	ctxBucket2 := cache.WithS3Backend(context.Background(),
 		cache.S3BackendSelection{Endpoint: backendKeyA, Bucket: "tenant-bucket-2"})
 
-	// An upload captured with bucket 1 lands in bucket 1 and only there:
-	// visible via a bucket-1 selection, a miss via bucket 2 and the default.
-	c.UploadFile(backendproxy.UploadReq{
-		Hash:       hashTenant,
-		Kind:       cache.CAS,
-		SizeOnDisk: 4,
-		Rc:         io.NopCloser(strings.NewReader("blob")),
-		S3Backend:  cache.S3BackendSelection{Endpoint: backendKeyA, Bucket: "tenant-bucket-1"},
-	})
+	// An object in bucket 1 is visible via a bucket-1 selection only:
+	// a miss via bucket 2 and the default.
+	if _, err := c.mcore.PutObject(context.Background(), "tenant-bucket-1",
+		c.objectKeyForContext(ctxBucket1, hashTenant, cache.CAS),
+		strings.NewReader("blob"), 4, "", "", minio.PutObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	rc, _, err := c.Get(ctxBucket1, cache.CAS, hashTenant, -1)
 	if err != nil || rc == nil {
 		t.Fatalf("Get from bucket 1 = (%v, %v), want hit", rc, err)
@@ -687,38 +354,17 @@ func TestPerRequestBucketRouting(t *testing.T) {
 		t.Fatal("Contains via bucket 2 = true, want false: same endpoint, different bucket")
 	}
 
-	// A selector-less capture (no request-scoped bucket) lands in the
-	// default bucket, invisible to the tenant buckets.
-	c.UploadFile(backendproxy.UploadReq{
-		Hash:       hashDefault,
-		Kind:       cache.CAS,
-		SizeOnDisk: 4,
-		Rc:         io.NopCloser(strings.NewReader("dflt")),
-	})
+	// An object in the default bucket is invisible to the tenant buckets.
+	if _, err := c.mcore.PutObject(context.Background(), "default-bucket",
+		c.objectKeyForContext(context.Background(), hashDefault, cache.CAS),
+		strings.NewReader("dflt"), 4, "", "", minio.PutObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	if exists, _ := c.Contains(context.Background(), cache.CAS, hashDefault, -1); !exists {
 		t.Fatal("selector-less Contains for default-bucket object = false, want true")
 	}
 	if exists, _ := c.Contains(ctxBucket1, cache.CAS, hashDefault, -1); exists {
 		t.Fatal("default-bucket object visible via tenant bucket 1")
-	}
-}
-
-func TestPutCapturesS3BackendSelectionForAsyncUpload(t *testing.T) {
-	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	uploadQueue := make(chan backendproxy.UploadReq, 1)
-	c := &s3Cache{
-		bucket:      "default-bucket",
-		uploadQueue: uploadQueue,
-	}
-
-	selection := cache.S3BackendSelection{Endpoint: backendKeyA, Bucket: "tenant-bucket-1"}
-	c.Put(cache.WithS3Backend(context.Background(), selection), cache.CAS, hash, 4, 4,
-		io.NopCloser(strings.NewReader("blob")))
-
-	item := <-uploadQueue
-	defer func() { _ = item.Rc.Close() }()
-	if item.S3Backend != selection {
-		t.Fatalf("queued upload S3Backend = %+v, want %+v", item.S3Backend, selection)
 	}
 }
 
@@ -1103,110 +749,16 @@ func TestGoBackendDisconnectSkipsAllKinds(t *testing.T) {
 	}
 }
 
-// TestGoBackendDisconnectPutSkipsEnqueue pins the canary toggle's write
-// side: with the disconnect on, a Go Put closes the payload and returns
-// without enqueueing, counted on backendUploadsSkipped and — critically —
-// with NO operation outcome (dropped/error/rejected statuses are consumed
-// by the web-side accounting as failures).
-func TestGoBackendDisconnectPutSkipsEnqueue(t *testing.T) {
-	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	uploadQueue := make(chan backendproxy.UploadReq, 2)
-	observer := &recordingObserver{}
-	c := &s3Cache{
-		key:               "go-disconnect-put",
-		uploadQueue:       uploadQueue,
-		observer:          observer,
-		disconnectedTools: disconnecting("go"),
-	}
-
-	skipsBefore := testutil.ToFloat64(backendUploadsSkipped.WithLabelValues(c.key, goDisconnectReason))
-
-	ctxGoPrefix := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/go")
-	ctxGoTool := cache.WithMetricsLabels(context.Background(), cache.MetricsLabels{BuildToolID: "go"})
-
-	for _, tc := range []struct {
-		name string
-		ctx  context.Context
-		kind cache.EntryKind
-	}{
-		{"go prefix CAS", ctxGoPrefix, cache.CAS},
-		{"go prefix AC", ctxGoPrefix, cache.AC},
-		{"go build tool label CAS", ctxGoTool, cache.CAS},
-		{"go build tool label AC", ctxGoTool, cache.AC},
-	} {
-		rc := &closeRecorder{Reader: strings.NewReader("blob")}
-		c.Put(tc.ctx, tc.kind, hash, 4, 4, rc)
-		if !rc.closed {
-			t.Fatalf("%s: expected skipped Put to close the reader", tc.name)
-		}
-		select {
-		case <-uploadQueue:
-			t.Fatalf("%s: skipped Put reached the upload queue", tc.name)
-		default:
-		}
-	}
-
-	if got := testutil.ToFloat64(backendUploadsSkipped.WithLabelValues(c.key, goDisconnectReason)) - skipsBefore; got != 4 {
-		t.Fatalf("backendUploadsSkipped{reason=go_disconnect} delta = %v, want 4", got)
-	}
-	if len(observer.outcomes) != 0 {
-		t.Fatalf("observer outcomes = %+v, want none for policy skips", observer.outcomes)
-	}
-
-	// Non-Go traffic still write-throughs with the disconnect on.
-	c.Put(cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/bazel"), cache.CAS, hash, 4, 4,
-		io.NopCloser(strings.NewReader("blob")))
-	select {
-	case item := <-uploadQueue:
-		_ = item.Rc.Close()
-	default:
-		t.Fatal("expected non-Go Put to enqueue with the disconnect on")
-	}
-}
-
-// TestGoBackendDisconnectOffGoPutStillEnqueues pins the toggle-off contract:
-// without the disconnect, Go traffic write-throughs exactly as before, for
-// both entry kinds.
-func TestGoBackendDisconnectOffGoPutStillEnqueues(t *testing.T) {
-	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-	uploadQueue := make(chan backendproxy.UploadReq, 1)
-	c := &s3Cache{uploadQueue: uploadQueue}
-
-	ctxGo := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/go")
-	ctxGoTool := cache.WithMetricsLabels(context.Background(), cache.MetricsLabels{BuildToolID: "go"})
-
-	for _, tc := range []struct {
-		name string
-		ctx  context.Context
-		kind cache.EntryKind
-	}{
-		{"go prefix CAS", ctxGo, cache.CAS},
-		{"go prefix AC", ctxGo, cache.AC},
-		{"go build tool label CAS", ctxGoTool, cache.CAS},
-	} {
-		c.Put(tc.ctx, tc.kind, hash, 4, 4, io.NopCloser(strings.NewReader("blob")))
-		select {
-		case item := <-uploadQueue:
-			_ = item.Rc.Close()
-		default:
-			t.Fatalf("%s: toggle-off Go Put did not enqueue", tc.name)
-		}
-	}
-}
-
 // Go-tenant LRU artifacts are part of the disconnect's "zero S3 ops"
 // contract: skipped as a successful no-op (an error would make the flusher
-// log every pass), counted on the skip counter. Key-based, because artifact
-// flushes run on timers whose contexts carry no tenant identity.
+// log every pass). Key-based, because artifact flushes run on timers whose
+// contexts carry no tenant identity. The cache has no minio client, so a
+// PutArtifact that was not skipped would panic rather than return.
 func TestGoBackendDisconnectSkipsGoTenantArtifacts(t *testing.T) {
 	c := &s3Cache{key: "go-disconnect-artifacts", disconnectedTools: disconnecting("go")}
 
-	skipsBefore := testutil.ToFloat64(backendUploadsSkipped.WithLabelValues(c.key, goDisconnectReason))
 	if err := c.PutArtifact(context.Background(), "prd/10/123/go/lru/00000001-x.jsonl", []byte("{}")); err != nil {
 		t.Fatalf("skipped go artifact must be a successful no-op, got %v", err)
-	}
-	if got := testutil.ToFloat64(backendUploadsSkipped.WithLabelValues(c.key, goDisconnectReason)) - skipsBefore; got != 1 {
-		t.Fatalf("expected 1 skipped artifact upload, got %v", got)
 	}
 }
 

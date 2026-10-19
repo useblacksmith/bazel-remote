@@ -165,15 +165,6 @@ func (c *diskCache) verifyVerbatim(job verifyJob) {
 	if err := os.Chmod(blobPath, tempfile.FinalMode); err != nil {
 		log.Println("failed to mark", blobPath, "as complete:", err)
 	}
-
-	if c.proxy != nil {
-		f, err := os.Open(blobPath)
-		if err != nil {
-			log.Println("Failed to proxy Put:", err)
-			return
-		}
-		c.proxy.Put(job.ctx, cache.CAS, job.hash, job.size, item.sizeOnDisk, f)
-	}
 }
 
 func (c *diskCache) checkVerbatimDigest(blobPath string, job verifyJob) string {

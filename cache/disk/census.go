@@ -128,7 +128,7 @@ type censusRecorder struct {
 	accessIntervalByAge     *prometheus.CounterVec
 	evictedNeverReadBytes   *prometheus.CounterVec
 	evictedNeverReadEntries *prometheus.CounterVec
-	gaugeRetentionWindow  prometheus.Gauge
+	gaugeRetentionWindow    prometheus.Gauge
 }
 
 func newCensusRecorder() *censusRecorder {
