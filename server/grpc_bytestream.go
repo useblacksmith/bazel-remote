@@ -428,6 +428,14 @@ func (s *grpcServer) parseWriteResource(r string) (string, int64, casblob.Compre
 }
 
 var errWriteOffset error = errors.New("bytestream writes from non-zero offsets are unsupported")
+
+// FAILED_PRECONDITION is deliberately not a connection-class code: Bazel's
+// retrier treats UNAVAILABLE as transient and walks the full --remote_retries
+// backoff ladder per blob, which under sustained shedding becomes a
+// minutes-long upload tail after the build summary. A permanent code makes
+// the client log the upload failure once and move on; the action result is
+// never published, so nothing references the unstored blob.
+var errCASWriteShed = status.Error(codes.FailedPrecondition, "too many in-flight CAS writes")
 var errDecoderPoolFail error = errors.New("failed to get DecoderWrapper from pool")
 
 func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
@@ -549,7 +557,18 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 					rc = dec.IOReadCloser()
 				}
 
+				// Acquire last so every earlier error path returns
+				// without holding a slot; the Put goroutine owns the
+				// release.
+				if !s.tryAcquireCASWriteSlot() {
+					_ = rc.Close()
+					s.accessLogger.Printf("GRPC BYTESTREAM WRITE SHED: %s", resourceName)
+					recvResult <- errCASWriteShed
+					return
+				}
+
 				go func() {
+					defer s.releaseCASWriteSlot()
 					defer func() { _ = rc.Close() }()
 					err := s.cache.Put(srv.Context(), cache.CAS, hash, size, rc)
 					putResult <- err
@@ -625,8 +644,10 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 			}
 
 			_ = pw.CloseWithError(err)
-			s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s %s",
-				resourceName, err.Error())
+			if err != errCASWriteShed {
+				s.accessLogger.Printf("GRPC BYTESTREAM WRITE FAILED: %s %s",
+					resourceName, err.Error())
+			}
 			return err
 		}
 
