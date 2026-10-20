@@ -3,6 +3,7 @@
 package gcsproxy
 
 import (
+	"encoding/json"
 	"context"
 	"fmt"
 	"net/http"
@@ -34,7 +35,15 @@ func New(bucket string, useDefaultCredentials bool, jsonCredentialsFile string, 
 			err = fmt.Errorf("Failed to read Google Credentials file '%s': %v", jsonCredentialsFile, err)
 			return nil, err
 		}
-		config, err := google.CredentialsFromJSON(context.Background(), jsonConfig,
+		var credFile struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(jsonConfig, &credFile); err != nil {
+			return nil, fmt.Errorf("The provided Google Credentials file '%s' couldn't be parsed: %v",
+				jsonCredentialsFile, err)
+		}
+		config, err := google.CredentialsFromJSONWithType(context.Background(), jsonConfig,
+			google.CredentialsType(credFile.Type),
 			"https://www.googleapis.com/auth/devstorage.read_write")
 		if err != nil {
 			err = fmt.Errorf("The provided Google Credentials file '%s' couldn't be parsed: %v",
