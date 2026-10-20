@@ -58,6 +58,33 @@ back to the configured process-wide prefix. Buck2 should not set this marker.
 
 ## Security and upstream patch tracking
 
+### L1 shared-secret rotation
+
+`BAZEL_REMOTE_L1_AUTH_SECRET` accepts one key or a comma-separated list such
+as `new-key,old-key`. Whitespace around entries is ignored. Empty entries
+never authorize a request, and a non-empty list containing only empty entries
+rejects all non-exempt RPCs. Unary and streaming RPCs must present exactly one
+`x-blacksmith-cache-auth` metadata value matching an accepted key.
+
+To rotate without credential mismatches:
+
+1. Deploy a server version supporting key lists to every affected L1 cache
+   node, then configure `new-key,old-key` and roll the L1s.
+2. Change runner agents' `BAZELRE_CACHE_L1_SECRET` to `new-key` and gracefully
+   roll every affected runner agent. Clients send a single key, never the list.
+3. Configure the L1s with only `new-key` and roll them again. Confirm an
+   authenticated cache RPC succeeds with the new key and rejects the old key.
+
+The list is read at startup. Health and capabilities RPCs are exempt from this
+authentication check, so they do not validate the rotation. In FA deployments,
+update the environment's `bazel_l1_auth_secret_prd` or
+`bazel_l1_auth_secret_stg` Ansible vault value for the server list; runner-agent
+Doppler values remain single keys. Leaving the server setting completely empty
+retains the development-only no-secret behavior, subject to the startup posture
+gate.
+
+### Upstream fixes
+
 Track upstream security fixes by monitoring the upstream repository's releases,
 tags, and security advisories for `bazel-remote`. To apply an upstream patch:
 

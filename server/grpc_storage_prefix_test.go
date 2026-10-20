@@ -7,6 +7,7 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -14,13 +15,13 @@ import (
 
 func TestStoragePrefixFromIncomingContext(t *testing.T) {
 	t.Run("no metadata is rejected (fail-closed)", func(t *testing.T) {
-		_, err := storagePrefixFromIncomingContext(context.Background(), "")
+		_, err := storagePrefixFromIncomingContext(context.Background(), nil)
 		requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "missing")
 	})
 
 	t.Run("missing prefix key is rejected", func(t *testing.T) {
 		md := metadata.Pairs("some-other-key", "value")
-		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "")
+		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), nil)
 		requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "missing")
 	})
 
@@ -29,13 +30,13 @@ func TestStoragePrefixFromIncomingContext(t *testing.T) {
 			cache.StoragePrefixGRPCMetadataKey, "bazel/staging/us-west/42/9876/v0/bazel/",
 			cache.StoragePrefixGRPCMetadataKey, "bazel/staging/us-west/43/1234/v0/bazel/",
 		)
-		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "")
+		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), nil)
 		requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "duplicate")
 	})
 
 	t.Run("valid prefix is lifted onto context", func(t *testing.T) {
 		md := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, "bazel/staging/us-west/42/9876/v0/bazel/")
-		ctx, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "")
+		ctx, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -51,7 +52,7 @@ func TestStoragePrefixFromIncomingContext(t *testing.T) {
 	for _, invalid := range []string{"", "/abs/path/", "a/../b/", "a//b/", "a\\b/", "..", "."} {
 		t.Run("rejects "+invalid, func(t *testing.T) {
 			md := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, invalid)
-			_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "")
+			_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), nil)
 			requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "invalid")
 		})
 	}
@@ -61,7 +62,7 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 	validPrefix := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, "bazel/staging/us-west/42/9876/v0/bazel/")
 
 	t.Run("missing secret is rejected when configured", func(t *testing.T) {
-		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), "hunter2")
+		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), []string{"hunter2"})
 		if status.Code(err) != codes.Unauthenticated {
 			t.Fatalf("expected Unauthenticated, got %v", err)
 		}
@@ -69,7 +70,7 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 
 	t.Run("wrong secret is rejected", func(t *testing.T) {
 		md := metadata.Join(validPrefix, metadata.Pairs(cache.AuthSecretGRPCMetadataKey, "wrong"))
-		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "hunter2")
+		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), []string{"hunter2"})
 		if status.Code(err) != codes.Unauthenticated {
 			t.Fatalf("expected Unauthenticated, got %v", err)
 		}
@@ -80,7 +81,7 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 			cache.AuthSecretGRPCMetadataKey, "hunter2",
 			cache.AuthSecretGRPCMetadataKey, "hunter2",
 		))
-		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "hunter2")
+		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), []string{"hunter2"})
 		if status.Code(err) != codes.Unauthenticated {
 			t.Fatalf("expected Unauthenticated for duplicate secrets, got %v", err)
 		}
@@ -88,7 +89,7 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 
 	t.Run("correct secret passes", func(t *testing.T) {
 		md := metadata.Join(validPrefix, metadata.Pairs(cache.AuthSecretGRPCMetadataKey, "hunter2"))
-		ctx, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "hunter2")
+		ctx, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), []string{"hunter2"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -98,11 +99,86 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 	})
 
 	t.Run("secret not required when unconfigured", func(t *testing.T) {
-		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), "")
+		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
+}
+
+func TestStoragePrefixAuthRotation(t *testing.T) {
+	t.Parallel()
+	const prefix = "bazel/staging/us-west/42/9876/v0/bazel/"
+	for _, tc := range []struct {
+		name       string
+		configured string
+		presented  []string
+		want       codes.Code
+	}{
+		{"single key", "old", []string{"old"}, codes.OK},
+		{"new key during overlap", "new,old", []string{"new"}, codes.OK},
+		{"old key during overlap", "new,old", []string{"old"}, codes.OK},
+		{"third key", "new,old,older", []string{"older"}, codes.OK},
+		{"whitespace and empty entries", " , new, , old , ", []string{"old"}, codes.OK},
+		{"repeated configured key", "new,new", []string{"new"}, codes.OK},
+		{"new key after rotation", "new", []string{"new"}, codes.OK},
+		{"retired key", "new", []string{"old"}, codes.Unauthenticated},
+		{"unknown key", "new,old", []string{"unknown"}, codes.Unauthenticated},
+		{"missing key", "new,old", nil, codes.Unauthenticated},
+		{"empty key", "new,,old", []string{""}, codes.Unauthenticated},
+		{"request list", "new,old", []string{"new,old"}, codes.Unauthenticated},
+		{"multiple request values", "new,old", []string{"new", "old"}, codes.Unauthenticated},
+		{"duplicate request values", "new,old", []string{"new", "new"}, codes.Unauthenticated},
+		{"untrimmed request key", "new,old", []string{" old "}, codes.Unauthenticated},
+		{"empty list", " , , ", []string{""}, codes.Unauthenticated},
+		{"empty list with unknown key", " , , ", []string{"unknown"}, codes.Unauthenticated},
+		{"whitespace configuration", " ", []string{" "}, codes.Unauthenticated},
+		{"unconfigured dev mode", "", nil, codes.OK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			md := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, prefix)
+			if tc.presented != nil {
+				md.Set(cache.AuthSecretGRPCMetadataKey, tc.presented...)
+			}
+			ctx := metadata.NewIncomingContext(context.Background(), md)
+			checkPrefix := func(t *testing.T, ctx context.Context) {
+				t.Helper()
+				got, ok := cache.StoragePrefixFromContext(ctx)
+				if !ok || got != prefix || !cache.StoragePrefixRequiredFromContext(ctx) {
+					t.Fatalf("authorized request lost required storage prefix: %q, present=%v", got, ok)
+				}
+			}
+			t.Run("unary", func(t *testing.T) {
+				called := false
+				_, err := GRPCStoragePrefixUnaryServerInterceptor(tc.configured)(
+					ctx, nil,
+					&grpc.UnaryServerInfo{FullMethod: "/build.bazel.remote.execution.v2.ActionCache/GetActionResult"},
+					func(ctx context.Context, _ interface{}) (interface{}, error) {
+						called = true
+						checkPrefix(t, ctx)
+						return nil, nil
+					})
+				if status.Code(err) != tc.want || called != (tc.want == codes.OK) {
+					t.Fatalf("code=%v, handler called=%v; want %v", status.Code(err), called, tc.want)
+				}
+			})
+			t.Run("stream", func(t *testing.T) {
+				called := false
+				err := GRPCStoragePrefixStreamServerInterceptor(tc.configured)(
+					nil, &tenantMetadataServerStream{ctx: ctx},
+					&grpc.StreamServerInfo{FullMethod: "/google.bytestream.ByteStream/Read"},
+					func(_ interface{}, stream grpc.ServerStream) error {
+						called = true
+						checkPrefix(t, stream.Context())
+						return nil
+					})
+				if status.Code(err) != tc.want || called != (tc.want == codes.OK) {
+					t.Fatalf("code=%v, handler called=%v; want %v", status.Code(err), called, tc.want)
+				}
+			})
+		})
+	}
 }
 
 func TestTrustRejectionCounters(t *testing.T) {
@@ -116,13 +192,13 @@ func TestTrustRejectionCounters(t *testing.T) {
 	secretBefore := testutil.ToFloat64(authSecretRejected.WithLabelValues("missing")) +
 		testutil.ToFloat64(authSecretRejected.WithLabelValues("mismatch"))
 
-	_, _ = storagePrefixFromIncomingContext(context.Background(), "")
+	_, _ = storagePrefixFromIncomingContext(context.Background(), nil)
 	md := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, "a//b/")
-	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "")
+	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), nil)
 
-	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), "hunter2")
+	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), []string{"hunter2"})
 	md = metadata.Join(validPrefix, metadata.Pairs(cache.AuthSecretGRPCMetadataKey, "wrong"))
-	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), "hunter2")
+	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), []string{"hunter2"})
 
 	prefixAfter := testutil.ToFloat64(storagePrefixRejected.WithLabelValues("missing")) +
 		testutil.ToFloat64(storagePrefixRejected.WithLabelValues("invalid"))
