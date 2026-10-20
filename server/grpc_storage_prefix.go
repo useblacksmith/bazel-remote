@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"crypto/subtle"
+	"strings"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 
@@ -48,24 +48,41 @@ var storagePrefixRejected = promauto.NewCounterVec(prometheus.CounterOpts{
 
 var authSecretRejected = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "bazel_remote_auth_secret_rejected_total",
-	Help: "Cache RPCs rejected by the shared-secret auth check, by cause (missing/duplicate/mismatch). Nonzero means the upstream's BAZELRE_CACHE_L1_SECRET disagrees with this node's configured secret.",
+	Help: "Cache RPCs rejected by the shared-secret auth check, by cause (missing/duplicate/mismatch). Nonzero means the upstream's BAZELRE_CACHE_L1_SECRET does not match any of this node's configured secrets.",
 }, []string{"reason"})
 
-func storagePrefixFromIncomingContext(ctx context.Context, authSecret string) (context.Context, error) {
+func parseAuthSecrets(raw string) map[string]struct{} {
+	if raw == "" {
+		return nil
+	}
+	secrets := make(map[string]struct{})
+	for _, secret := range strings.Split(raw, ",") {
+		if secret = strings.TrimSpace(secret); secret != "" {
+			secrets[secret] = struct{}{}
+		}
+	}
+	// A non-nil empty set keeps authentication required when the
+	// configuration contains no usable keys.
+	return secrets
+}
+
+func matchesAuthSecret(got string, secrets map[string]struct{}) bool {
+	_, ok := secrets[got]
+	return ok
+}
+
+func storagePrefixFromIncomingContext(ctx context.Context, authSecrets map[string]struct{}) (context.Context, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 
-	if authSecret != "" {
+	if authSecrets != nil {
 		secrets := md.Get(cache.AuthSecretGRPCMetadataKey)
-		// The value count is not secret-dependent, so distinguishing
-		// missing/duplicate from mismatch leaks nothing; only the value
-		// comparison itself must be constant-time.
 		cause := ""
 		switch {
 		case len(secrets) == 0:
 			cause = "missing"
 		case len(secrets) > 1:
 			cause = "duplicate"
-		case subtle.ConstantTimeCompare([]byte(secrets[0]), []byte(authSecret)) != 1:
+		case !matchesAuthSecret(secrets[0], authSecrets):
 			cause = "mismatch"
 		}
 		if cause != "" {
@@ -98,14 +115,17 @@ func storagePrefixFromIncomingContext(ctx context.Context, authSecret string) (c
 
 // GRPCStoragePrefixUnaryServerInterceptor returns a unary interceptor that
 // enforces the fail-closed trust contract and lifts the forwarded storage
-// prefix onto the context. authSecret, when non-empty, must match the
-// cache.AuthSecretGRPCMetadataKey metadata on every non-exempt RPC.
+// prefix onto the context. authSecret is a comma-separated list of accepted
+// secrets; whitespace around each entry is ignored. When non-empty, exactly
+// one cache.AuthSecretGRPCMetadataKey value must match a non-empty entry on
+// every non-exempt RPC. An empty authSecret disables the secret check.
 func GRPCStoragePrefixUnaryServerInterceptor(authSecret string) grpc.UnaryServerInterceptor {
+	authSecrets := parseAuthSecrets(authSecret)
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		if exemptFromTenantMetadata(info.FullMethod) {
 			return handler(ctx, req)
 		}
-		ctx, err := storagePrefixFromIncomingContext(ctx, authSecret)
+		ctx, err := storagePrefixFromIncomingContext(ctx, authSecrets)
 		if err != nil {
 			return nil, err
 		}
@@ -115,13 +135,15 @@ func GRPCStoragePrefixUnaryServerInterceptor(authSecret string) grpc.UnaryServer
 
 // GRPCStoragePrefixStreamServerInterceptor returns a stream interceptor that
 // enforces the fail-closed trust contract and lifts the forwarded storage
-// prefix onto the context.
+// prefix onto the context. authSecret has the same comma-separated format
+// as GRPCStoragePrefixUnaryServerInterceptor.
 func GRPCStoragePrefixStreamServerInterceptor(authSecret string) grpc.StreamServerInterceptor {
+	authSecrets := parseAuthSecrets(authSecret)
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		if exemptFromTenantMetadata(info.FullMethod) {
 			return handler(srv, ss)
 		}
-		ctx, err := storagePrefixFromIncomingContext(ss.Context(), authSecret)
+		ctx, err := storagePrefixFromIncomingContext(ss.Context(), authSecrets)
 		if err != nil {
 			return err
 		}
