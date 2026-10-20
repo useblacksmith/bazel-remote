@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -62,7 +64,7 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 	validPrefix := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, "bazel/staging/us-west/42/9876/v0/bazel/")
 
 	t.Run("missing secret is rejected when configured", func(t *testing.T) {
-		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), []string{"hunter2"})
+		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), parseAuthSecrets("hunter2"))
 		if status.Code(err) != codes.Unauthenticated {
 			t.Fatalf("expected Unauthenticated, got %v", err)
 		}
@@ -70,7 +72,7 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 
 	t.Run("wrong secret is rejected", func(t *testing.T) {
 		md := metadata.Join(validPrefix, metadata.Pairs(cache.AuthSecretGRPCMetadataKey, "wrong"))
-		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), []string{"hunter2"})
+		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), parseAuthSecrets("hunter2"))
 		if status.Code(err) != codes.Unauthenticated {
 			t.Fatalf("expected Unauthenticated, got %v", err)
 		}
@@ -81,7 +83,7 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 			cache.AuthSecretGRPCMetadataKey, "hunter2",
 			cache.AuthSecretGRPCMetadataKey, "hunter2",
 		))
-		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), []string{"hunter2"})
+		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), parseAuthSecrets("hunter2"))
 		if status.Code(err) != codes.Unauthenticated {
 			t.Fatalf("expected Unauthenticated for duplicate secrets, got %v", err)
 		}
@@ -89,7 +91,7 @@ func TestStoragePrefixAuthSecret(t *testing.T) {
 
 	t.Run("correct secret passes", func(t *testing.T) {
 		md := metadata.Join(validPrefix, metadata.Pairs(cache.AuthSecretGRPCMetadataKey, "hunter2"))
-		ctx, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), []string{"hunter2"})
+		ctx, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), parseAuthSecrets("hunter2"))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -196,9 +198,9 @@ func TestTrustRejectionCounters(t *testing.T) {
 	md := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, "a//b/")
 	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), nil)
 
-	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), []string{"hunter2"})
+	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), validPrefix), parseAuthSecrets("hunter2"))
 	md = metadata.Join(validPrefix, metadata.Pairs(cache.AuthSecretGRPCMetadataKey, "wrong"))
-	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), []string{"hunter2"})
+	_, _ = storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), parseAuthSecrets("hunter2"))
 
 	prefixAfter := testutil.ToFloat64(storagePrefixRejected.WithLabelValues("missing")) +
 		testutil.ToFloat64(storagePrefixRejected.WithLabelValues("invalid"))
@@ -223,6 +225,30 @@ func TestExemptFromTenantMetadata(t *testing.T) {
 	} {
 		if got := exemptFromTenantMetadata(method); got != want {
 			t.Errorf("exemptFromTenantMetadata(%q) = %v, want %v", method, got, want)
+		}
+	}
+}
+
+func BenchmarkAuthSecretLookup(b *testing.B) {
+	for _, count := range []int{1, 2, 16, 128} {
+		keys := make([]string, count)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("%064x", i+1)
+		}
+		accepted := parseAuthSecrets(strings.Join(keys, ","))
+		for _, hit := range []bool{true, false} {
+			b.Run(fmt.Sprintf("keys=%d/hit=%t", count, hit), func(b *testing.B) {
+				presented := strings.Repeat("f", 64)
+				if hit {
+					presented = strings.Clone(keys[len(keys)-1])
+				}
+				b.ReportAllocs()
+				for b.Loop() {
+					if matchesAuthSecret(presented, accepted) != hit {
+						b.Fatal("unexpected lookup result")
+					}
+				}
+			})
 		}
 	}
 }

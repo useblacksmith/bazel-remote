@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/subtle"
 	"strings"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -52,38 +51,31 @@ var authSecretRejected = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Cache RPCs rejected by the shared-secret auth check, by cause (missing/duplicate/mismatch). Nonzero means the upstream's BAZELRE_CACHE_L1_SECRET does not match any of this node's configured secrets.",
 }, []string{"reason"})
 
-func parseAuthSecrets(raw string) []string {
+func parseAuthSecrets(raw string) map[string]struct{} {
 	if raw == "" {
 		return nil
 	}
-	secrets := strings.Split(raw, ",")
-	for i := range secrets {
-		secrets[i] = strings.TrimSpace(secrets[i])
+	secrets := make(map[string]struct{})
+	for _, secret := range strings.Split(raw, ",") {
+		if secret = strings.TrimSpace(secret); secret != "" {
+			secrets[secret] = struct{}{}
+		}
 	}
-	// Keep empty entries so a non-empty configuration with no usable keys
-	// still requires authentication and rejects every request.
+	// A non-nil empty set keeps authentication required when the
+	// configuration contains no usable keys.
 	return secrets
 }
 
-func matchesAuthSecret(got string, secrets []string) bool {
-	matched := 0
-	for _, secret := range secrets {
-		if secret != "" {
-			// Check every key so the matching key's position is not exposed.
-			matched |= subtle.ConstantTimeCompare([]byte(got), []byte(secret))
-		}
-	}
-	return matched == 1
+func matchesAuthSecret(got string, secrets map[string]struct{}) bool {
+	_, ok := secrets[got]
+	return ok
 }
 
-func storagePrefixFromIncomingContext(ctx context.Context, authSecrets []string) (context.Context, error) {
+func storagePrefixFromIncomingContext(ctx context.Context, authSecrets map[string]struct{}) (context.Context, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 
-	if len(authSecrets) > 0 {
+	if authSecrets != nil {
 		secrets := md.Get(cache.AuthSecretGRPCMetadataKey)
-		// The value count is not secret-dependent, so distinguishing
-		// missing/duplicate from mismatch leaks nothing; only the value
-		// comparison itself must be constant-time.
 		cause := ""
 		switch {
 		case len(secrets) == 0:
