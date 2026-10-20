@@ -3,8 +3,8 @@
 package gcsproxy
 
 import (
-	"encoding/json"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
