@@ -609,6 +609,16 @@ var chunkBufferPool = &sync.Pool{
 	},
 }
 
+// alreadyCompressed reports whether b is the start of a gzip member or a
+// zstd frame. Those are the bodies the guest caches upload as identity
+// blobs (Nx gzip, Turborepo zstd).
+func alreadyCompressed(b []byte) bool {
+	if len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b {
+		return true
+	}
+	return len(b) >= 4 && b[0] == 0x28 && b[1] == 0xb5 && b[2] == 0x2f && b[3] == 0xfd
+}
+
 // Read from r and write to f, using CompressionType t.
 // Return the size on disk or an error if something went wrong.
 func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t CompressionType, hash string, size int64) (int64, error) {
@@ -617,6 +627,24 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 
 	if size <= 0 {
 		return -1, fmt.Errorf("invalid file size: %d", size)
+	}
+
+	// A blob whose own framing is already gzip or zstd does not get a second
+	// zstd pass. The digest is of those bytes, and encoding them again only
+	// spends CPU to store a marginally different size. Identity casblobs are
+	// what the reader already returns verbatim.
+	if t == Zstandard {
+		peek := make([]byte, 4)
+		n, err := io.ReadFull(r, peek)
+		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+			_ = f.Close()
+			return -1, err
+		}
+		peek = peek[:n]
+		r = io.MultiReader(bytes.NewReader(peek), r)
+		if alreadyCompressed(peek) {
+			t = Identity
+		}
 	}
 
 	chunkSize := uint32(defaultChunkSize)
@@ -667,6 +695,17 @@ func WriteAndClose(zstd zstdimpl.ZstdImpl, r io.Reader, f *os.File, t Compressio
 			return -1,
 				fmt.Errorf("checksums don't match. Expected %s, found %s",
 					hash, actualHash)
+		}
+
+		// The offset table is written before the size is known. The reader
+		// requires it to increase and for the last entry to be the file size.
+		h.chunkOffsets[0] = fileOffset
+		h.chunkOffsets[1] = fileOffset + n
+		if _, err = f.Seek(chunkTableOffset, io.SeekStart); err != nil {
+			return -1, fmt.Errorf("failed to seek to offset %d: %w", chunkTableOffset, err)
+		}
+		if err = binary.Write(f, binary.LittleEndian, h.chunkOffsets); err != nil {
+			return -1, fmt.Errorf("failed to write chunk offsets: %w", err)
 		}
 
 		return n + fileOffset, f.Close()
