@@ -2,6 +2,7 @@ package casblob_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -25,6 +26,72 @@ func TestLenSize(t *testing.T) {
 	if len(slice) != 0 {
 		// We should never hit this case.
 		t.Errorf("This should silence linters that think slice is never used")
+	}
+}
+
+func TestWriteAndCloseStoresAlreadyCompressedBytesAsIdentity(t *testing.T) {
+	zstd, err := zstdimpl.Get("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := bytes.Repeat([]byte("cache-me-"), 4096)
+	var gzipped bytes.Buffer
+	zw := gzip.NewWriter(&gzipped)
+	if _, err := zw.Write(plain); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	compressed := zstd.EncodeAll(plain)
+
+	for _, tc := range []struct {
+		name       string
+		body       []byte
+		wantStored byte
+	}{
+		{name: "plain", body: plain, wantStored: byte(casblob.Zstandard)},
+		{name: "gzip", body: gzipped.Bytes(), wantStored: byte(casblob.Identity)},
+		{name: "zstd", body: compressed, wantStored: byte(casblob.Identity)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sum := sha256.Sum256(tc.body)
+			hash := hex.EncodeToString(sum[:])
+			dir := testutils.TempDir(t)
+			file, err := os.OpenFile(dir+"/"+hash, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o664)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := casblob.WriteAndClose(zstd, bytes.NewReader(tc.body), file, casblob.Zstandard, hash, int64(len(tc.body))); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := os.ReadFile(dir + "/" + hash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(stored) < 17 {
+				t.Fatalf("blob is %d bytes, shorter than a casblob header", len(stored))
+			}
+			if stored[16] != tc.wantStored {
+				t.Fatalf("compression byte = %d, want %d", stored[16], tc.wantStored)
+			}
+			in, err := os.Open(dir + "/" + hash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rc, err := casblob.GetUncompressedReadCloser(zstd, in, int64(len(tc.body)), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(rc)
+			_ = rc.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, tc.body) {
+				t.Fatalf("round trip = %d bytes, want %d", len(got), len(tc.body))
+			}
+		})
 	}
 }
 

@@ -57,17 +57,13 @@ type s3Cache struct {
 	metrics          Metrics
 	v2mode           bool
 	updateTimestamps bool
-	// disconnectedTools severs the named build tools from this backend
-	// entirely: Get and Contains answer clean misses and LRU artifacts are
-	// skipped, leaving the local disk cache as the only tier for those tools. Nil
-	// disconnects nothing. Canary toggle — flipping the env var is the whole
-	// roll-in/roll-out.
-	//
-	// Values are each tool's pre-rendered skip reason ("go" ->
-	// "go_disconnect"), which keeps the hot skip path allocation-free and,
-	// more importantly, bounds the metric label: the reason reaching
-	// Prometheus is always one this map was configured with, never a build
-	// tool named by an incoming request.
+	// disconnectedTools, when non-empty, severs every build tool from this
+	// backend: Get and Contains answer clean misses and LRU artifacts are
+	// skipped, leaving the local disk cache as the only tier. Nil or empty
+	// disconnects nothing. The map's keys are the tools whose historical
+	// reason labels must stay stable ("go" -> "go_disconnect"); any other
+	// tool is cut under the fixed label tool_disconnect. A request with no
+	// build-tool identity still reads the backend (the quarantine prefix).
 	disconnectedTools map[string]string
 	// readDeadline is the overall bound on one read-path call including the
 	// streamed body; defaults to the package-level readDeadline, overridable
@@ -86,9 +82,10 @@ func WithOperationObserver(observer cache.OperationObserver) Option {
 	}
 }
 
-// WithBackendDisconnectTools severs the named build tools ("go", "turbo")
-// from this backend, for every entry kind and operation (see
-// s3Cache.disconnectedTools). Empty disconnects nothing.
+// WithBackendDisconnectTools turns the backend disconnect on. An empty list
+// disconnects nothing. A non-empty list disconnects every build tool; the
+// names only select the stable per-tool reason labels (see
+// s3Cache.disconnectedTools).
 func WithBackendDisconnectTools(tools []string) Option {
 	return func(c *s3Cache) {
 		if len(tools) == 0 {
@@ -543,6 +540,11 @@ const (
 	// producing exactly "go_disconnect" — the existing dashboards and alerts
 	// query that series by name.
 	skipReasonDisconnectSuffix = "_disconnect"
+	// skipReasonAnyTool is the bounded label for a build tool that is cut
+	// because the disconnect is on, but that was not named in the set. The
+	// label must not be the tool string from the request: that string is
+	// unbounded.
+	skipReasonAnyTool = "tool_disconnect"
 )
 
 // isGoRequest reports whether the request is Go-cache traffic, identified by
@@ -559,31 +561,44 @@ func isGoRequest(ctx context.Context) bool {
 	return path.Base(prefix) == "go"
 }
 
-// disconnectReason resolves whether this request belongs to a disconnected
-// build tool, and under which skip reason.
+// disconnectReason resolves whether this request belongs to a build tool
+// while the backend disconnect is on, and under which skip reason.
 //
-// Both of isGoRequest's signals are consulted independently, and either one
-// naming a disconnected tool is enough — deliberately not "resolve the tool,
-// then test it". The two can disagree (a request can carry a bazel label under
-// a go prefix), and the disconnect is a promise that a tool produces zero S3
-// operations, so an ambiguous request has to be treated as the tool being
-// withheld. Tightening this to a single resolved tool would silently re-attach
-// exactly the traffic the cut exists to remove.
+// A non-empty disconnectedTools set cuts every build tool, not only the
+// named ones. The names choose the historical reason label so existing
+// dashboards keep their series; any other tool uses tool_disconnect.
+//
+// Both signals are consulted independently, and either one identifying a
+// tool is enough. They can disagree (a bazel label under a go prefix). The
+// disconnect promises a tool emits zero S3 operations, so an ambiguous
+// request is withheld. A named reason wins over tool_disconnect when either
+// signal names a tool in the set. A request with neither signal still reads
+// the backend.
 func (c *s3Cache) disconnectReason(ctx context.Context) (string, bool) {
 	if len(c.disconnectedTools) == 0 {
 		return "", false
 	}
+	toolFromLabel := ""
 	if labels, ok := cache.MetricsLabelsFromContext(ctx); ok {
-		if reason, disconnected := c.disconnectedTools[labels.BuildToolID]; disconnected {
-			return reason, true
-		}
+		toolFromLabel = labels.BuildToolID
 	}
+	toolFromPrefix := ""
 	if prefix, ok := cache.StoragePrefixFromContext(ctx); ok {
-		if reason, disconnected := c.disconnectedTools[path.Base(prefix)]; disconnected {
-			return reason, true
+		toolFromPrefix = path.Base(prefix)
+		if toolFromPrefix == "." || toolFromPrefix == "/" {
+			toolFromPrefix = ""
 		}
 	}
-	return "", false
+	if toolFromLabel == "" && toolFromPrefix == "" {
+		return "", false
+	}
+	if reason, named := c.disconnectedTools[toolFromLabel]; named && toolFromLabel != "" {
+		return reason, true
+	}
+	if reason, named := c.disconnectedTools[toolFromPrefix]; named && toolFromPrefix != "" {
+		return reason, true
+	}
+	return skipReasonAnyTool, true
 }
 
 // skipGoActionCacheBackendLookup reports whether Get/Contains should skip MinIO.

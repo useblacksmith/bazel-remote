@@ -66,24 +66,24 @@ func (c *s3Cache) PutArtifact(ctx context.Context, key string, body []byte) erro
 }
 
 // disconnectedArtifactReason reports whether an artifact key sits inside a
-// disconnected tool's tenant namespace, and under which skip reason: the
-// artifact segment ("lru/", and any future sibling) nested directly under a
-// disconnected tool segment (keys are
-// <env>/<installation>/<repo>/<tool>/lru/<name>). Keyed on the key rather
-// than the request context because artifact flushes run on timers whose
-// contexts carry no tenant identity.
+// build tool's tenant namespace while the disconnect is on, and under which
+// skip reason. Keys are <env>/<installation>/<repo>/<tool>/lru/<name>. A
+// named tool keeps its historical reason; any other tool uses
+// tool_disconnect. Keyed on the key rather than the request context because
+// artifact flushes run on timers whose contexts carry no tenant identity.
 func (c *s3Cache) disconnectedArtifactReason(key string) (string, bool) {
 	if len(c.disconnectedTools) == 0 {
 		return "", false
 	}
 	segments := strings.Split(key, "/")
 	for i := 1; i < len(segments); i++ {
-		if segments[i] != "lru" {
+		if segments[i] != "lru" || segments[i-1] == "" {
 			continue
 		}
-		if reason, disconnected := c.disconnectedTools[segments[i-1]]; disconnected {
+		if reason, named := c.disconnectedTools[segments[i-1]]; named {
 			return reason, true
 		}
+		return skipReasonAnyTool, true
 	}
 	return "", false
 }
