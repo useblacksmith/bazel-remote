@@ -60,6 +60,10 @@ back to the configured process-wide prefix. Buck2 should not set this marker.
 
 ### L1 shared-secret rotation
 
+Follow the [operator runbook](docs/CREDENTIAL_ROTATION.md) for inventory
+reconciliation, encrypted configuration updates, serial deployment, protected
+unary/streaming RPC probes, client drain, retirement, and rollback.
+
 `BAZEL_REMOTE_L1_AUTH_SECRET` accepts one key or a comma-separated list such
 as `new-key,old-key`. Whitespace around entries is ignored. Empty entries
 never authorize a request, and a non-empty list containing only empty entries
