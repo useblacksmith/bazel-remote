@@ -134,13 +134,14 @@ func (c *Config) setProxy() error {
 	}
 
 	if c.S3CloudStorage != nil {
-		// Canary toggle, read once at construction and threaded to every
-		// backend so it covers single-backend and map mode alike: Go-cache
-		// traffic bypasses the S3 backend entirely (reads answer clean
-		// misses).
+		// Read once at construction and threaded to every backend so it
+		// covers single-backend and map mode alike. A non-empty set severs
+		// every build tool from the S3 backend (reads answer clean misses).
+		// The names are the tools whose skip-reason labels stay specific;
+		// every other tool is cut under tool_disconnect.
 		disconnectTools := backendDisconnectTools()
 		if len(disconnectTools) > 0 {
-			log.Printf("S3 backend disconnect enabled for build tools %s: that traffic will not read from the S3 backend",
+			log.Printf("S3 backend disconnect enabled: every build tool skips the S3 backend (named reason labels: %s)",
 				strings.Join(disconnectTools, ", "))
 		}
 
@@ -234,9 +235,11 @@ func parseBucketLookupType(typeStr string) (minio.BucketLookupType, error) {
 	return val, nil
 }
 
-// backendDisconnectTools resolves which build tools are severed from the S3
-// backend. BAZEL_REMOTE_BACKEND_DISCONNECT_TOOLS is the general form, a
-// comma-separated list of build tool IDs ("go,turbo").
+// backendDisconnectTools resolves the build tools whose S3 skip-reason
+// labels stay specific. A non-empty result severs every build tool from
+// the backend, not only the names returned here.
+// BAZEL_REMOTE_BACKEND_DISCONNECT_TOOLS is a comma-separated list of build
+// tool IDs ("go,turbo").
 //
 // BAZEL_REMOTE_GO_BACKEND_DISCONNECT=1 predates that list and is still
 // honoured, because the binary and the env file roll independently: a node

@@ -616,8 +616,8 @@ func TestSkipBackendLookupReason(t *testing.T) {
 		{name: "on go prefix CAS", disconnect: true, ctx: goPrefix, kind: cache.CAS, reason: goDisconnectReason, skip: true},
 		{name: "on go label AC", disconnect: true, ctx: goTool, kind: cache.AC, reason: goDisconnectReason, skip: true},
 		{name: "on go label CAS", disconnect: true, ctx: goTool, kind: cache.CAS, reason: goDisconnectReason, skip: true},
-		{name: "on bazel prefix AC", disconnect: true, ctx: bazelPrefix, kind: cache.AC, skip: false},
-		{name: "on bazel prefix CAS", disconnect: true, ctx: bazelPrefix, kind: cache.CAS, skip: false},
+		{name: "on bazel prefix AC", disconnect: true, ctx: bazelPrefix, kind: cache.AC, reason: skipReasonAnyTool, skip: true},
+		{name: "on bazel prefix CAS", disconnect: true, ctx: bazelPrefix, kind: cache.CAS, reason: skipReasonAnyTool, skip: true},
 		{name: "on unscoped AC", disconnect: true, ctx: context.Background(), kind: cache.AC, skip: false},
 		{name: "on unscoped CAS", disconnect: true, ctx: context.Background(), kind: cache.CAS, skip: false},
 	}
@@ -675,10 +675,11 @@ func countingFakeS3Backend(t *testing.T, requests *atomic.Int64, buckets ...stri
 	}
 }
 
-// TestGoBackendDisconnectSkipsAllKinds pins the canary toggle's read side:
-// with the disconnect on, Go traffic (either detection signal) answers clean
-// misses for EVERY entry kind without dialing the backend — even for objects
-// the backend demonstrably holds — while non-Go traffic is untouched.
+// TestGoBackendDisconnectSkipsAllKinds pins the disconnect's read side: with
+// the disconnect on, Go traffic (either detection signal) answers clean
+// misses for every entry kind without dialing the backend, and so does any
+// other build tool. Go keeps its historical reason label; an unlisted tool
+// is counted as tool_disconnect.
 func TestGoBackendDisconnectSkipsAllKinds(t *testing.T) {
 	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	var requests atomic.Int64
@@ -734,18 +735,24 @@ func TestGoBackendDisconnectSkipsAllKinds(t *testing.T) {
 		t.Fatalf("backendLookupsSkipped{reason=go_ac} delta = %v, want 0", got)
 	}
 
+	bazelSkipsBefore := testutil.ToFloat64(backendLookupsSkipped.WithLabelValues(c.key, skipReasonAnyTool))
 	for _, kind := range []cache.EntryKind{cache.AC, cache.CAS} {
-		rc, _, err := c.Get(ctxBazel, kind, hash, -1)
-		if err != nil || rc == nil {
-			t.Fatalf("bazel %s Get = (%v, %v), want hit", kind, rc, err)
+		rc, size, err := c.Get(ctxBazel, kind, hash, -1)
+		if rc != nil || size != -1 || err != nil {
+			if rc != nil {
+				_ = rc.Close()
+			}
+			t.Fatalf("bazel %s Get = (%v, %d, %v), want skip miss", kind, rc, size, err)
 		}
-		_ = rc.Close()
-		if exists, _ := c.Contains(ctxBazel, kind, hash, -1); !exists {
-			t.Fatalf("bazel %s Contains = false, want true", kind)
+		if exists, size := c.Contains(ctxBazel, kind, hash, -1); exists || size != -1 {
+			t.Fatalf("bazel %s Contains = (%v, %d), want skip miss", kind, exists, size)
 		}
 	}
-	if got := requests.Load() - seeded; got == 0 {
-		t.Fatal("expected non-Go traffic to dial the backend with the disconnect on")
+	if got := requests.Load() - seeded; got != 0 {
+		t.Fatalf("backend dialed %d times for an unlisted tool, want 0", got)
+	}
+	if got := testutil.ToFloat64(backendLookupsSkipped.WithLabelValues(c.key, skipReasonAnyTool)) - bazelSkipsBefore; got != 4 {
+		t.Fatalf("backendLookupsSkipped{reason=tool_disconnect} delta = %v, want 4", got)
 	}
 }
 
@@ -763,23 +770,27 @@ func TestGoBackendDisconnectSkipsGoTenantArtifacts(t *testing.T) {
 }
 
 func TestGoTenantArtifactKey(t *testing.T) {
-	cases := map[string]bool{
-		"prd/10/123/go/lru/00000001-x.jsonl":    true,
-		"staging/42/9/v0/go/lru/x.jsonl":        true,
-		"go/lru/x.jsonl":                        true,
-		"prd/10/123/bazel/lru/00000001-x.jsonl": false,
-		"prd/10/123/go/cas.v2/ab/abcd":          false,
-		"lru/x.jsonl":                           false,
-		"prd/10/go":                             false,
+	cases := map[string]string{
+		"prd/10/123/go/lru/00000001-x.jsonl":    goDisconnectReason,
+		"staging/42/9/v0/go/lru/x.jsonl":        goDisconnectReason,
+		"go/lru/x.jsonl":                        goDisconnectReason,
+		"prd/10/123/bazel/lru/00000001-x.jsonl": skipReasonAnyTool,
+		"prd/10/123/nx/lru/00000001-x.jsonl":    skipReasonAnyTool,
+		"prd/10/123/go/cas.v2/ab/abcd":          "",
+		"lru/x.jsonl":                           "",
+		"prd/10/go":                             "",
 	}
 	c := &s3Cache{disconnectedTools: disconnecting("go")}
 	for key, want := range cases {
 		reason, got := c.disconnectedArtifactReason(key)
-		if got != want {
-			t.Errorf("disconnectedArtifactReason(%q) = %v, want %v", key, got, want)
+		if want == "" {
+			if got {
+				t.Errorf("disconnectedArtifactReason(%q) = %q, want connected", key, reason)
+			}
+			continue
 		}
-		if got && reason != goDisconnectReason {
-			t.Errorf("disconnectedArtifactReason(%q) reason = %q, want %q", key, reason, goDisconnectReason)
+		if !got || reason != want {
+			t.Errorf("disconnectedArtifactReason(%q) = (%q, %v), want (%q, true)", key, reason, got, want)
 		}
 	}
 }
@@ -798,11 +809,11 @@ func disconnecting(tools ...string) map[string]string {
 	return c.disconnectedTools
 }
 
-// TestDisconnectIsPerTool pins the generalization's core claim: tools are
-// severed independently. With only turbo disconnected, turbo traffic never
-// dials the backend for any entry kind, while go — which the Go-only rollout
-// disconnects through a separate switch — still reads through normally.
-func TestDisconnectIsPerTool(t *testing.T) {
+// TestDisconnectCutsEveryTool pins the systematic cut: naming one tool
+// turns the disconnect on for every build tool. The named tool keeps its
+// reason label. An unlisted tool is also withheld, under tool_disconnect,
+// and does not dial the backend.
+func TestDisconnectCutsEveryTool(t *testing.T) {
 	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	var requests atomic.Int64
 	c := countingFakeS3Backend(t, &requests, "default-bucket")
@@ -846,14 +857,19 @@ func TestDisconnectIsPerTool(t *testing.T) {
 		t.Fatalf("expected 4 turbo_disconnect skips, got %v", got)
 	}
 
-	// Go is not in this backend's disconnect set, so it must still serve.
-	rc, _, err := c.Get(ctxGo, cache.CAS, hash, -1)
-	if err != nil || rc == nil {
-		t.Fatalf("go CAS Get = (%v, %v), want a hit: an unlisted tool must be untouched", rc, err)
+	goSkipsBefore := testutil.ToFloat64(backendLookupsSkipped.WithLabelValues(c.key, skipReasonAnyTool))
+	rc, size, err := c.Get(ctxGo, cache.CAS, hash, -1)
+	if rc != nil || size != -1 || err != nil {
+		if rc != nil {
+			_ = rc.Close()
+		}
+		t.Fatalf("go CAS Get = (%v, %d, %v), want skip miss", rc, size, err)
 	}
-	_ = rc.Close()
-	if requests.Load() == seeded {
-		t.Fatal("go read never dialled the backend, so the disconnect is not per-tool")
+	if got := requests.Load(); got != seeded {
+		t.Fatalf("unlisted go dialled the backend: %d requests, want %d", got, seeded)
+	}
+	if got := testutil.ToFloat64(backendLookupsSkipped.WithLabelValues(c.key, skipReasonAnyTool)) - goSkipsBefore; got != 1 {
+		t.Fatalf("expected 1 tool_disconnect skip, got %v", got)
 	}
 }
 
@@ -872,8 +888,19 @@ func TestDisconnectReasonsAreDistinctPerTool(t *testing.T) {
 		}
 	}
 	ctx := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/bazel")
-	if reason, disconnected := c.disconnectReason(ctx); disconnected {
-		t.Errorf("bazel disconnected as %q, want connected", reason)
+	if reason, disconnected := c.disconnectReason(ctx); !disconnected || reason != skipReasonAnyTool {
+		t.Errorf("disconnectReason(bazel) = (%q, %v), want (%q, true)", reason, disconnected, skipReasonAnyTool)
+	}
+}
+
+func TestDisconnectOffLeavesToolsConnected(t *testing.T) {
+	c := &s3Cache{}
+	ctx := cache.WithStoragePrefix(context.Background(), "prd/10/123/v0/nx")
+	if _, disconnected := c.disconnectReason(ctx); disconnected {
+		t.Fatal("an empty disconnect set must leave nx connected")
+	}
+	if _, disconnected := c.disconnectedArtifactReason("prd/10/123/nx/lru/x.jsonl"); disconnected {
+		t.Fatal("an empty disconnect set must leave nx artifacts connected")
 	}
 }
 
