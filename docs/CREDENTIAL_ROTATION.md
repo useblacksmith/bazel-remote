@@ -5,12 +5,9 @@ Use this runbook for the Blacksmith L1 credential in
 or TLS certificates. The production operator sequence is server overlap,
 client transition, graceful drain, and finally old-key rejection.
 
-Blacksmith operators should keep the
-[fa coordination runbook](https://github.com/FastActions/fa/blob/main/runbooks/CREDENTIAL_ROTATION.md)
-open for fleet discovery, Doppler config enumeration, runner rolls, and the
-cross-service retirement gate. That repository is private. This document
-describes the server contract and a reproducible probe without requiring
-private infrastructure addresses or credentials.
+Complete staging before repeating for production. Runner hosts must be rolled
+to load the new client credential; keep both keys accepted until outgoing
+agents and their jobs have finished.
 
 ## What accepts which value
 
@@ -58,11 +55,24 @@ Never assume an inventory alone is the full serving set.
 
 ## 2. Prepare keys and the persistent server configuration
 
-Generate an independent cryptographically random new key and preserve old in
-the private operation journal. In the coordinated procedure these are
-`$ROTATION_DIR/bazel.new` and `$ROTATION_DIR/bazel.old`. Compare the old key with
-the runner Doppler values and the live server configuration without printing it.
-Unexpected variation is a reason to map consumers before proceeding.
+Run the examples in Bash. Create a private working directory, and reuse it for
+retries so the replacement key stays the same:
+
+```bash
+set +x
+umask 077
+ROTATION_DIR=$(mktemp -d "${TMPDIR:-/tmp}/credential-rotation.XXXXXX")
+export ROTATION_DIR
+```
+
+Generate an independent cryptographically random new key. Save it as
+`$ROTATION_DIR/bazel.new` and preserve the current key as `$ROTATION_DIR/bazel.old`.
+Compare the old key with the runner Doppler values and the live server
+configuration without printing it. Unexpected variation is a reason to map
+consumers before proceeding.
+
+Save only the raw credential values in `bazel.old` and `bazel.new` inside
+that directory, with mode `0600`. Keep these files out of Git and terminal logs.
 
 fa owns the persistent server value:
 
@@ -276,9 +286,10 @@ Check every discovered endpoint again immediately before updating clients.
 ## 5. Update clients, roll, and wait for old jobs
 
 Only after complete server coverage, update `BAZELRE_CACHE_L1_SECRET` to the
-single new key in every applicable `gha-agent` config. Use the fa runbook's
-enumeration and secret-safe write/readback procedure. Server overlap can remain
-in place while waiting for a separately scheduled agent roll.
+single new key in every applicable Doppler `gha-agent` config for the selected
+environment. Include regional, Linux ARM, and Mac configs; preserve intentionally
+absent variables. Read back each write privately to verify it. Server overlap
+can remain in place while waiting for a separately scheduled agent roll.
 
 Gracefully roll live/reporting runner hosts, including both Linux architectures
 and Mac regions. Force a restart when the code SHA is unchanged. Keep old
@@ -294,9 +305,8 @@ miss/fallback as proof that authentication worked.
 
 ## 6. Retire old and close the operation
 
-1. Obtain the recorded drain evidence from the shared fa procedure: every live
-   serving client uses new, no old-key jobs/processes remain, and offline
-   consumers cannot return with old.
+1. Confirm runner hosts have been rolled: every live serving client uses new,
+   no old-key jobs/processes remain, and offline consumers cannot return with old.
 2. Generate a new `!vault` block containing only `bazel.new`; replace only the
    selected environment's variable. Commit/review the encrypted change.
 3. Apply the same canary-first, serial configuration convergence to all L1s.
