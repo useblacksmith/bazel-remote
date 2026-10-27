@@ -65,6 +65,7 @@ go_test(
         "grpc_storage_prefix_test.go",
         "grpc_tenant_metadata_test.go",
         "grpc_test.go",
+        "grpc_bytestream_put_panic_test.go",
         "grpc_zstd_crafted_test.go",
         "http_test.go",
         "runtime_test.go",
