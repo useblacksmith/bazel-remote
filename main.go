@@ -535,6 +535,11 @@ func startGrpcServer(c *config.Config, grpcServer **grpc.Server,
 		grpc_prometheus.EnableHandlingTimeHistogram(grpc_prometheus.WithHistogramBuckets(c.MetricsDurationBuckets))
 	}
 
+	// Inside grpc_prometheus so a recovered panic is counted as Internal,
+	// outside everything else so a panic anywhere below is caught.
+	streamInterceptors = append(streamInterceptors, server.GRPCRecoveryStreamServerInterceptor)
+	unaryInterceptors = append(unaryInterceptors, server.GRPCRecoveryUnaryServerInterceptor)
+
 	// L1 mode: trust upstream bazel-remote instances to forward per-tenant
 	// storage prefixes as request metadata. Trust-on is fail-closed: every
 	// cache RPC must carry exactly one valid prefix (and the shared secret,
