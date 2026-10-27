@@ -39,6 +39,7 @@ var (
 		"expected a non-nil *bytestream.ReadRequest")
 	errNilQueryWriteStatusRequest = status.Error(codes.InvalidArgument,
 		"expected a non-nil *bytestream.QueryWriteStatusRequest")
+	errPutPanicked = errors.New("put goroutine panicked")
 )
 
 func (s *grpcServer) Read(req *bytestream.ReadRequest,
@@ -579,6 +580,15 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 
 				go func() {
 					defer s.releaseCASWriteSlot()
+					// Not under the recovery interceptor: a panic here
+					// (e.g. in the zstd decoder) must fail this write, not
+					// the process, and must unblock the recv loop's pipe.
+					defer func() {
+						if r := recover(); r != nil {
+							_ = pr.CloseWithError(errPutPanicked)
+							putResult <- recoveredPanicStatus("ByteStream/Write put", r)
+						}
+					}()
 					putResult <- s.putUpload(srv.Context(), hash, size, cmp, pr)
 				}()
 
