@@ -221,3 +221,26 @@ func TestPutZstdUnavailableDoesNotConsumeInput(t *testing.T) {
 		t.Fatalf("reader was read %d times", cr.n)
 	}
 }
+
+type panickingDecoderZstd struct{ zstdimpl.ZstdImpl }
+
+func (panickingDecoderZstd) GetDecoder(io.ReadCloser) (io.ReadCloser, error) {
+	panic("decoder bug")
+}
+
+func TestPutZstdEvictsWhenVerifierDecoderPanics(t *testing.T) {
+	c := newVerbatimTestCache(t, 1)
+	ctx := context.Background()
+	zstd, _ := zstdimpl.Get("go")
+	c.zstd = panickingDecoderZstd{zstd}
+
+	const size = 4096
+	data, hash := testutils.RandomDataAndHash(size)
+	if err := c.PutZstd(ctx, hash, size, bytes.NewReader(zstd.EncodeAll(data))); err != nil {
+		t.Fatal(err)
+	}
+	waitVerified(t, c)
+	if ok, _ := c.Contains(ctx, cache.CAS, hash, size); ok {
+		t.Fatal("blob whose verification panicked should have been evicted")
+	}
+}

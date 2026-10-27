@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime/debug"
 	"sync/atomic"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -167,7 +168,16 @@ func (c *diskCache) verifyVerbatim(job verifyJob) {
 	}
 }
 
-func (c *diskCache) checkVerbatimDigest(blobPath string, job verifyJob) string {
+func (c *diskCache) checkVerbatimDigest(blobPath string, job verifyJob) (result string) {
+	// The verifier runs on its own goroutines, where a decoder panic on a
+	// client-supplied frame would exit the process; treat it as a failed
+	// verification so the blob is evicted instead.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic verifying stored-as-received blob %s: %v\n%s", job.key, r, debug.Stack())
+			result = "panic"
+		}
+	}()
 	f, err := os.Open(blobPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
