@@ -49,6 +49,11 @@ type Cache interface {
 	// must take the decoding Put path instead.
 	PutZstd(ctx context.Context, hash string, size int64, r io.Reader) error
 	Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64)
+	// ContainsStrict is Contains that fails closed: when the item is not
+	// local and the proxy cannot complete the lookup, it returns an error
+	// instead of a miss. Create-only writers use it so an unreachable
+	// backend never lets a result be overwritten.
+	ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error)
 	FindMissingCasBlobs(ctx context.Context, blobs []*pb.Digest) ([]*pb.Digest, error)
 
 	MaxSize() int64
@@ -1012,6 +1017,44 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 	return false, -1
 }
 
+// ContainsStrict implements Cache.
+func (c *diskCache) ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error) {
+	if c.proxy == nil {
+		exists, foundSize := c.Contains(ctx, kind, hash, size)
+		return exists, foundSize, nil
+	}
+	strict, ok := c.proxy.(cache.StrictExistenceChecker)
+	if !ok {
+		exists, foundSize := c.Contains(ctx, kind, hash, size)
+		return exists, foundSize, nil
+	}
+	if len(hash) != sha256HashStrSize {
+		return false, -1, nil
+	}
+	if kind == cache.CAS && size <= 0 && hash == emptySha256 {
+		return true, 0, nil
+	}
+
+	key := cache.LookupKeyForContext(ctx, kind, hash)
+	c.mu.Lock()
+	item, listElem := c.lru.Get(key)
+	c.mu.Unlock()
+	if listElem != nil && !isSizeMismatch(size, item.size) {
+		return true, item.size, nil
+	}
+	if size > c.maxProxyBlobSize {
+		return false, -1, nil
+	}
+	exists, foundSize, err := strict.ContainsStrict(ctx, kind, hash, size)
+	if err != nil {
+		return false, -1, err
+	}
+	if exists && foundSize <= c.maxProxyBlobSize && !isSizeMismatch(size, foundSize) {
+		return true, foundSize, nil
+	}
+	return false, -1, nil
+}
+
 // MaxSize returns the maximum cache size in bytes.
 func (c *diskCache) MaxSize() int64 {
 	// The underlying value is never modified, no need to lock.
@@ -1084,6 +1127,10 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 	// could only turn a proven hit into a miss (e.g. a transient proxy
 	// StatObject error on a proxy-served Tree).
 	var treeLeafHashes []string
+	// A closure is keyed by the AC's own scope (the observer writes it under
+	// ctx's storage prefix), so leaves resolved from a read-fallback scope
+	// cannot be attributed to it; such hits drop the closure instead.
+	crossScope := false
 
 	for _, f := range result.OutputFiles {
 		// f was validated in validate.ActionResult but blobs were not checked for existence
@@ -1094,7 +1141,7 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 
 	for _, d := range result.OutputDirectories {
 		// d was validated in validate.ActionResult but blobs were not checked for existence
-		r, size, err := c.Get(ctx, cache.CAS, d.TreeDigest.Hash, d.TreeDigest.SizeBytes, 0)
+		r, size, treeCtx, err := c.getCASAcrossScopes(ctx, d.TreeDigest.Hash, d.TreeDigest.SizeBytes)
 		if r == nil {
 			return nil, nil, err // aka "not found", or an err if non-nil
 		}
@@ -1128,7 +1175,9 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 			// only (zero extra round trips); a proxy-only Tree yields no local
 			// size and is handled by complete-or-drop (recorded as a missing
 			// leaf size in emitACClosureFromHit).
-			if sz, ok := c.lookupSizeOnDisk(ctx, cache.CAS, d.TreeDigest.Hash); ok {
+			if treeCtx != ctx {
+				crossScope = true
+			} else if sz, ok := c.lookupSizeOnDisk(ctx, cache.CAS, d.TreeDigest.Hash); ok {
 				collector.RecordLeafSize(d.TreeDigest.Hash, sz, false)
 			}
 			treeLeafHashes = append(treeLeafHashes, d.TreeDigest.Hash)
@@ -1172,7 +1221,8 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 		leafHashes = append(leafHashes, treeLeafHashes...)
 	}
 
-	err = c.findMissingCasBlobsInternal(ctx, pendingValidations, true)
+	err, depsCrossScope := c.validateDepsAcrossScopes(ctx, pendingValidations)
+	crossScope = crossScope || depsCrossScope
 	if errors.Is(err, errMissingBlob) {
 		return nil, nil, nil // aka "not found"
 	}
@@ -1180,11 +1230,58 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 		return nil, nil, err
 	}
 
-	if capture {
+	if capture && crossScope {
+		lruObservationsDropped.WithLabelValues(dropReasonCrossScope).Inc()
+	} else if capture {
 		// A successful hit proves every leaf exists; sizes were recorded as
 		// validation touched each one. AC blobs are uncompressed (size == sizeOnDisk).
 		c.emitACClosureFromHit(ctx, hash, sizeBytes, leafHashes, collector)
 	}
 
 	return result, acdata, nil
+}
+
+// getCASAcrossScopes reads a CAS blob from the stamped storage prefix, then
+// from each read-fallback prefix in order, returning the context it was found
+// under. Action results in a fallback-bearing scope may legitimately reference
+// blobs the client never uploaded because FindMissingBlobs reported them
+// present in a fallback scope.
+func (c *diskCache) getCASAcrossScopes(ctx context.Context, hash string, size int64) (io.ReadCloser, int64, context.Context, error) {
+	for _, readCtx := range cache.ReadContexts(ctx) {
+		r, found, err := c.Get(readCtx, cache.CAS, hash, size, 0)
+		if r != nil || err != nil {
+			return r, found, readCtx, err
+		}
+	}
+	return nil, -1, ctx, nil
+}
+
+// validateDepsAcrossScopes checks that every digest exists in the stamped
+// prefix or one of its read fallbacks; it returns errMissingBlob otherwise.
+// Without fallbacks it is the fail-fast single-scope check. crossScope reports
+// whether any digest was resolved from a fallback rather than the stamped prefix.
+func (c *diskCache) validateDepsAcrossScopes(ctx context.Context, blobs []*pb.Digest) (err error, crossScope bool) {
+	readCtxs := cache.ReadContexts(ctx)
+	if len(readCtxs) == 1 {
+		return c.findMissingCasBlobsInternal(ctx, blobs, true), false
+	}
+	for i, readCtx := range readCtxs {
+		if err := c.findMissingCasBlobsInternal(readCtx, blobs, false); err != nil {
+			return err, crossScope
+		}
+		remaining := blobs[:0]
+		for _, d := range blobs {
+			if d != nil {
+				remaining = append(remaining, d)
+			}
+		}
+		if i > 0 && len(remaining) < len(blobs) {
+			crossScope = true
+		}
+		blobs = remaining
+		if len(blobs) == 0 {
+			return nil, crossScope
+		}
+	}
+	return errMissingBlob, crossScope
 }

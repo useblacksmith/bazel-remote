@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc"
@@ -40,7 +41,11 @@ const (
 const grpcHealthCheckMethod = "/grpc.health.v1.Health/Check"
 
 type grpcServer struct {
-	cache                  disk.Cache
+	cache disk.Cache
+	// acCreateLocks serialises create-only action-result writes per key so
+	// the existence check and the write happen atomically within this
+	// process (a namespace is pinned to one L1, so that is the race window).
+	acCreateLocks          [256]sync.Mutex
 	accessLogger           cache.Logger
 	errorLogger            cache.Logger
 	depsCheck              bool

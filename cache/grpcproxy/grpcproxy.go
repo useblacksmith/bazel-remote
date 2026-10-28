@@ -276,7 +276,14 @@ func withOutgoingStoragePrefix(ctx context.Context) context.Context {
 	if !ok {
 		return ctx
 	}
-	return ensureOutgoingMetadataValue(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
+	ctx = ensureOutgoingMetadataValue(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
+	if fallbacks := cache.FallbackStoragePrefixesFromContext(ctx); len(fallbacks) > 0 {
+		ctx = ensureOutgoingMetadataValue(ctx, cache.FallbackPrefixesGRPCMetadataKey, strings.Join(fallbacks, ","))
+	}
+	if cache.ACImmutableFromContext(ctx) {
+		ctx = ensureOutgoingMetadataValue(ctx, cache.ACImmutableGRPCMetadataKey, "1")
+	}
+	return ctx
 }
 
 // withOutgoingS3Backend forwards the request-scoped (endpoint, bucket)
@@ -426,6 +433,52 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 		return &rc, size, nil
 	default:
 		return nil, -1, fmt.Errorf("unexpected kind %s", kind)
+	}
+}
+
+// ContainsStrict implements cache.StrictExistenceChecker: unlike Contains,
+// a transport or server error from the upstream is returned instead of being
+// folded into a miss, so create-only writers can refuse rather than overwrite.
+func (r *remoteGrpcProxyCache) ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error) {
+	ctx = withOutgoingStoragePrefix(ctx)
+	ctx = withOutgoingS3Backend(ctx)
+	switch kind {
+	case cache.RAW, cache.AC:
+		// Not via Get: that path folds auth, config and transport failures
+		// into a miss, which is exactly what a strict caller must not see.
+		res, err := r.clients.ac.GetActionResult(ctx, &pb.GetActionResultRequest{
+			ActionDigest: &pb.Digest{Hash: hash, SizeBytes: -1},
+		})
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return false, -1, nil
+		}
+		if err != nil {
+			return false, -1, err
+		}
+		return true, int64(proto.Size(res)), nil
+	case cache.CAS:
+		if size < 0 {
+			digest, err := r.fetchBlobDigest(ctx, hash)
+			if errors.Is(err, errBlobNotFound) {
+				return false, -1, nil
+			}
+			if err != nil {
+				return false, -1, err
+			}
+			return true, digest.SizeBytes, nil
+		}
+		res, err := r.clients.cas.FindMissingBlobs(ctx, &pb.FindMissingBlobsRequest{
+			BlobDigests: []*pb.Digest{{Hash: hash, SizeBytes: size}},
+		})
+		if err != nil {
+			return false, -1, err
+		}
+		if len(res.MissingBlobDigests) > 0 {
+			return false, -1, nil
+		}
+		return true, size, nil
+	default:
+		return false, -1, fmt.Errorf("unexpected entry kind %v", kind)
 	}
 }
 

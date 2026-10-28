@@ -76,6 +76,15 @@ type Proxy interface {
 	Contains(ctx context.Context, kind EntryKind, hash string, size int64) (bool, int64)
 }
 
+// StrictExistenceChecker is implemented by proxies that can tell an absent
+// item from a lookup they could not complete (backend unreachable, breaker
+// open). Contains folds both into "not present"; create-only writers need
+// the distinction so they fail closed instead of overwriting a result that
+// exists in the backend but was evicted locally.
+type StrictExistenceChecker interface {
+	ContainsStrict(ctx context.Context, kind EntryKind, hash string, size int64) (bool, int64, error)
+}
+
 // TransformActionCacheKey takes an ActionCache key and an instance name
 // and returns a new ActionCache key to use instead. If the instance name
 // is empty, then the original key is returned unchanged.
