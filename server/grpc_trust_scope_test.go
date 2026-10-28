@@ -3,6 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"google.golang.org/protobuf/proto"
 	"io"
 	stdlog "log"
 	"os"
@@ -28,12 +31,35 @@ const (
 
 func trustScopeServer(t *testing.T, depsCheck bool) (*grpcServer, disk.Cache) {
 	t.Helper()
+	return trustScopeServerWithOptions(t, depsCheck)
+}
+
+type recordingClosureObserver struct {
+	mu       sync.Mutex
+	closures []cache.ACClosure
+}
+
+func (r *recordingClosureObserver) RecordACAccess(_ context.Context, c cache.ACClosure) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closures = append(r.closures, c)
+}
+
+func (r *recordingClosureObserver) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.closures)
+}
+
+func trustScopeServerWithOptions(t *testing.T, depsCheck bool, opts ...disk.Option) (*grpcServer, disk.Cache) {
+	t.Helper()
 	dir, err := os.MkdirTemp("", "bazel-remote-trust-scope-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	diskCache, err := disk.New(dir, 10*maxChunkSize*2, disk.WithAccessLogger(testutils.NewSilentLogger()))
+	opts = append([]disk.Option{disk.WithAccessLogger(testutils.NewSilentLogger())}, opts...)
+	diskCache, err := disk.New(dir, 10*maxChunkSize*2, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,5 +411,63 @@ func TestTrustScopeACImmutableExistenceCheckIgnoresFallbacks(t *testing.T) {
 	}
 	if fb := cache.FallbackStoragePrefixesFromContext(rec.containsCtx); len(fb) != 0 {
 		t.Fatalf("create-only existence check must not carry fallbacks, got %v", fb)
+	}
+}
+
+// A closure is written under the AC's own scope, so a pr hit whose leaves
+// (output files or Trees) live only in main records no closure rather than
+// one that names blobs the pr scope does not hold.
+func TestTrustScopeCrossScopeHitEmitsNoClosure(t *testing.T) {
+	obs := &recordingClosureObserver{}
+	s, c := trustScopeServerWithOptions(t, true, disk.WithLRUObserver(obs))
+
+	mainBlob := putCAS(t, c, mainCtx(), 64)
+	tree := &pb.Tree{Root: &pb.Directory{Files: []*pb.FileNode{{Name: "f", Digest: mainBlob}}}}
+	treeData, err := proto.Marshal(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	treeHash := sha256.Sum256(treeData)
+	treeDigest := &pb.Digest{Hash: hex.EncodeToString(treeHash[:]), SizeBytes: int64(len(treeData))}
+	if err := c.Put(mainCtx(), cache.CAS, treeDigest.Hash, treeDigest.SizeBytes, bytes.NewReader(treeData)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, acHash := testutils.RandomDataAndHash(32)
+	acDigest := &pb.Digest{Hash: acHash, SizeBytes: 32}
+	if _, err := s.UpdateActionResult(prCtx(), &pb.UpdateActionResultRequest{
+		ActionDigest: acDigest,
+		ActionResult: &pb.ActionResult{
+			OutputFiles:       []*pb.OutputFile{{Path: "out", Digest: mainBlob}},
+			OutputDirectories: []*pb.OutputDirectory{{Path: "dir", TreeDigest: treeDigest}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writes := obs.count()
+
+	if _, err := s.GetActionResult(prCtx(), &pb.GetActionResultRequest{ActionDigest: acDigest}); err != nil {
+		t.Fatalf("pr result with main-only leaves must validate: %v", err)
+	}
+	if got := obs.count(); got != writes {
+		t.Fatalf("cross-scope hit must not emit a closure, got %d new", got-writes)
+	}
+
+	// The same shape with every leaf in the pr scope records its closure.
+	prBlob := putCAS(t, c, prCtx(), 64)
+	_, acHash2 := testutils.RandomDataAndHash(32)
+	acDigest2 := &pb.Digest{Hash: acHash2, SizeBytes: 32}
+	if _, err := s.UpdateActionResult(prCtx(), &pb.UpdateActionResultRequest{
+		ActionDigest: acDigest2,
+		ActionResult: &pb.ActionResult{OutputFiles: []*pb.OutputFile{{Path: "out", Digest: prBlob}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := obs.count()
+	if _, err := s.GetActionResult(prCtx(), &pb.GetActionResultRequest{ActionDigest: acDigest2}); err != nil {
+		t.Fatal(err)
+	}
+	if obs.count() != before+1 {
+		t.Fatalf("same-scope hit must emit exactly one closure, got %d", obs.count()-before)
 	}
 }

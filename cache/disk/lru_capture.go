@@ -25,6 +25,7 @@ const (
 	leafSizeSourceMissing = "missing"
 
 	dropReasonIncompleteClosure  = "incomplete_closure"
+	dropReasonCrossScope         = "cross_scope"
 	dropReasonWriteHasDirs       = "write_has_directories"
 	dropReasonWriteInlinedLeaf   = "write_inlined_leaf"
 	dropReasonUnmarshalActionRes = "ac_unmarshal_failed"
