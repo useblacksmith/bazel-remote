@@ -175,12 +175,20 @@ func (s *grpcServer) getBlobData(ctx context.Context, hash string, size int64) (
 		return []byte{}, nil
 	}
 
-	rdr, sizeBytes, err := s.cache.Get(ctx, cache.CAS, hash, size, 0)
-	if err != nil {
-		if rdr != nil {
-			_ = rdr.Close()
+	var rdr io.ReadCloser
+	var sizeBytes int64
+	var err error
+	for _, readCtx := range cache.ReadContexts(ctx) {
+		rdr, sizeBytes, err = s.cache.Get(readCtx, cache.CAS, hash, size, 0)
+		if err != nil {
+			if rdr != nil {
+				_ = rdr.Close()
+			}
+			return []byte{}, err
 		}
-		return []byte{}, err
+		if rdr != nil {
+			break
+		}
 	}
 
 	if rdr == nil {

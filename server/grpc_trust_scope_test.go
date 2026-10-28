@@ -323,3 +323,32 @@ func TestTrustScopeACImmutableConcurrentWritersKeepFirst(t *testing.T) {
 		t.Fatalf("stored result %v (err %v) is not the single successful write %d", got, err, winner)
 	}
 }
+
+func TestTrustScopeDepsCheckResolvesFallbackBlobs(t *testing.T) {
+	s, c := trustScopeServer(t, true)
+	blob := putCAS(t, c, mainCtx(), 128)
+	_, acHash := testutils.RandomDataAndHash(32)
+	acDigest := &pb.Digest{Hash: acHash, SizeBytes: 32}
+	_, err := s.UpdateActionResult(prCtx(), &pb.UpdateActionResultRequest{
+		ActionDigest: acDigest,
+		ActionResult: &pb.ActionResult{OutputFiles: []*pb.OutputFile{{Path: "out", Digest: blob}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetActionResult(prCtx(), &pb.GetActionResultRequest{
+		ActionDigest:      acDigest,
+		InlineOutputFiles: []string{"out"},
+	})
+	if err != nil {
+		t.Fatalf("pr result whose output blob lives only in main must validate: %v", err)
+	}
+	if len(got.OutputFiles) != 1 || len(got.OutputFiles[0].Contents) != 128 {
+		t.Fatalf("output file was not inlined from the fallback scope: %v", got.OutputFiles)
+	}
+
+	if _, err := s.GetActionResult(mainCtx(), &pb.GetActionResultRequest{ActionDigest: acDigest}); status.Code(err) != codes.NotFound {
+		t.Fatalf("main must not read pr's action result, got %v", err)
+	}
+}

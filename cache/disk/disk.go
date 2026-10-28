@@ -1094,7 +1094,7 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 
 	for _, d := range result.OutputDirectories {
 		// d was validated in validate.ActionResult but blobs were not checked for existence
-		r, size, err := c.Get(ctx, cache.CAS, d.TreeDigest.Hash, d.TreeDigest.SizeBytes, 0)
+		r, size, err := c.getCASAcrossScopes(ctx, d.TreeDigest.Hash, d.TreeDigest.SizeBytes)
 		if r == nil {
 			return nil, nil, err // aka "not found", or an err if non-nil
 		}
@@ -1172,7 +1172,7 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 		leafHashes = append(leafHashes, treeLeafHashes...)
 	}
 
-	err = c.findMissingCasBlobsInternal(ctx, pendingValidations, true)
+	err = c.validateDepsAcrossScopes(ctx, pendingValidations)
 	if errors.Is(err, errMissingBlob) {
 		return nil, nil, nil // aka "not found"
 	}
@@ -1187,4 +1187,44 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 	}
 
 	return result, acdata, nil
+}
+
+// getCASAcrossScopes reads a CAS blob from the stamped storage prefix, then
+// from each read-fallback prefix in order. Action results in a fallback-bearing
+// scope may legitimately reference blobs the client never uploaded because
+// FindMissingBlobs reported them present in a fallback scope.
+func (c *diskCache) getCASAcrossScopes(ctx context.Context, hash string, size int64) (io.ReadCloser, int64, error) {
+	for _, readCtx := range cache.ReadContexts(ctx) {
+		r, found, err := c.Get(readCtx, cache.CAS, hash, size, 0)
+		if r != nil || err != nil {
+			return r, found, err
+		}
+	}
+	return nil, -1, nil
+}
+
+// validateDepsAcrossScopes checks that every digest exists in the stamped
+// prefix or one of its read fallbacks; it returns errMissingBlob otherwise.
+// Without fallbacks it is the fail-fast single-scope check.
+func (c *diskCache) validateDepsAcrossScopes(ctx context.Context, blobs []*pb.Digest) error {
+	readCtxs := cache.ReadContexts(ctx)
+	if len(readCtxs) == 1 {
+		return c.findMissingCasBlobsInternal(ctx, blobs, true)
+	}
+	for _, readCtx := range readCtxs {
+		if err := c.findMissingCasBlobsInternal(readCtx, blobs, false); err != nil {
+			return err
+		}
+		remaining := blobs[:0]
+		for _, d := range blobs {
+			if d != nil {
+				remaining = append(remaining, d)
+			}
+		}
+		blobs = remaining
+		if len(blobs) == 0 {
+			return nil
+		}
+	}
+	return errMissingBlob
 }
