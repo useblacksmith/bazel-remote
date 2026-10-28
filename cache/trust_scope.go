@@ -36,6 +36,28 @@ func ParseFallbackPrefixes(raw string) ([]string, bool) {
 	return prefixes, true
 }
 
+// SiblingPrefix reports whether fallback is another scope of the same
+// namespace as stamped: both are "<base>/<scope>/" with an identical base and
+// different scopes. A fallback outside the stamped base would let a request
+// read another tenant's entries, so the interceptor rejects it.
+func SiblingPrefix(stamped, fallback string) bool {
+	if stamped == fallback {
+		return false
+	}
+	sb, ok1 := prefixBase(stamped)
+	fb, ok2 := prefixBase(fallback)
+	return ok1 && ok2 && sb == fb
+}
+
+func prefixBase(prefix string) (string, bool) {
+	trimmed := strings.TrimSuffix(prefix, "/")
+	i := strings.LastIndex(trimmed, "/")
+	if i <= 0 {
+		return "", false
+	}
+	return trimmed[:i], true
+}
+
 // WithFallbackStoragePrefixes attaches the ordered read-fallback prefixes.
 func WithFallbackStoragePrefixes(ctx context.Context, prefixes []string) context.Context {
 	if len(prefixes) == 0 {

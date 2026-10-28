@@ -124,6 +124,13 @@ func storagePrefixFromIncomingContext(ctx context.Context, authSecrets map[strin
 			return ctx, trustRejection(cache.RejectionReasonStoragePrefix, "invalid_fallback",
 				"invalid %s metadata value", cache.FallbackPrefixesGRPCMetadataKey)
 		}
+		for _, fallback := range fallbacks {
+			if !cache.SiblingPrefix(prefix, fallback) {
+				storagePrefixRejected.WithLabelValues("foreign_fallback").Inc()
+				return ctx, trustRejection(cache.RejectionReasonStoragePrefix, "foreign_fallback",
+					"%s metadata names a prefix outside the stamped namespace", cache.FallbackPrefixesGRPCMetadataKey)
+			}
+		}
 		ctx = cache.WithFallbackStoragePrefixes(ctx, fallbacks)
 	}
 

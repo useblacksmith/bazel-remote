@@ -9,6 +9,7 @@ import (
 	"io"
 	stdlog "log"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -273,7 +274,8 @@ func TestStoragePrefixInterceptorTrustScopeMetadata(t *testing.T) {
 	})
 
 	t.Run("scoped prefix and fallbacks are lifted", func(t *testing.T) {
-		ctx, err := lift(cache.FallbackPrefixesGRPCMetadataKey, trustScopeMainPrefix+", a/b/main", cache.ACImmutableGRPCMetadataKey, "1")
+		release := strings.TrimSuffix(trustScopeMainPrefix, "main") + "release"
+		ctx, err := lift(cache.FallbackPrefixesGRPCMetadataKey, trustScopeMainPrefix+", "+release, cache.ACImmutableGRPCMetadataKey, "1")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -281,7 +283,7 @@ func TestStoragePrefixInterceptorTrustScopeMetadata(t *testing.T) {
 			t.Fatalf("prefix %q", p)
 		}
 		fb := cache.FallbackStoragePrefixesFromContext(ctx)
-		if len(fb) != 2 || fb[0] != trustScopeMainPrefix || fb[1] != "a/b/main" {
+		if len(fb) != 2 || fb[0] != trustScopeMainPrefix || fb[1] != release {
 			t.Fatalf("fallbacks %v", fb)
 		}
 		if !cache.ACImmutableFromContext(ctx) {
@@ -293,6 +295,17 @@ func TestStoragePrefixInterceptorTrustScopeMetadata(t *testing.T) {
 		t.Run("rejects fallback "+invalid, func(t *testing.T) {
 			_, err := lift(cache.FallbackPrefixesGRPCMetadataKey, trustScopeMainPrefix+","+invalid)
 			requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "invalid_fallback")
+		})
+	}
+
+	// A fallback outside the stamped namespace (another tenant's prefix, a
+	// root-level prefix, the stamped prefix itself) is refused even when it
+	// is well-formed: old shims forward guest metadata untouched, so the L1
+	// cannot trust the sender to have scoped the list.
+	for _, foreign := range []string{"a/b/main", "other/", trustScopePRPrefix, strings.TrimSuffix(trustScopeMainPrefix, "/") + "/deeper/"} {
+		t.Run("rejects foreign fallback "+foreign, func(t *testing.T) {
+			_, err := lift(cache.FallbackPrefixesGRPCMetadataKey, trustScopeMainPrefix+","+foreign)
+			requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "foreign_fallback")
 		})
 	}
 
