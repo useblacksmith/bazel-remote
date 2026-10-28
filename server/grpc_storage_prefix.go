@@ -110,7 +110,32 @@ func storagePrefixFromIncomingContext(ctx context.Context, authSecrets map[strin
 		return ctx, trustRejection(cache.RejectionReasonStoragePrefix, "invalid",
 			"invalid %s metadata value", cache.StoragePrefixGRPCMetadataKey)
 	}
-	return cache.WithRequiredStoragePrefix(cache.WithStoragePrefix(ctx, prefix)), nil
+	ctx = cache.WithRequiredStoragePrefix(cache.WithStoragePrefix(ctx, prefix))
+
+	if values := md.Get(cache.FallbackPrefixesGRPCMetadataKey); len(values) > 0 {
+		if len(values) > 1 {
+			storagePrefixRejected.WithLabelValues("duplicate_fallback").Inc()
+			return ctx, trustRejection(cache.RejectionReasonStoragePrefix, "duplicate_fallback",
+				"duplicate %s metadata", cache.FallbackPrefixesGRPCMetadataKey)
+		}
+		fallbacks, ok := cache.ParseFallbackPrefixes(values[0])
+		if !ok {
+			storagePrefixRejected.WithLabelValues("invalid_fallback").Inc()
+			return ctx, trustRejection(cache.RejectionReasonStoragePrefix, "invalid_fallback",
+				"invalid %s metadata value", cache.FallbackPrefixesGRPCMetadataKey)
+		}
+		ctx = cache.WithFallbackStoragePrefixes(ctx, fallbacks)
+	}
+
+	if values := md.Get(cache.ACImmutableGRPCMetadataKey); len(values) > 0 {
+		if len(values) != 1 || values[0] != "1" {
+			storagePrefixRejected.WithLabelValues("invalid_ac_immutable").Inc()
+			return ctx, trustRejection(cache.RejectionReasonStoragePrefix, "invalid_ac_immutable",
+				"invalid %s metadata value", cache.ACImmutableGRPCMetadataKey)
+		}
+		ctx = cache.WithACImmutable(ctx)
+	}
+	return ctx, nil
 }
 
 // GRPCStoragePrefixUnaryServerInterceptor returns a unary interceptor that

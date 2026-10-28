@@ -276,7 +276,14 @@ func withOutgoingStoragePrefix(ctx context.Context) context.Context {
 	if !ok {
 		return ctx
 	}
-	return ensureOutgoingMetadataValue(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
+	ctx = ensureOutgoingMetadataValue(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
+	if fallbacks := cache.FallbackStoragePrefixesFromContext(ctx); len(fallbacks) > 0 {
+		ctx = ensureOutgoingMetadataValue(ctx, cache.FallbackPrefixesGRPCMetadataKey, strings.Join(fallbacks, ","))
+	}
+	if cache.ACImmutableFromContext(ctx) {
+		ctx = ensureOutgoingMetadataValue(ctx, cache.ACImmutableGRPCMetadataKey, "1")
+	}
+	return ctx
 }
 
 // withOutgoingS3Backend forwards the request-scoped (endpoint, bucket)

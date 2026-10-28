@@ -73,10 +73,17 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 	if !s.depsCheck {
 		logPrefix = "GRPC AC GET NODEPSCHECK"
 
-		rdr, sizeBytes, err := s.cache.Get(ctx, cache.AC, req.ActionDigest.Hash, unknownActionResultSize, 0)
-		if err != nil {
-			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
-			return nil, status.Error(gRPCErrCode(err, codes.Unknown), err.Error())
+		var rdr io.ReadCloser
+		var sizeBytes int64
+		for _, readCtx := range cache.ReadContexts(ctx) {
+			rdr, sizeBytes, err = s.cache.Get(readCtx, cache.AC, req.ActionDigest.Hash, unknownActionResultSize, 0)
+			if err != nil {
+				s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
+				return nil, status.Error(gRPCErrCode(err, codes.Unknown), err.Error())
+			}
+			if rdr != nil && sizeBytes > 0 {
+				break
+			}
 		}
 		if rdr == nil || sizeBytes <= 0 {
 			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, "NOT FOUND")
@@ -109,10 +116,18 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 		return result, nil
 	}
 
-	result, _, err := s.cache.GetValidatedActionResult(ctx, req.ActionDigest.Hash)
-	if err != nil {
-		s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
-		return nil, status.Error(gRPCErrCode(err, codes.Unknown), err.Error())
+	var result *pb.ActionResult
+	for _, readCtx := range cache.ReadContexts(ctx) {
+		result, _, err = s.cache.GetValidatedActionResult(readCtx, req.ActionDigest.Hash)
+		if err != nil {
+			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
+			return nil, status.Error(gRPCErrCode(err, codes.Unknown), err.Error())
+		}
+		if result != nil {
+			// Inlined blobs must come from the prefix the result was found under.
+			ctx = readCtx
+			break
+		}
 	}
 
 	if result == nil {
@@ -261,6 +276,14 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 		s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash,
 			errEmptyActionResult.Error())
 		return nil, errEmptyActionResult
+	}
+
+	if cache.ACImmutableFromContext(ctx) {
+		if exists, _ := s.cache.Contains(ctx, cache.AC, req.ActionDigest.Hash, -1); exists {
+			s.accessLogger.Printf("%s %s ALREADY EXISTS", logPrefix, req.ActionDigest.Hash)
+			return nil, status.Errorf(codes.AlreadyExists,
+				"%s already exists in AC and the request forbids overwrites", req.ActionDigest.Hash)
+		}
 	}
 
 	err = s.cache.Put(ctx, cache.AC, req.ActionDigest.Hash,

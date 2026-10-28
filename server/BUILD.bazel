@@ -64,6 +64,7 @@ go_test(
         "grpc_cas_spliceblobs_test.go",
         "grpc_s3_backend_test.go",
         "grpc_storage_prefix_test.go",
+        "grpc_trust_scope_test.go",
         "grpc_tenant_metadata_test.go",
         "grpc_test.go",
         "grpc_zstd_crafted_test.go",

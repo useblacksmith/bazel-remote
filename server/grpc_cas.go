@@ -60,9 +60,16 @@ func (s *grpcServer) FindMissingBlobs(ctx context.Context,
 		}
 	}
 
-	missingBlobs, err := s.cache.FindMissingCasBlobs(ctx, req.BlobDigests)
-	if err != nil {
-		return nil, err
+	missingBlobs := req.BlobDigests
+	for _, readCtx := range cache.ReadContexts(ctx) {
+		if len(missingBlobs) == 0 {
+			break
+		}
+		var err error
+		missingBlobs, err = s.cache.FindMissingCasBlobs(readCtx, missingBlobs)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &pb.FindMissingBlobsResponse{MissingBlobDigests: missingBlobs}, nil
@@ -304,10 +311,18 @@ func (s *grpcServer) BatchReadBlobs(ctx context.Context,
 		}
 	}
 
+	readContexts := cache.ReadContexts(ctx)
 	for _, digest := range in.Digests {
 		// TODO: consider fanning-out goroutines here.
 
-		resp.Responses = append(resp.Responses, s.getBlobResponse(ctx, digest, allowZstd))
+		var r *pb.BatchReadBlobsResponse_Response
+		for _, readCtx := range readContexts {
+			r = s.getBlobResponse(readCtx, digest, allowZstd)
+			if r.Status == nil || r.Status.Code != int32(code.Code_NOT_FOUND) {
+				break
+			}
+		}
+		resp.Responses = append(resp.Responses, r)
 	}
 
 	return &resp, nil
