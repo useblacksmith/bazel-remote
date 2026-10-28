@@ -444,17 +444,18 @@ func (r *remoteGrpcProxyCache) ContainsStrict(ctx context.Context, kind cache.En
 	ctx = withOutgoingS3Backend(ctx)
 	switch kind {
 	case cache.RAW, cache.AC:
-		rc, foundSize, err := r.Get(ctx, kind, hash, size)
-		if rc != nil {
-			_ = rc.Close()
+		// Not via Get: that path folds auth, config and transport failures
+		// into a miss, which is exactly what a strict caller must not see.
+		res, err := r.clients.ac.GetActionResult(ctx, &pb.GetActionResultRequest{
+			ActionDigest: &pb.Digest{Hash: hash, SizeBytes: -1},
+		})
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return false, -1, nil
 		}
 		if err != nil {
 			return false, -1, err
 		}
-		if foundSize < 0 {
-			return false, -1, nil
-		}
-		return true, foundSize, nil
+		return true, int64(proto.Size(res)), nil
 	case cache.CAS:
 		if size < 0 {
 			digest, err := r.fetchBlobDigest(ctx, hash)
