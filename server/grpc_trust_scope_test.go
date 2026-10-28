@@ -6,6 +6,7 @@ import (
 	"io"
 	stdlog "log"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -278,4 +279,47 @@ func TestStoragePrefixInterceptorTrustScopeMetadata(t *testing.T) {
 		_, err := lift(cache.ACImmutableGRPCMetadataKey, "true")
 		requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "invalid_ac_immutable")
 	})
+}
+
+func TestTrustScopeACImmutableConcurrentWritersKeepFirst(t *testing.T) {
+	s, _ := trustScopeServer(t, true)
+	_, hash := testutils.RandomDataAndHash(64)
+	digest := &pb.Digest{Hash: hash, SizeBytes: 64}
+
+	const writers = 32
+	var wg sync.WaitGroup
+	oks := make([]int32, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := s.UpdateActionResult(cache.WithACImmutable(mainCtx()), &pb.UpdateActionResultRequest{
+				ActionDigest: digest,
+				ActionResult: &pb.ActionResult{ExitCode: int32(i + 1)},
+			})
+			if err == nil {
+				oks[i] = 1
+			} else if status.Code(err) != codes.AlreadyExists {
+				t.Errorf("writer %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	winner := int32(0)
+	for i, ok := range oks {
+		if ok == 1 {
+			if winner != 0 {
+				t.Fatalf("more than one writer succeeded: %d and %d", winner, i+1)
+			}
+			winner = int32(i + 1)
+		}
+	}
+	if winner == 0 {
+		t.Fatal("no writer succeeded")
+	}
+	got, err := s.GetActionResult(mainCtx(), &pb.GetActionResultRequest{ActionDigest: digest})
+	if err != nil || got.ExitCode != winner {
+		t.Fatalf("stored result %v (err %v) is not the single successful write %d", got, err, winner)
+	}
 }

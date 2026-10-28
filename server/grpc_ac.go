@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"strings"
@@ -279,6 +280,9 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 	}
 
 	if cache.ACImmutableFromContext(ctx) {
+		lock := &s.acCreateLocks[acCreateLockIndex(cache.LookupKeyForContext(ctx, cache.AC, req.ActionDigest.Hash))]
+		lock.Lock()
+		defer lock.Unlock()
 		if exists, _ := s.cache.Contains(ctx, cache.AC, req.ActionDigest.Hash, -1); exists {
 			s.accessLogger.Printf("%s %s ALREADY EXISTS", logPrefix, req.ActionDigest.Hash)
 			return nil, status.Errorf(codes.AlreadyExists,
@@ -406,4 +410,10 @@ func addWorkerMetadataGRPC(ctx context.Context, ar *pb.ActionResult) {
 	}
 
 	ar.ExecutionMetadata.Worker = worker
+}
+
+func acCreateLockIndex(key string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % 256)
 }
