@@ -157,3 +157,11 @@ func (m *multiS3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash 
 	}
 	return backend.Contains(ctx, kind, hash, size)
 }
+
+func (m *multiS3Cache) ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error) {
+	backend := m.backendFor(ctx, "CONTAINS")
+	if backend == nil {
+		return false, -1, errUnknownBackend
+	}
+	return backend.ContainsStrict(ctx, kind, hash, size)
+}

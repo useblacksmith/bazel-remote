@@ -2888,6 +2888,10 @@ func (c *StubCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 	return false, -1
 }
 
+func (c *StubCache) ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error) {
+	return false, -1, nil
+}
+
 func (c *StubCache) FindMissingCasBlobs(ctx context.Context, blobs []*pb.Digest) ([]*pb.Digest, error) {
 	return blobs, nil
 }

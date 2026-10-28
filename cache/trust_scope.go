@@ -36,26 +36,41 @@ func ParseFallbackPrefixes(raw string) ([]string, bool) {
 	return prefixes, true
 }
 
-// SiblingPrefix reports whether fallback is another scope of the same
-// namespace as stamped: both are "<base>/<scope>/" with an identical base and
-// different scopes. A fallback outside the stamped base would let a request
-// read another tenant's entries, so the interceptor rejects it.
-func SiblingPrefix(stamped, fallback string) bool {
-	if stamped == fallback {
-		return false
-	}
-	sb, ok1 := prefixBase(stamped)
-	fb, ok2 := prefixBase(fallback)
+// TrustScopeTrusted and TrustScopeUntrusted are the two trust pools a
+// client-hashed namespace is split into: "<base>/trusted" holds what reviewed
+// runs produced, "<base>/untrusted" what same-repo PRs and feature branches
+// produced. The only read across pools the L1 honours is untrusted -> trusted.
+const (
+	TrustScopeTrusted   = "trusted"
+	TrustScopeUntrusted = "untrusted"
+)
+
+// FallbackAllowed reports whether a request stamped with prefix stamped may
+// read fallback: stamped must be the untrusted pool of a namespace and
+// fallback the trusted pool of that same namespace. Anything else (a foreign
+// base, trusted reading untrusted, an arbitrary sibling) is refused, so the
+// one-way trust invariant is enforced here and not only by the grant issuer.
+func FallbackAllowed(stamped, fallback string) bool {
+	sb, ss, ok1 := splitScope(stamped)
+	fb, fs, ok2 := splitScope(fallback)
+	return ok1 && ok2 && sb == fb && ss == TrustScopeUntrusted && fs == TrustScopeTrusted
+}
+
+// SameNamespace reports whether stamped and fallback are scopes of one
+// namespace ("<base>/<scope>/" with an identical base).
+func SameNamespace(stamped, fallback string) bool {
+	sb, _, ok1 := splitScope(stamped)
+	fb, _, ok2 := splitScope(fallback)
 	return ok1 && ok2 && sb == fb
 }
 
-func prefixBase(prefix string) (string, bool) {
+func splitScope(prefix string) (base, scope string, ok bool) {
 	trimmed := strings.TrimSuffix(prefix, "/")
 	i := strings.LastIndex(trimmed, "/")
-	if i <= 0 {
-		return "", false
+	if i <= 0 || i == len(trimmed)-1 {
+		return "", "", false
 	}
-	return trimmed[:i], true
+	return trimmed[:i], trimmed[i+1:], true
 }
 
 // WithFallbackStoragePrefixes attaches the ordered read-fallback prefixes.

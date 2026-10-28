@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"google.golang.org/protobuf/proto"
 	"io"
 	stdlog "log"
@@ -26,8 +27,8 @@ import (
 )
 
 const (
-	trustScopeMainPrefix = "bazel/staging/us-west/42/9876/v0/turbo/main"
-	trustScopePRPrefix   = "bazel/staging/us-west/42/9876/v0/turbo/pr"
+	trustScopeTrustedPrefix   = "bazel/staging/us-west/42/9876/v0/turbo/trusted"
+	trustScopeUntrustedPrefix = "bazel/staging/us-west/42/9876/v0/turbo/untrusted"
 )
 
 func trustScopeServer(t *testing.T, depsCheck bool) (*grpcServer, disk.Cache) {
@@ -76,13 +77,13 @@ func trustScopeServerWithOptions(t *testing.T, depsCheck bool, opts ...disk.Opti
 }
 
 func mainCtx() context.Context {
-	return cache.WithStoragePrefix(context.Background(), trustScopeMainPrefix)
+	return cache.WithStoragePrefix(context.Background(), trustScopeTrustedPrefix)
 }
 
 func prCtx() context.Context {
 	return cache.WithFallbackStoragePrefixes(
-		cache.WithStoragePrefix(context.Background(), trustScopePRPrefix),
-		[]string{trustScopeMainPrefix})
+		cache.WithStoragePrefix(context.Background(), trustScopeUntrustedPrefix),
+		[]string{trustScopeTrustedPrefix})
 }
 
 type trustScopeReadServer struct {
@@ -259,7 +260,7 @@ func TestReadContexts(t *testing.T) {
 
 func TestStoragePrefixInterceptorTrustScopeMetadata(t *testing.T) {
 	lift := func(pairs ...string) (context.Context, error) {
-		md := metadata.Pairs(append([]string{cache.StoragePrefixGRPCMetadataKey, trustScopePRPrefix}, pairs...)...)
+		md := metadata.Pairs(append([]string{cache.StoragePrefixGRPCMetadataKey, trustScopeUntrustedPrefix}, pairs...)...)
 		return storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), nil)
 	}
 
@@ -273,17 +274,16 @@ func TestStoragePrefixInterceptorTrustScopeMetadata(t *testing.T) {
 		}
 	})
 
-	t.Run("scoped prefix and fallbacks are lifted", func(t *testing.T) {
-		release := strings.TrimSuffix(trustScopeMainPrefix, "main") + "release"
-		ctx, err := lift(cache.FallbackPrefixesGRPCMetadataKey, trustScopeMainPrefix+", "+release, cache.ACImmutableGRPCMetadataKey, "1")
+	t.Run("scoped prefix and fallback are lifted", func(t *testing.T) {
+		ctx, err := lift(cache.FallbackPrefixesGRPCMetadataKey, " "+trustScopeTrustedPrefix+" ", cache.ACImmutableGRPCMetadataKey, "1")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if p, _ := cache.StoragePrefixFromContext(ctx); p != trustScopePRPrefix {
+		if p, _ := cache.StoragePrefixFromContext(ctx); p != trustScopeUntrustedPrefix {
 			t.Fatalf("prefix %q", p)
 		}
 		fb := cache.FallbackStoragePrefixesFromContext(ctx)
-		if len(fb) != 2 || fb[0] != trustScopeMainPrefix || fb[1] != release {
+		if len(fb) != 1 || fb[0] != trustScopeTrustedPrefix {
 			t.Fatalf("fallbacks %v", fb)
 		}
 		if !cache.ACImmutableFromContext(ctx) {
@@ -291,9 +291,9 @@ func TestStoragePrefixInterceptorTrustScopeMetadata(t *testing.T) {
 		}
 	})
 
-	for _, invalid := range []string{"/abs/main", "a/../main", "a//main", ".."} {
+	for _, invalid := range []string{"/abs/trusted", "a/../trusted", "a//trusted", ".."} {
 		t.Run("rejects fallback "+invalid, func(t *testing.T) {
-			_, err := lift(cache.FallbackPrefixesGRPCMetadataKey, trustScopeMainPrefix+","+invalid)
+			_, err := lift(cache.FallbackPrefixesGRPCMetadataKey, trustScopeTrustedPrefix+","+invalid)
 			requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "invalid_fallback")
 		})
 	}
@@ -302,12 +302,29 @@ func TestStoragePrefixInterceptorTrustScopeMetadata(t *testing.T) {
 	// root-level prefix, the stamped prefix itself) is refused even when it
 	// is well-formed: old shims forward guest metadata untouched, so the L1
 	// cannot trust the sender to have scoped the list.
-	for _, foreign := range []string{"a/b/main", "other/", trustScopePRPrefix, strings.TrimSuffix(trustScopeMainPrefix, "/") + "/deeper/"} {
+	for _, foreign := range []string{"a/b/trusted", "other/", strings.TrimSuffix(trustScopeTrustedPrefix, "/") + "/deeper/"} {
 		t.Run("rejects foreign fallback "+foreign, func(t *testing.T) {
-			_, err := lift(cache.FallbackPrefixesGRPCMetadataKey, trustScopeMainPrefix+","+foreign)
+			_, err := lift(cache.FallbackPrefixesGRPCMetadataKey, trustScopeTrustedPrefix+","+foreign)
 			requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "foreign_fallback")
 		})
 	}
+
+	// Within a namespace the only cross-pool read is untrusted -> trusted:
+	// the stamped prefix itself, an arbitrary sibling scope, and a trusted
+	// request naming untrusted are all refused.
+	release := strings.TrimSuffix(trustScopeTrustedPrefix, cache.TrustScopeTrusted) + "release"
+	for _, wrongWay := range []string{trustScopeUntrustedPrefix, release} {
+		t.Run("rejects fallback direction "+wrongWay, func(t *testing.T) {
+			_, err := lift(cache.FallbackPrefixesGRPCMetadataKey, wrongWay)
+			requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "fallback_direction")
+		})
+	}
+	t.Run("rejects trusted reading untrusted", func(t *testing.T) {
+		md := metadata.Pairs(cache.StoragePrefixGRPCMetadataKey, trustScopeTrustedPrefix,
+			cache.FallbackPrefixesGRPCMetadataKey, trustScopeUntrustedPrefix)
+		_, err := storagePrefixFromIncomingContext(metadata.NewIncomingContext(context.Background(), md), nil)
+		requireTrustRejection(t, err, cache.RejectionReasonStoragePrefix, "fallback_direction")
+	})
 
 	t.Run("rejects duplicate fallback metadata", func(t *testing.T) {
 		_, err := lift(cache.FallbackPrefixesGRPCMetadataKey, "a/main", cache.FallbackPrefixesGRPCMetadataKey, "b/main")
@@ -482,5 +499,44 @@ func TestTrustScopeCrossScopeHitEmitsNoClosure(t *testing.T) {
 	}
 	if obs.count() != before+1 {
 		t.Fatalf("same-scope hit must emit exactly one closure, got %d", obs.count()-before)
+	}
+}
+
+// erroringProxy is a backend that cannot answer existence checks.
+type erroringProxy struct{}
+
+func (erroringProxy) Get(context.Context, cache.EntryKind, string, int64) (io.ReadCloser, int64, error) {
+	return nil, -1, errors.New("backend down")
+}
+func (erroringProxy) Contains(context.Context, cache.EntryKind, string, int64) (bool, int64) {
+	return false, -1
+}
+func (erroringProxy) ContainsStrict(context.Context, cache.EntryKind, string, int64) (bool, int64, error) {
+	return false, -1, errors.New("backend down")
+}
+
+// A create-only write must not treat "the backend did not answer" as "the
+// key is absent": after local eviction that would overwrite the stored
+// result. It is refused with UNAVAILABLE and nothing is written locally.
+func TestTrustScopeACImmutableFailsClosedWhenBackendLookupFails(t *testing.T) {
+	s, c := trustScopeServerWithOptions(t, false, disk.WithProxyBackend(erroringProxy{}))
+	_, acHash := testutils.RandomDataAndHash(32)
+	acDigest := &pb.Digest{Hash: acHash, SizeBytes: 32}
+
+	_, err := s.UpdateActionResult(cache.WithACImmutable(mainCtx()), &pb.UpdateActionResultRequest{
+		ActionDigest: acDigest, ActionResult: &pb.ActionResult{ExitCode: 1},
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("create-only write with an unanswerable existence check should be UNAVAILABLE, got %v", err)
+	}
+	if exists, _ := c.Contains(mainCtx(), cache.AC, acHash, -1); exists {
+		t.Fatal("refused create-only write must not store anything")
+	}
+
+	// Without the create-only flag the write does not depend on the check.
+	if _, err := s.UpdateActionResult(mainCtx(), &pb.UpdateActionResultRequest{
+		ActionDigest: acDigest, ActionResult: &pb.ActionResult{ExitCode: 1},
+	}); err != nil {
+		t.Fatalf("plain write must not consult the backend: %v", err)
 	}
 }

@@ -49,6 +49,11 @@ type Cache interface {
 	// must take the decoding Put path instead.
 	PutZstd(ctx context.Context, hash string, size int64, r io.Reader) error
 	Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64)
+	// ContainsStrict is Contains that fails closed: when the item is not
+	// local and the proxy cannot complete the lookup, it returns an error
+	// instead of a miss. Create-only writers use it so an unreachable
+	// backend never lets a result be overwritten.
+	ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error)
 	FindMissingCasBlobs(ctx context.Context, blobs []*pb.Digest) ([]*pb.Digest, error)
 
 	MaxSize() int64
@@ -1010,6 +1015,44 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 	}
 
 	return false, -1
+}
+
+// ContainsStrict implements Cache.
+func (c *diskCache) ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error) {
+	if c.proxy == nil {
+		exists, foundSize := c.Contains(ctx, kind, hash, size)
+		return exists, foundSize, nil
+	}
+	strict, ok := c.proxy.(cache.StrictExistenceChecker)
+	if !ok {
+		exists, foundSize := c.Contains(ctx, kind, hash, size)
+		return exists, foundSize, nil
+	}
+	if len(hash) != sha256HashStrSize {
+		return false, -1, nil
+	}
+	if kind == cache.CAS && size <= 0 && hash == emptySha256 {
+		return true, 0, nil
+	}
+
+	key := cache.LookupKeyForContext(ctx, kind, hash)
+	c.mu.Lock()
+	item, listElem := c.lru.Get(key)
+	c.mu.Unlock()
+	if listElem != nil && !isSizeMismatch(size, item.size) {
+		return true, item.size, nil
+	}
+	if size > c.maxProxyBlobSize {
+		return false, -1, nil
+	}
+	exists, foundSize, err := strict.ContainsStrict(ctx, kind, hash, size)
+	if err != nil {
+		return false, -1, err
+	}
+	if exists && foundSize <= c.maxProxyBlobSize && !isSizeMismatch(size, foundSize) {
+		return true, foundSize, nil
+	}
+	return false, -1, nil
 }
 
 // MaxSize returns the maximum cache size in bytes.

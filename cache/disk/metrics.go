@@ -91,6 +91,10 @@ func (m *metricsDecorator) GetZstd(ctx context.Context, hash string, size int64,
 	return rc, size, nil
 }
 
+func (m *metricsDecorator) ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error) {
+	return m.diskCache.ContainsStrict(ctx, kind, hash, size)
+}
+
 func (m *metricsDecorator) Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64) {
 	ok, size := m.diskCache.Contains(ctx, kind, hash, size)
 

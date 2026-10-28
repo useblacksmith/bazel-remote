@@ -712,6 +712,23 @@ func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ 
 }
 
 func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (bool, int64) {
+	exists, size, _ := c.stat(ctx, kind, hash)
+	return exists, size
+}
+
+// ContainsStrict is Contains that reports a lookup it could not complete as
+// an error rather than a miss (see cache.StrictExistenceChecker).
+func (c *s3Cache) ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (bool, int64, error) {
+	return c.stat(ctx, kind, hash)
+}
+
+var errLookupSkipped = errors.New("backend lookup skipped")
+
+// stat answers (exists, size, err): err is nil for a definite hit or miss and
+// non-nil when the backend did not answer (breaker open, lookup skipped,
+// transport or server error). Callers that only need the miss convention
+// drop err.
+func (c *s3Cache) stat(ctx context.Context, kind cache.EntryKind, hash string) (bool, int64, error) {
 	size := int64(-1)
 	exists := false
 	prefix, requestScopedPrefix, requirePrefix := c.prefixForContext(ctx, kind)
@@ -720,7 +737,7 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	}
 	if reason, skip := c.skipBackendLookupReason(ctx, kind); skip {
 		backendLookupsSkipped.WithLabelValues(c.key, reason).Inc()
-		return false, -1
+		return false, -1, errLookupSkipped
 	}
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
 	bucket := c.bucketForContext(ctx)
@@ -743,11 +760,15 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 		// Breaker open: report "not present" without dialing MinIO — the
 		// existing miss convention of this method.
 		logResponse(c.accessLogger, "CONTAINS", bucket, objectKey, berr)
-		return false, -1
+		return false, -1, berr
 	}
 
 	exists = (err == nil)
+	var lookupErr error
 	if err != nil {
+		if !isNotFound(err) {
+			lookupErr = err
+		}
 		err = errNotFound
 	} else if kind != cache.CAS || !c.v2mode {
 		size = s.Size
@@ -766,7 +787,7 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 
 	logResponse(c.accessLogger, "CONTAINS", bucket, objectKey, err)
 
-	return exists, size
+	return exists, size, lookupErr
 }
 
 func nonNegativeUint64(value int64) uint64 {

@@ -283,7 +283,15 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 		lock := &s.acCreateLocks[acCreateLockIndex(cache.LookupKeyForContext(ctx, cache.AC, req.ActionDigest.Hash))]
 		lock.Lock()
 		defer lock.Unlock()
-		exists, _ := s.cache.Contains(cache.WithoutFallbackStoragePrefixes(ctx), cache.AC, req.ActionDigest.Hash, -1)
+		exists, _, err := s.cache.ContainsStrict(cache.WithoutFallbackStoragePrefixes(ctx), cache.AC, req.ActionDigest.Hash, -1)
+		if err != nil {
+			// Fail closed: without a definite answer a create-only write
+			// could replace a result that exists in the backend but was
+			// evicted locally.
+			s.logErrorPrintf(err, "%s %s create-only existence check failed: %s", logPrefix, req.ActionDigest.Hash, err)
+			return nil, status.Errorf(codes.Unavailable,
+				"%s: cannot verify whether the action result exists; create-only write refused", req.ActionDigest.Hash)
+		}
 		if exists {
 			s.accessLogger.Printf("%s %s ALREADY EXISTS", logPrefix, req.ActionDigest.Hash)
 			return nil, status.Errorf(codes.AlreadyExists,
