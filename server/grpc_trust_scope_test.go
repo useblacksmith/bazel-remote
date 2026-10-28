@@ -421,6 +421,11 @@ func (c *containsContextRecorder) Contains(ctx context.Context, kind cache.Entry
 	return c.Cache.Contains(ctx, kind, hash, size)
 }
 
+func (c *containsContextRecorder) ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error) {
+	c.containsCtx = ctx
+	return c.Cache.ContainsStrict(ctx, kind, hash, size)
+}
+
 func TestTrustScopeACImmutableExistenceCheckIgnoresFallbacks(t *testing.T) {
 	s, c := trustScopeServer(t, false)
 	rec := &containsContextRecorder{Cache: c}

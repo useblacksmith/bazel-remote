@@ -436,6 +436,51 @@ func (r *remoteGrpcProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 	}
 }
 
+// ContainsStrict implements cache.StrictExistenceChecker: unlike Contains,
+// a transport or server error from the upstream is returned instead of being
+// folded into a miss, so create-only writers can refuse rather than overwrite.
+func (r *remoteGrpcProxyCache) ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error) {
+	ctx = withOutgoingStoragePrefix(ctx)
+	ctx = withOutgoingS3Backend(ctx)
+	switch kind {
+	case cache.RAW, cache.AC:
+		rc, foundSize, err := r.Get(ctx, kind, hash, size)
+		if rc != nil {
+			_ = rc.Close()
+		}
+		if err != nil {
+			return false, -1, err
+		}
+		if foundSize < 0 {
+			return false, -1, nil
+		}
+		return true, foundSize, nil
+	case cache.CAS:
+		if size < 0 {
+			digest, err := r.fetchBlobDigest(ctx, hash)
+			if errors.Is(err, errBlobNotFound) {
+				return false, -1, nil
+			}
+			if err != nil {
+				return false, -1, err
+			}
+			return true, digest.SizeBytes, nil
+		}
+		res, err := r.clients.cas.FindMissingBlobs(ctx, &pb.FindMissingBlobsRequest{
+			BlobDigests: []*pb.Digest{{Hash: hash, SizeBytes: size}},
+		})
+		if err != nil {
+			return false, -1, err
+		}
+		if len(res.MissingBlobDigests) > 0 {
+			return false, -1, nil
+		}
+		return true, size, nil
+	default:
+		return false, -1, fmt.Errorf("unexpected entry kind %v", kind)
+	}
+}
+
 func (r *remoteGrpcProxyCache) Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64) {
 	ctx = withOutgoingStoragePrefix(ctx)
 	ctx = withOutgoingS3Backend(ctx)

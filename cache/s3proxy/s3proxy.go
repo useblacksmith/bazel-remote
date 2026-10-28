@@ -737,6 +737,12 @@ func (c *s3Cache) stat(ctx context.Context, kind cache.EntryKind, hash string) (
 	}
 	if reason, skip := c.skipBackendLookupReason(ctx, kind); skip {
 		backendLookupsSkipped.WithLabelValues(c.key, reason).Inc()
+		if reason == skipReasonGoAC {
+			// Go action results are never read back from the backend by
+			// design, so "not present" is the definitive answer for strict
+			// callers too; only a disconnect leaves the backend state unknown.
+			return false, -1, nil
+		}
 		return false, -1, errLookupSkipped
 	}
 	objectKey := c.objectKeyForPrefix(prefix, hash, kind)
