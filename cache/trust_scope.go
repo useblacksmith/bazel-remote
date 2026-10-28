@@ -54,6 +54,16 @@ func FallbackStoragePrefixesFromContext(ctx context.Context) []string {
 	return prefixes
 }
 
+// WithoutFallbackStoragePrefixes returns ctx pinned to its stamped prefix
+// only, for checks that must answer for exactly one scope (the create-only
+// existence check: a key present only in a fallback must still be creatable).
+func WithoutFallbackStoragePrefixes(ctx context.Context) context.Context {
+	if len(FallbackStoragePrefixesFromContext(ctx)) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, fallbackPrefixesContextKey{}, []string(nil))
+}
+
 // ReadContexts returns the contexts a read should try in order: ctx itself
 // (the stamped prefix) followed by one context per fallback prefix. The
 // fallback contexts carry no fallback list of their own, so a backend that

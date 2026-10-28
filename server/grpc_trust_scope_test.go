@@ -352,3 +352,38 @@ func TestTrustScopeDepsCheckResolvesFallbackBlobs(t *testing.T) {
 		t.Fatalf("main must not read pr's action result, got %v", err)
 	}
 }
+
+// containsContextRecorder stands in for a disk cache fronting a proxy whose
+// Contains would answer through the forwarded fallback list.
+type containsContextRecorder struct {
+	disk.Cache
+	containsCtx context.Context
+}
+
+func (c *containsContextRecorder) Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64) {
+	c.containsCtx = ctx
+	return c.Cache.Contains(ctx, kind, hash, size)
+}
+
+func TestTrustScopeACImmutableExistenceCheckIgnoresFallbacks(t *testing.T) {
+	s, c := trustScopeServer(t, false)
+	rec := &containsContextRecorder{Cache: c}
+	s.cache = rec
+
+	_, acHash := testutils.RandomDataAndHash(32)
+	acDigest := &pb.Digest{Hash: acHash, SizeBytes: 32}
+	if _, err := s.UpdateActionResult(mainCtx(), &pb.UpdateActionResultRequest{
+		ActionDigest: acDigest, ActionResult: &pb.ActionResult{ExitCode: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.UpdateActionResult(cache.WithACImmutable(prCtx()), &pb.UpdateActionResultRequest{
+		ActionDigest: acDigest, ActionResult: &pb.ActionResult{ExitCode: 2},
+	}); err != nil {
+		t.Fatalf("pr create-only write of a key that exists only in main must succeed: %v", err)
+	}
+	if fb := cache.FallbackStoragePrefixesFromContext(rec.containsCtx); len(fb) != 0 {
+		t.Fatalf("create-only existence check must not carry fallbacks, got %v", fb)
+	}
+}

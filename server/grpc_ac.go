@@ -283,7 +283,8 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 		lock := &s.acCreateLocks[acCreateLockIndex(cache.LookupKeyForContext(ctx, cache.AC, req.ActionDigest.Hash))]
 		lock.Lock()
 		defer lock.Unlock()
-		if exists, _ := s.cache.Contains(ctx, cache.AC, req.ActionDigest.Hash, -1); exists {
+		exists, _ := s.cache.Contains(cache.WithoutFallbackStoragePrefixes(ctx), cache.AC, req.ActionDigest.Hash, -1)
+		if exists {
 			s.accessLogger.Printf("%s %s ALREADY EXISTS", logPrefix, req.ActionDigest.Hash)
 			return nil, status.Errorf(codes.AlreadyExists,
 				"%s already exists in AC and the request forbids overwrites", req.ActionDigest.Hash)
