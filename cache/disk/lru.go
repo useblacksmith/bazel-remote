@@ -307,8 +307,11 @@ func (c *SizedLRU) Get(key string) (lruItem, *list.Element) {
 		prev := kv.value.lastAccess
 		kv.value.lastAccess = c.nowFn()
 		if c.observer != nil {
+			// The observer sees the pre-bump accessState so it can move
+			// the entry out of its never-read / unknown bucket exactly once.
 			c.observer.OnAccess(key, kv.value, prev)
 		}
+		kv.value.accessState = itemStateTouched
 		return kv.value, ele
 	}
 

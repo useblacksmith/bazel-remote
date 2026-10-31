@@ -3,10 +3,13 @@ package disk
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestCensusBucketIdx(t *testing.T) {
@@ -252,5 +255,218 @@ func TestToolForPrefix(t *testing.T) {
 		if got := toolForPrefix(tc.prefix); got != tc.want {
 			t.Errorf("toolForPrefix(%q) = %q, want %q", tc.prefix, got, tc.want)
 		}
+	}
+}
+
+func TestCensusClassIdx(t *testing.T) {
+	cases := []struct {
+		kind cache.EntryKind
+		size int64
+		want string
+	}{
+		{cache.AC, 0, "ac/4k"},
+		{cache.AC, 4 << 10, "ac/4k"},
+		{cache.RAW, 4<<10 + 1, "ac/64k"},
+		{cache.CAS, 100, "cas/4k"},
+		{cache.CAS, 1 << 20, "cas/1m"},
+		{cache.CAS, 1<<20 + 1, "cas/16m"},
+		{cache.CAS, 200 << 20, "cas/256m"},
+		{cache.CAS, 1 << 30, "cas/+Inf"},
+	}
+	for _, tc := range cases {
+		got := censusClassLabels[censusClassIdx(tc.kind, tc.size)]
+		if got != tc.want {
+			t.Errorf("censusClassIdx(%v, %d) = %s, want %s", tc.kind, tc.size, got, tc.want)
+		}
+	}
+}
+
+func TestCensusWallBucketIdx(t *testing.T) {
+	cases := []struct {
+		ms   int64
+		want string
+	}{
+		{1, "100ms"},
+		{100, "100ms"},
+		{101, "1s"},
+		{5000, "10s"},
+		{60000, "60s"},
+		{60001, "+Inf"},
+	}
+	for _, tc := range cases {
+		if got := censusWallLabels[censusWallBucketIdx(tc.ms)]; got != tc.want {
+			t.Errorf("censusWallBucketIdx(%d) = %s, want %s", tc.ms, got, tc.want)
+		}
+	}
+}
+
+func TestCensusClassAccounting(t *testing.T) {
+	clock := uint32(1000)
+	lru, rec := newTestLRUWithCensus(t, 1000*BlockSize, &clock)
+
+	casKey := cache.LookupKey(cache.CAS, testHashA)
+	acKey := cache.LookupKey(cache.AC, testHashB)
+	casClass := censusClassIdx(cache.CAS, 100)
+	acClass := censusClassIdx(cache.AC, 200<<10)
+
+	if !lru.Add(casKey, lruItem{size: 100, sizeOnDisk: 100}) {
+		t.Fatal("Add CAS failed")
+	}
+	if !lru.Add(acKey, lruItem{size: 200 << 10, sizeOnDisk: 200 << 10}) {
+		t.Fatal("Add AC failed")
+	}
+
+	// Both resident and never read.
+	rec.mu.Lock()
+	acc := rec.tenant("")
+	if acc.residentBytesByClass[casClass] != 100 || acc.residentNeverReadBytesByClass[casClass] != 100 {
+		t.Errorf("cas class resident/never-read = %d/%d, want 100/100",
+			acc.residentBytesByClass[casClass], acc.residentNeverReadBytesByClass[casClass])
+	}
+	if acc.residentEntriesByClass[acClass] != 1 || acc.residentNeverReadBytesByClass[acClass] != 200<<10 {
+		t.Errorf("ac class entries/never-read = %d/%d, want 1/%d",
+			acc.residentEntriesByClass[acClass], acc.residentNeverReadBytesByClass[acClass], 200<<10)
+	}
+	rec.mu.Unlock()
+
+	// Read the CAS blob twice in the same second: moves out of never-read exactly once.
+	lru.Get(casKey)
+	lru.Get(casKey)
+
+	rec.mu.Lock()
+	if acc.residentNeverReadBytesByClass[casClass] != 0 || acc.residentBytesByClass[casClass] != 100 {
+		t.Errorf("after reads: cas never-read/resident = %d/%d, want 0/100",
+			acc.residentNeverReadBytesByClass[casClass], acc.residentBytesByClass[casClass])
+	}
+	if acc.hitBytesByClass[casClass] != 200 {
+		t.Errorf("hitBytesByClass = %d, want 200", acc.hitBytesByClass[casClass])
+	}
+	rec.mu.Unlock()
+
+	// Evict both: only the never-read AC counts as evicted-never-read.
+	lru.RemoveKey(casKey)
+	lru.RemoveKey(acKey)
+
+	_, rows := rec.snapshot("h")
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.EvictedNeverReadBytesByClass[casClass] != 0 || row.EvictedNeverReadBytesByClass[acClass] != 200<<10 {
+		t.Errorf("EvictedNeverReadBytesByClass cas/ac = %d/%d, want 0/%d",
+			row.EvictedNeverReadBytesByClass[casClass], row.EvictedNeverReadBytesByClass[acClass], 200<<10)
+	}
+	for i, v := range row.ResidentBytesByClass {
+		if v != 0 || row.ResidentEntriesByClass[i] != 0 || row.ResidentNeverReadBytesByClass[i] != 0 {
+			t.Errorf("class %s still resident after evictions: %d bytes / %d entries / %d never-read",
+				censusClassLabels[i], v, row.ResidentEntriesByClass[i], row.ResidentNeverReadBytesByClass[i])
+		}
+	}
+	if row.PutBytesByClass[casClass] != 100 || row.PutBytesByClass[acClass] != 200<<10 {
+		t.Errorf("PutBytesByClass cas/ac = %d/%d", row.PutBytesByClass[casClass], row.PutBytesByClass[acClass])
+	}
+}
+
+func TestCensusBootScannedIsUnknownNotNeverRead(t *testing.T) {
+	clock := uint32(5000)
+	lru, rec := newTestLRUWithCensus(t, 100*BlockSize, &clock)
+
+	key := cache.LookupKey(cache.CAS, testHashA)
+	class := censusClassIdx(cache.CAS, 50)
+	// As the boot scan seeds entries: timestamps from file metadata, state unknown.
+	if !lru.Add(key, lruItem{size: 50, sizeOnDisk: 50, addedAt: 4000, lastAccess: 4000, accessState: itemStateBootScanned}) {
+		t.Fatal("Add failed")
+	}
+
+	rec.mu.Lock()
+	acc := rec.tenant("")
+	if acc.residentUnknownBytesByClass[class] != 50 || acc.residentNeverReadBytesByClass[class] != 0 {
+		t.Errorf("unknown/never-read = %d/%d, want 50/0",
+			acc.residentUnknownBytesByClass[class], acc.residentNeverReadBytesByClass[class])
+	}
+	rec.mu.Unlock()
+
+	lru.Get(key)
+
+	rec.mu.Lock()
+	if acc.residentUnknownBytesByClass[class] != 0 {
+		t.Errorf("unknown after read = %d, want 0", acc.residentUnknownBytesByClass[class])
+	}
+	rec.mu.Unlock()
+
+	// Add another boot-scanned entry and evict it untouched: it is not a
+	// never-read eviction in the class accounting (its history is unknown).
+	keyB := cache.LookupKey(cache.CAS, testHashB)
+	if !lru.Add(keyB, lruItem{size: 50, sizeOnDisk: 50, addedAt: 4000, lastAccess: 4000, accessState: itemStateBootScanned}) {
+		t.Fatal("Add B failed")
+	}
+	lru.RemoveKey(keyB)
+
+	_, rows := rec.snapshot("h")
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if rows[0].EvictedNeverReadBytesByClass[class] != 0 {
+		t.Errorf("EvictedNeverReadBytesByClass = %d, want 0", rows[0].EvictedNeverReadBytesByClass[class])
+	}
+	if rows[0].ResidentUnknownBytesByClass[class] != 0 || rows[0].ResidentBytesByClass[class] != 50 {
+		t.Errorf("resident unknown/total = %d/%d, want 0/50",
+			rows[0].ResidentUnknownBytesByClass[class], rows[0].ResidentBytesByClass[class])
+	}
+}
+
+func TestCensusActionWallTime(t *testing.T) {
+	rec := newCensusRecorder()
+
+	prefix := "bazelre/prod/42/12345/bazel/"
+	prefixID := cache.StoragePrefixID(prefix)
+	key := cache.LookupKeyForStoragePrefixID(prefixID, cache.AC, testHashA)
+
+	withTimes := func(ms int64) *pb.ActionResult {
+		start := time.Unix(1_700_000_000, 0)
+		return &pb.ActionResult{ExecutionMetadata: &pb.ExecutedActionMetadata{
+			ExecutionStartTimestamp:     timestamppb.New(start),
+			ExecutionCompletedTimestamp: timestamppb.New(start.Add(time.Duration(ms) * time.Millisecond)),
+		}}
+	}
+
+	rec.RecordACHit(key, withTimes(50))       // 100ms bucket
+	rec.RecordACHit(key, withTimes(2500))     // 10s bucket
+	rec.RecordACHit(key, &pb.ActionResult{})  // no metadata
+	rec.RecordACWrite(key, withTimes(90_000)) // +Inf bucket
+	rec.RecordACWrite(key, &pb.ActionResult{ExecutionMetadata: &pb.ExecutedActionMetadata{
+		ExecutionStartTimestamp: timestamppb.New(time.Unix(1, 0)),
+	}}) // half-stamped: no metadata
+
+	_, rows := rec.snapshot("h")
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.PrefixID != prefixID {
+		t.Errorf("PrefixID = %q, want %q", row.PrefixID, prefixID)
+	}
+	wantHitMs := []int64{50, 0, 2500, 0, 0}
+	wantHitN := []int64{1, 0, 1, 0, 0}
+	wantWriteMs := []int64{0, 0, 0, 0, 90_000}
+	wantWriteN := []int64{0, 0, 0, 0, 1}
+	for i := range wantHitMs {
+		if row.ACHitWallMsByBucket[i] != wantHitMs[i] || row.ACHitCountByBucket[i] != wantHitN[i] {
+			t.Errorf("hit bucket %s = %d ms / %d, want %d / %d", censusWallLabels[i],
+				row.ACHitWallMsByBucket[i], row.ACHitCountByBucket[i], wantHitMs[i], wantHitN[i])
+		}
+		if row.ACWriteWallMsByBucket[i] != wantWriteMs[i] || row.ACWriteCountByBucket[i] != wantWriteN[i] {
+			t.Errorf("write bucket %s = %d ms / %d, want %d / %d", censusWallLabels[i],
+				row.ACWriteWallMsByBucket[i], row.ACWriteCountByBucket[i], wantWriteMs[i], wantWriteN[i])
+		}
+	}
+	if row.ACHitNoMetadata != 1 || row.ACWriteNoMetadata != 1 {
+		t.Errorf("NoMetadata hit/write = %d/%d, want 1/1", row.ACHitNoMetadata, row.ACWriteNoMetadata)
+	}
+
+	// Window deltas reset; the tenant had nothing resident so it is dropped.
+	_, rows = rec.snapshot("h")
+	if len(rows) != 0 {
+		t.Errorf("second snapshot rows = %d, want 0", len(rows))
 	}
 }
