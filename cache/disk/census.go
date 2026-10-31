@@ -503,7 +503,9 @@ func (r *censusRecorder) OnAccess(key string, value lruItem, prevAccess uint32) 
 
 // RecordACWrite accounts the wall time of the action behind a just-written
 // ActionResult: compute the client spent because the cache had no result.
-// Called from Put outside the diskCache mutex.
+// ar is nil when the write could not be parsed (oversized, over the capture
+// budget, malformed) and counts as a write without metadata. Called from
+// Put outside the diskCache mutex.
 func (r *censusRecorder) RecordACWrite(key string, ar *pb.ActionResult) {
 	_, _, prefixID := lookupKeyParts(key)
 	ms, ok := actionWallMs(ar)

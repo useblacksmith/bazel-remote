@@ -394,13 +394,20 @@ func (c *diskCache) put(ctx context.Context, kind cache.EntryKind, hash string, 
 	// aggregate (lruCaptureBudgetBytes). Either bound tripping skips the
 	// OBSERVATION only: the write itself proceeds on the normal streaming
 	// path with constant memory. Capture is advisory and never gates writes.
+	//
+	// The census shares the parsed result for its action wall-time
+	// accounting; a skipped capture reaches it as a nil result (counted as
+	// "no metadata"), and the LRU drop counters only move when an LRU
+	// observer is configured, since they describe lost closure observations.
 	var acForObserver *pb.ActionResult
-	if kind == cache.AC && (c.lruObserver != nil || c.census != nil) {
+	captureAC := kind == cache.AC && (c.lruObserver != nil || c.census != nil)
+	if captureAC {
+		skipReason := ""
 		switch {
 		case size > lruMaxACCaptureBytes:
-			lruObservationsDropped.WithLabelValues(dropReasonACTooLarge).Inc()
+			skipReason = dropReasonACTooLarge
 		case !c.tryAcquireCaptureBudget(size):
-			lruObservationsDropped.WithLabelValues(dropReasonCaptureBudget).Inc()
+			skipReason = dropReasonCaptureBudget
 		default:
 			// Held until Put returns: the buffer stays live through the
 			// tempfile write below via the replacement reader.
@@ -421,8 +428,11 @@ func (c *diskCache) put(ctx context.Context, kind cache.EntryKind, hash string, 
 			if proto.Unmarshal(acBytes, ar) == nil {
 				acForObserver = ar
 			} else {
-				lruObservationsDropped.WithLabelValues(dropReasonUnmarshalActionRes).Inc()
+				skipReason = dropReasonUnmarshalActionRes
 			}
+		}
+		if skipReason != "" && c.lruObserver != nil {
+			lruObservationsDropped.WithLabelValues(skipReason).Inc()
 		}
 	}
 
@@ -527,14 +537,12 @@ func (c *diskCache) put(ctx context.Context, kind cache.EntryKind, hash string, 
 		verbatim.enqueued = true
 	}
 
-	if acForObserver != nil {
-		if c.census != nil {
-			c.census.RecordACWrite(key, acForObserver)
-		}
-		if c.lruObserver != nil {
-			// AC blobs are stored uncompressed, so size == sizeOnDisk.
-			c.emitACClosureFromWrite(ctx, hash, size, acForObserver)
-		}
+	if captureAC && c.census != nil {
+		c.census.RecordACWrite(key, acForObserver)
+	}
+	if acForObserver != nil && c.lruObserver != nil {
+		// AC blobs are stored uncompressed, so size == sizeOnDisk.
+		c.emitACClosureFromWrite(ctx, hash, size, acForObserver)
 	}
 
 	return nil

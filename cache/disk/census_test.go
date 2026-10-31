@@ -437,6 +437,7 @@ func TestCensusActionWallTime(t *testing.T) {
 	rec.RecordACWrite(key, &pb.ActionResult{ExecutionMetadata: &pb.ExecutedActionMetadata{
 		ExecutionStartTimestamp: timestamppb.New(time.Unix(1, 0)),
 	}}) // half-stamped: no metadata
+	rec.RecordACWrite(key, nil) // capture skipped: no metadata
 
 	_, rows := rec.snapshot("h")
 	if len(rows) != 1 {
@@ -460,8 +461,8 @@ func TestCensusActionWallTime(t *testing.T) {
 				row.ACWriteWallMsByBucket[i], row.ACWriteCountByBucket[i], wantWriteMs[i], wantWriteN[i])
 		}
 	}
-	if row.ACHitNoMetadata != 1 || row.ACWriteNoMetadata != 1 {
-		t.Errorf("NoMetadata hit/write = %d/%d, want 1/1", row.ACHitNoMetadata, row.ACWriteNoMetadata)
+	if row.ACHitNoMetadata != 1 || row.ACWriteNoMetadata != 2 {
+		t.Errorf("NoMetadata hit/write = %d/%d, want 1/2", row.ACHitNoMetadata, row.ACWriteNoMetadata)
 	}
 
 	// Window deltas reset; the tenant had nothing resident so it is dropped.
