@@ -36,6 +36,8 @@ import (
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -81,6 +83,92 @@ func censusBucketIdx(ageSeconds uint32) int {
 	return censusNumBuckets - 1
 }
 
+// Object classes: entry kind × logical (uncompressed) size bucket. AC and
+// RAW (the HTTP action-cache variant) share the AC classes. Byte values
+// accounted under a class are sizeOnDisk, like every other census byte.
+// Class index = kind offset + size bucket; labels in censusClassLabels order.
+var censusSizeEdges = [...]int64{
+	4 << 10,   // 4k
+	64 << 10,  // 64k
+	1 << 20,   // 1m
+	16 << 20,  // 16m
+	256 << 20, // 256m
+}
+
+var censusSizeLabels = [...]string{"4k", "64k", "1m", "16m", "256m", "+Inf"}
+
+const censusNumSizeBuckets = len(censusSizeEdges) + 1
+
+const (
+	censusClassAC    = 0
+	censusClassCAS   = censusNumSizeBuckets
+	censusNumClasses = 2 * censusNumSizeBuckets
+)
+
+func censusSizeBucketIdx(size int64) int {
+	for i, edge := range censusSizeEdges {
+		if size <= edge {
+			return i
+		}
+	}
+	return censusNumSizeBuckets - 1
+}
+
+func censusClassIdx(kind cache.EntryKind, size int64) int {
+	base := censusClassAC
+	if kind == cache.CAS {
+		base = censusClassCAS
+	}
+	return base + censusSizeBucketIdx(size)
+}
+
+// censusClassLabels is the documented class order of every *_by_class
+// column: ac/4k … ac/+Inf, cas/4k … cas/+Inf.
+var censusClassLabels = func() [censusNumClasses]string {
+	var labels [censusNumClasses]string
+	for i, sz := range censusSizeLabels {
+		labels[censusClassAC+i] = "ac/" + sz
+		labels[censusClassCAS+i] = "cas/" + sz
+	}
+	return labels
+}()
+
+// Action wall-time buckets (milliseconds) for the AC hit/write accounting:
+// how long the action took when it last executed, as stamped by the client
+// in ActionResult.execution_metadata (Bazel >= 6.0 sets it on the results
+// it uploads for locally executed actions).
+var censusWallEdgesMs = [...]int64{100, 1000, 10000, 60000}
+
+var censusWallLabels = [...]string{"100ms", "1s", "10s", "60s", "+Inf"}
+
+const censusNumWallBuckets = len(censusWallEdgesMs) + 1
+
+func censusWallBucketIdx(ms int64) int {
+	for i, edge := range censusWallEdgesMs {
+		if ms <= edge {
+			return i
+		}
+	}
+	return censusNumWallBuckets - 1
+}
+
+// actionWallMs returns the action's recorded wall time, or ok=false when the
+// client did not stamp execution_metadata (older Bazel, remote executors
+// that only set queued/worker timestamps, non-Bazel clients).
+func actionWallMs(ar *pb.ActionResult) (int64, bool) {
+	md := ar.GetExecutionMetadata()
+	start := md.GetExecutionStartTimestamp()
+	end := md.GetExecutionCompletedTimestamp()
+	if start == nil || end == nil {
+		return 0, false
+	}
+	ms := end.AsTime().Sub(start.AsTime()).Milliseconds()
+	if ms <= 0 {
+		return 0, false
+	}
+	return ms, true
+}
+
 // tenantAcc accumulates per-tenant counters. Resident values track current
 // state; the remaining fields are deltas since the previous snapshot.
 type tenantAcc struct {
@@ -103,6 +191,73 @@ type tenantAcc struct {
 	evictedByLastReadAge [censusNumBuckets]int64 // bytes
 	evictedByCreatedAge  [censusNumBuckets]int64 // bytes
 	accessIntervalBytes  [censusNumBuckets]int64 // bytes
+
+	// Per object class (kind × size bucket). Resident values are current
+	// state; the rest are window deltas. resident = never_read + unknown +
+	// touched, where never_read entries were added at runtime and never
+	// bumped, unknown entries were re-baselined by the boot scan and not
+	// yet bumped, and touched is the remainder.
+	residentBytesByClass          [censusNumClasses]int64
+	residentEntriesByClass        [censusNumClasses]int64
+	residentNeverReadBytesByClass [censusNumClasses]int64
+	residentUnknownBytesByClass   [censusNumClasses]int64
+	putBytesByClass               [censusNumClasses]int64
+	hitBytesByClass               [censusNumClasses]int64
+	evictedNeverReadBytesByClass  [censusNumClasses]int64
+
+	// Action wall time (window deltas): on a validated AC hit the action's
+	// recorded wall time is compute the client did not have to spend; on an
+	// AC write it is compute spent on an action the cache did not have.
+	acHitWallMsByBucket   [censusNumWallBuckets]int64
+	acHitCountByBucket    [censusNumWallBuckets]int64
+	acWriteWallMsByBucket [censusNumWallBuckets]int64
+	acWriteCountByBucket  [censusNumWallBuckets]int64
+	acHitNoMetadata       int64
+	acWriteNoMetadata     int64
+}
+
+// resetWindowDeltas clears every per-window counter, keeping resident state.
+func (acc *tenantAcc) resetWindowDeltas() {
+	acc.putBytes, acc.putEntries = 0, 0
+	acc.hitBytes, acc.hitCount = 0, 0
+	acc.evictedBytes, acc.evictedEntries = 0, 0
+	acc.evictedLiveBytes, acc.evictedNeverReadByes = 0, 0
+	acc.evictedByLastReadAge = [censusNumBuckets]int64{}
+	acc.evictedByCreatedAge = [censusNumBuckets]int64{}
+	acc.accessIntervalBytes = [censusNumBuckets]int64{}
+	acc.putBytesByClass = [censusNumClasses]int64{}
+	acc.hitBytesByClass = [censusNumClasses]int64{}
+	acc.evictedNeverReadBytesByClass = [censusNumClasses]int64{}
+	acc.acHitWallMsByBucket = [censusNumWallBuckets]int64{}
+	acc.acHitCountByBucket = [censusNumWallBuckets]int64{}
+	acc.acWriteWallMsByBucket = [censusNumWallBuckets]int64{}
+	acc.acWriteCountByBucket = [censusNumWallBuckets]int64{}
+	acc.acHitNoMetadata, acc.acWriteNoMetadata = 0, 0
+}
+
+// addResident / removeResident keep the per-class resident counters and the
+// read-state split in step with the index. state is the entry's accessState
+// at the time of the event.
+func (acc *tenantAcc) addResident(class int, sizeOnDisk int64, state uint8) {
+	acc.residentBytesByClass[class] += sizeOnDisk
+	acc.residentEntriesByClass[class]++
+	switch state {
+	case itemStateNew:
+		acc.residentNeverReadBytesByClass[class] += sizeOnDisk
+	case itemStateBootScanned:
+		acc.residentUnknownBytesByClass[class] += sizeOnDisk
+	}
+}
+
+func (acc *tenantAcc) removeResident(class int, sizeOnDisk int64, state uint8) {
+	acc.residentBytesByClass[class] -= sizeOnDisk
+	acc.residentEntriesByClass[class]--
+	switch state {
+	case itemStateNew:
+		acc.residentNeverReadBytesByClass[class] -= sizeOnDisk
+	case itemStateBootScanned:
+		acc.residentUnknownBytesByClass[class] -= sizeOnDisk
+	}
 }
 
 // censusLiveThreshold is the "still live" boundary used for the per-tenant
@@ -227,7 +382,8 @@ func toolForPrefix(rawPrefix string) string {
 // mutex and take only r.mu (a leaf lock): O(1), memory-only.
 
 func (r *censusRecorder) OnAdd(key string, value lruItem) {
-	_, _, prefixID := lookupKeyParts(key)
+	kind, _, prefixID := lookupKeyParts(key)
+	class := censusClassIdx(kind, value.size)
 
 	r.mu.Lock()
 	acc := r.tenant(prefixID)
@@ -235,22 +391,30 @@ func (r *censusRecorder) OnAdd(key string, value lruItem) {
 	acc.residentEntries++
 	acc.putBytes += value.sizeOnDisk
 	acc.putEntries++
+	acc.addResident(class, value.sizeOnDisk, value.accessState)
+	acc.putBytesByClass[class] += value.sizeOnDisk
 	r.mu.Unlock()
 }
 
 func (r *censusRecorder) OnOverwrite(key string, oldValue lruItem, newValue lruItem) {
-	_, _, prefixID := lookupKeyParts(key)
+	kind, _, prefixID := lookupKeyParts(key)
+	oldClass := censusClassIdx(kind, oldValue.size)
+	newClass := censusClassIdx(kind, newValue.size)
 
 	r.mu.Lock()
 	acc := r.tenant(prefixID)
 	acc.residentBytes += newValue.sizeOnDisk - oldValue.sizeOnDisk
 	acc.putBytes += newValue.sizeOnDisk
 	acc.putEntries++
+	acc.removeResident(oldClass, oldValue.sizeOnDisk, oldValue.accessState)
+	acc.addResident(newClass, newValue.sizeOnDisk, newValue.accessState)
+	acc.putBytesByClass[newClass] += newValue.sizeOnDisk
 	r.mu.Unlock()
 }
 
 func (r *censusRecorder) OnEvict(key string, value lruItem) {
-	_, _, prefixID := lookupKeyParts(key)
+	kind, _, prefixID := lookupKeyParts(key)
+	class := censusClassIdx(kind, value.size)
 	now := r.nowFn()
 
 	lastReadAge := uint32(0)
@@ -281,6 +445,10 @@ func (r *censusRecorder) OnEvict(key string, value lruItem) {
 		acc.evictedByLastReadAge[lastReadIdx] += value.sizeOnDisk
 	}
 	acc.evictedByCreatedAge[createdIdx] += value.sizeOnDisk
+	acc.removeResident(class, value.sizeOnDisk, value.accessState)
+	if value.accessState == itemStateNew {
+		acc.evictedNeverReadBytesByClass[class] += value.sizeOnDisk
+	}
 	r.mu.Unlock()
 
 	sz := float64(value.sizeOnDisk)
@@ -302,7 +470,8 @@ func (r *censusRecorder) OnEvict(key string, value lruItem) {
 }
 
 func (r *censusRecorder) OnAccess(key string, value lruItem, prevAccess uint32) {
-	_, _, prefixID := lookupKeyParts(key)
+	kind, _, prefixID := lookupKeyParts(key)
+	class := censusClassIdx(kind, value.size)
 	now := value.lastAccess
 
 	interval := uint32(0)
@@ -317,9 +486,59 @@ func (r *censusRecorder) OnAccess(key string, value lruItem, prevAccess uint32) 
 	acc.hitBytes += value.sizeOnDisk
 	acc.hitCount++
 	acc.accessIntervalBytes[idx] += value.sizeOnDisk
+	acc.hitBytesByClass[class] += value.sizeOnDisk
+	// value carries the pre-bump accessState (SizedLRU.Get marks the entry
+	// touched after notifying), so the first bump moves the bytes out of
+	// their never-read / unknown bucket exactly once.
+	switch value.accessState {
+	case itemStateNew:
+		acc.residentNeverReadBytesByClass[class] -= value.sizeOnDisk
+	case itemStateBootScanned:
+		acc.residentUnknownBytesByClass[class] -= value.sizeOnDisk
+	}
 	r.mu.Unlock()
 
 	r.accessIntervalByAge.WithLabelValues(censusBucketLabels[idx], tool).Add(float64(value.sizeOnDisk))
+}
+
+// RecordACWrite accounts the wall time of the action behind a just-written
+// ActionResult: compute the client spent because the cache had no result.
+// ar is nil when the write could not be parsed (oversized, over the capture
+// budget, malformed) and counts as a write without metadata. Called from
+// Put outside the diskCache mutex.
+func (r *censusRecorder) RecordACWrite(key string, ar *pb.ActionResult) {
+	_, _, prefixID := lookupKeyParts(key)
+	ms, ok := actionWallMs(ar)
+
+	r.mu.Lock()
+	acc := r.tenant(prefixID)
+	if !ok {
+		acc.acWriteNoMetadata++
+	} else {
+		idx := censusWallBucketIdx(ms)
+		acc.acWriteWallMsByBucket[idx] += ms
+		acc.acWriteCountByBucket[idx]++
+	}
+	r.mu.Unlock()
+}
+
+// RecordACHit accounts the wall time of the action behind a validated
+// ActionResult served to a client: compute the client did not have to spend.
+// Called from GetValidatedActionResult outside the diskCache mutex.
+func (r *censusRecorder) RecordACHit(key string, ar *pb.ActionResult) {
+	_, _, prefixID := lookupKeyParts(key)
+	ms, ok := actionWallMs(ar)
+
+	r.mu.Lock()
+	acc := r.tenant(prefixID)
+	if !ok {
+		acc.acHitNoMetadata++
+	} else {
+		idx := censusWallBucketIdx(ms)
+		acc.acHitWallMsByBucket[idx] += ms
+		acc.acHitCountByBucket[idx]++
+	}
+	r.mu.Unlock()
 }
 
 // CensusHeader is the first JSONL line of a census artifact.
@@ -358,6 +577,29 @@ type CensusRow struct {
 	EvictedByLastReadAge []int64 `json:"evicted_by_last_read_age,omitempty"`
 	EvictedByCreatedAge  []int64 `json:"evicted_by_created_age,omitempty"`
 	AccessIntervalBytes  []int64 `json:"access_interval_bytes,omitempty"`
+
+	// Per object class, indexed in censusClassLabels order (ac/4k … ac/+Inf,
+	// cas/4k … cas/+Inf). Resident arrays are point-in-time; the rest are
+	// window deltas. Omitted when the tenant has nothing resident and no
+	// class traffic in the window.
+	ResidentBytesByClass          []int64 `json:"resident_bytes_by_class,omitempty"`
+	ResidentEntriesByClass        []int64 `json:"resident_entries_by_class,omitempty"`
+	ResidentNeverReadBytesByClass []int64 `json:"resident_never_read_bytes_by_class,omitempty"`
+	ResidentUnknownBytesByClass   []int64 `json:"resident_unknown_bytes_by_class,omitempty"`
+	PutBytesByClass               []int64 `json:"put_bytes_by_class,omitempty"`
+	HitBytesByClass               []int64 `json:"hit_bytes_by_class,omitempty"`
+	EvictedNeverReadBytesByClass  []int64 `json:"evicted_never_read_bytes_by_class,omitempty"`
+
+	// Action wall time over the window, indexed in censusWallLabels order
+	// (100ms, 1s, 10s, 60s, +Inf): the sum of recorded action wall times
+	// and the count of actions, for validated AC hits and for AC writes.
+	// *NoMetadata counts results whose client stamped no execution times.
+	ACHitWallMsByBucket   []int64 `json:"ac_hit_wall_ms_by_bucket,omitempty"`
+	ACHitCountByBucket    []int64 `json:"ac_hit_count_by_bucket,omitempty"`
+	ACWriteWallMsByBucket []int64 `json:"ac_write_wall_ms_by_bucket,omitempty"`
+	ACWriteCountByBucket  []int64 `json:"ac_write_count_by_bucket,omitempty"`
+	ACHitNoMetadata       int64   `json:"ac_hit_no_metadata"`
+	ACWriteNoMetadata     int64   `json:"ac_write_no_metadata"`
 }
 
 // resetWindowDeltas clears the per-window counters on every tenant while
@@ -366,13 +608,7 @@ type CensusRow struct {
 func (r *censusRecorder) resetWindowDeltas() {
 	r.mu.Lock()
 	for _, acc := range r.tenants {
-		acc.putBytes, acc.putEntries = 0, 0
-		acc.hitBytes, acc.hitCount = 0, 0
-		acc.evictedBytes, acc.evictedEntries = 0, 0
-		acc.evictedLiveBytes, acc.evictedNeverReadByes = 0, 0
-		acc.evictedByLastReadAge = [censusNumBuckets]int64{}
-		acc.evictedByCreatedAge = [censusNumBuckets]int64{}
-		acc.accessIntervalBytes = [censusNumBuckets]int64{}
+		acc.resetWindowDeltas()
 	}
 	r.windowStart = time.Now()
 	r.mu.Unlock()
@@ -408,16 +644,27 @@ func (r *censusRecorder) snapshot(host string) (CensusHeader, []CensusRow) {
 		if acc.hitBytes > 0 {
 			row.AccessIntervalBytes = append([]int64(nil), acc.accessIntervalBytes[:]...)
 		}
+		if acc.residentEntries > 0 || acc.putEntries > 0 || acc.hitCount > 0 || acc.evictedEntries > 0 {
+			row.ResidentBytesByClass = append([]int64(nil), acc.residentBytesByClass[:]...)
+			row.ResidentEntriesByClass = append([]int64(nil), acc.residentEntriesByClass[:]...)
+			row.ResidentNeverReadBytesByClass = append([]int64(nil), acc.residentNeverReadBytesByClass[:]...)
+			row.ResidentUnknownBytesByClass = append([]int64(nil), acc.residentUnknownBytesByClass[:]...)
+			row.PutBytesByClass = append([]int64(nil), acc.putBytesByClass[:]...)
+			row.HitBytesByClass = append([]int64(nil), acc.hitBytesByClass[:]...)
+			row.EvictedNeverReadBytesByClass = append([]int64(nil), acc.evictedNeverReadBytesByClass[:]...)
+		}
+		row.ACHitNoMetadata = acc.acHitNoMetadata
+		row.ACWriteNoMetadata = acc.acWriteNoMetadata
+		if acc.acHitNoMetadata > 0 || acc.acWriteNoMetadata > 0 || censusAnyNonZero(acc.acHitCountByBucket[:]) || censusAnyNonZero(acc.acWriteCountByBucket[:]) {
+			row.ACHitWallMsByBucket = append([]int64(nil), acc.acHitWallMsByBucket[:]...)
+			row.ACHitCountByBucket = append([]int64(nil), acc.acHitCountByBucket[:]...)
+			row.ACWriteWallMsByBucket = append([]int64(nil), acc.acWriteWallMsByBucket[:]...)
+			row.ACWriteCountByBucket = append([]int64(nil), acc.acWriteCountByBucket[:]...)
+		}
 		rows = append(rows, row)
 
 		// Reset window deltas; resident state persists.
-		acc.putBytes, acc.putEntries = 0, 0
-		acc.hitBytes, acc.hitCount = 0, 0
-		acc.evictedBytes, acc.evictedEntries = 0, 0
-		acc.evictedLiveBytes, acc.evictedNeverReadByes = 0, 0
-		acc.evictedByLastReadAge = [censusNumBuckets]int64{}
-		acc.evictedByCreatedAge = [censusNumBuckets]int64{}
-		acc.accessIntervalBytes = [censusNumBuckets]int64{}
+		acc.resetWindowDeltas()
 
 		// Drop tenants with nothing resident so the map stays bounded.
 		if acc.residentEntries <= 0 && acc.residentBytes <= 0 {
@@ -435,6 +682,15 @@ func (r *censusRecorder) snapshot(host string) (CensusHeader, []CensusRow) {
 		TenantCount:   len(rows),
 	}
 	return header, rows
+}
+
+func censusAnyNonZero(values []int64) bool {
+	for _, v := range values {
+		if v != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // StartCensusSnapshots periodically snapshots the tenant census and exports

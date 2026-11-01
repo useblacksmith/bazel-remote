@@ -525,6 +525,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 					// consumers suppress the window after a restart.
 					item[n].addedAt = uint32(info.ModTime().Unix())
 					item[n].lastAccess = uint32(metadata[n].ts.Unix())
+					item[n].accessState = itemStateBootScanned
 					if item[n].lastAccess < item[n].addedAt {
 						item[n].lastAccess = item[n].addedAt
 					}
