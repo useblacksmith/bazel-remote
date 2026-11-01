@@ -129,6 +129,7 @@ func New(dir string, maxSizeBytes int64, opts ...Option) (Cache, error) {
 	}
 
 	if cc.censusSink != nil && cc.censusInterval > 0 {
+		c.censusExport = true
 		c.StartCensusSnapshots(cc.censusSink, cc.censusInterval, cc.censusHost)
 	}
 

@@ -132,6 +132,11 @@ type diskCache struct {
 	// Tenant census and byte-weighted age accounting (see census.go).
 	// Wired as the LRU's IndexObserver in loadExistingFiles.
 	census *censusRecorder
+	// censusExport is set when census snapshots are exported; only then do
+	// AC writes get buffered and decoded for the census's action wall-time
+	// accounting, so a node without an LRU observer or export keeps the
+	// streaming write path unchanged.
+	censusExport bool
 
 	// Background digest verification for blobs stored via PutZstd.
 	verifier *verbatimVerifier
@@ -396,11 +401,12 @@ func (c *diskCache) put(ctx context.Context, kind cache.EntryKind, hash string, 
 	// path with constant memory. Capture is advisory and never gates writes.
 	//
 	// The census shares the parsed result for its action wall-time
-	// accounting; a skipped capture reaches it as a nil result (counted as
-	// "no metadata"), and the LRU drop counters only move when an LRU
-	// observer is configured, since they describe lost closure observations.
+	// accounting when snapshots are exported; a skipped capture reaches it as
+	// a nil result (counted as "no metadata"), and the LRU drop counters only
+	// move when an LRU observer is configured, since they describe lost
+	// closure observations.
 	var acForObserver *pb.ActionResult
-	captureAC := kind == cache.AC && (c.lruObserver != nil || c.census != nil)
+	captureAC := kind == cache.AC && (c.lruObserver != nil || c.censusExport)
 	if captureAC {
 		skipReason := ""
 		switch {
