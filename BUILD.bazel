@@ -205,7 +205,14 @@ oci_push(
 
 go_test(
     name = "go_default_test",
-    srcs = ["main_test.go"],
+    srcs = [
+        "main_stop_test.go",
+        "main_test.go",
+    ],
     embed = [":go_default_library"],
-    deps = ["//config:go_default_library"],
+    deps = [
+        "//config:go_default_library",
+        "@org_golang_google_grpc//:go_default_library",
+        "@org_golang_google_grpc//credentials/insecure:go_default_library",
+    ],
 )
