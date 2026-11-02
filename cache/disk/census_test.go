@@ -409,6 +409,14 @@ func TestCensusBootScannedIsUnknownNotNeverRead(t *testing.T) {
 	if rows[0].EvictedNeverReadBytesByClass[class] != 0 {
 		t.Errorf("EvictedNeverReadBytesByClass = %d, want 0", rows[0].EvictedNeverReadBytesByClass[class])
 	}
+	// The scalar and its counters follow the same access state: a boot-scanned
+	// entry has addedAt == lastAccess, which must not read as never-read.
+	if rows[0].EvictedNeverReadBytes != 0 || rows[0].EvictedBytes != 50 {
+		t.Errorf("EvictedNeverReadBytes/EvictedBytes = %d/%d, want 0/50", rows[0].EvictedNeverReadBytes, rows[0].EvictedBytes)
+	}
+	if got := testutil.ToFloat64(rec.evictedNeverReadEntries.WithLabelValues("unknown")); got != 0 {
+		t.Errorf("evictedNeverReadEntries = %v, want 0", got)
+	}
 	if rows[0].ResidentUnknownBytesByClass[class] != 0 || rows[0].ResidentBytesByClass[class] != 50 {
 		t.Errorf("resident unknown/total = %d/%d, want 0/50",
 			rows[0].ResidentUnknownBytesByClass[class], rows[0].ResidentBytesByClass[class])

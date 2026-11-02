@@ -425,7 +425,7 @@ func (r *censusRecorder) OnEvict(key string, value lruItem) {
 	if now > value.addedAt {
 		createdAge = now - value.addedAt
 	}
-	neverRead := value.lastAccess == value.addedAt
+	neverRead := value.accessState == itemStateNew
 	lastReadIdx := censusBucketIdx(lastReadAge)
 	createdIdx := censusBucketIdx(createdAge)
 
