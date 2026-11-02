@@ -133,7 +133,7 @@ func run(ctx *cli.Context) error {
 			if !grpcSem.TryAcquire(1) {
 				if grpcServer != nil {
 					log.Println("Stopping gRPC server")
-					grpcServer.GracefulStop()
+					stopGrpcServer(grpcServer, grpcGracefulStopTimeout)
 					log.Println("gRPC server stopped")
 				}
 			}
@@ -335,6 +335,30 @@ func run(ctx *cli.Context) error {
 		lruFlusher.Drain()
 	}
 	return err
+}
+
+// grpcGracefulStopTimeout bounds GracefulStop. A single stream whose client
+// has gone away without closing it would otherwise hold the drain until
+// systemd's TimeoutStopSec fires and SIGKILLs the process before the index's
+// access state is saved.
+const grpcGracefulStopTimeout = 10 * time.Second
+
+// stopGrpcServer drains in-flight RPCs for at most timeout, then closes the
+// remaining connections. Stop unblocks a pending GracefulStop, so the drain
+// goroutine always returns.
+func stopGrpcServer(s *grpc.Server, timeout time.Duration) {
+	drained := make(chan struct{})
+	go func() {
+		s.GracefulStop()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(timeout):
+		log.Printf("gRPC server did not drain within %s, closing remaining connections", timeout)
+		s.Stop()
+		<-drained
+	}
 }
 
 // validateMultiBackendTrust refuses to start a multi-backend (s3_proxy
