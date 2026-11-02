@@ -70,6 +70,8 @@ func (c *consumptionTrackingCache) GetZstd(ctx context.Context, hash string, siz
 	panic("not used by Write")
 }
 
+func (c *consumptionTrackingCache) SaveAccessState() error { return nil }
+
 func (c *consumptionTrackingCache) FindMissingCasBlobs(ctx context.Context, blobs []*pb.Digest) ([]*pb.Digest, error) {
 	panic("not used by Write")
 }

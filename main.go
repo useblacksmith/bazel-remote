@@ -324,8 +324,12 @@ func run(ctx *cli.Context) error {
 	}
 
 	err = servers.Wait()
-	// Both servers have stopped accepting requests, so no new observations
-	// can arrive: flush what remains and wait for in-flight uploads.
+	// Both servers have stopped accepting requests, so the index is final:
+	// persist its read history for the next boot scan, then flush what
+	// remains of the LRU observations and wait for in-flight uploads.
+	if saveErr := diskCache.SaveAccessState(); saveErr != nil {
+		log.Println(saveErr)
+	}
 	if lruFlusher != nil {
 		log.Println("Draining buffered LRU observation artifacts")
 		lruFlusher.Drain()

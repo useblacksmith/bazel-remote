@@ -2888,6 +2888,8 @@ func (c *StubCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 	return false, -1
 }
 
+func (c *StubCache) SaveAccessState() error { return nil }
+
 func (c *StubCache) FindMissingCasBlobs(ctx context.Context, blobs []*pb.Digest) ([]*pb.Digest, error) {
 	return blobs, nil
 }

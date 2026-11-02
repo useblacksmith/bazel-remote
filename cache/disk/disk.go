@@ -50,6 +50,9 @@ type Cache interface {
 	PutZstd(ctx context.Context, hash string, size int64, r io.Reader) error
 	Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64)
 	FindMissingCasBlobs(ctx context.Context, blobs []*pb.Digest) ([]*pb.Digest, error)
+	// SaveAccessState persists the index's read history for the next boot
+	// scan (see access_state.go). Call once the servers have stopped.
+	SaveAccessState() error
 
 	MaxSize() int64
 	Stats() (totalSize int64, reservedSize int64, numItems int, uncompressedSize int64)
