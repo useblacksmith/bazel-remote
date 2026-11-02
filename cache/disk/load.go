@@ -646,6 +646,11 @@ func (c *diskCache) scanDir(bootAccess *accessStateIndex) (scanResult, error) {
 			if strings.ToLower(name) == lowercaseDSStoreFile {
 				continue
 			}
+			// consumeAccessState deletes these before the scan; if the
+			// unlink failed they are still only advisory, never fatal.
+			if name == accessStateFileName || name == accessStateTempName {
+				continue
+			}
 
 			return scanResult{}, fmt.Errorf("unexpected file: %s", name)
 		}

@@ -163,3 +163,24 @@ func TestAccessStateRoundTrip(t *testing.T) {
 		t.Error("nil index returned a record")
 	}
 }
+
+func TestAccessStateFilesNeverFailTheScan(t *testing.T) {
+	cacheDir := testutils.TempDir(t)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
+
+	c, err := New(cacheDir, 1024*1024, WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putBlob(t, c, 100)
+	for _, name := range []string{accessStateFileName, accessStateTempName} {
+		if err := os.WriteFile(path.Join(cacheDir, name), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The scan itself must tolerate the files, whether or not
+	// consumeAccessState managed to delete them first.
+	if _, err := c.(*diskCache).scanDir(nil); err != nil {
+		t.Fatalf("scanDir with leftover access-state files: %v", err)
+	}
+}
