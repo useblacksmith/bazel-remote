@@ -426,6 +426,11 @@ func TestCensusBootScannedIsUnknownNotNeverRead(t *testing.T) {
 			t.Errorf("EvictedByLastReadAge[%d] = %d, want 0", i, v)
 		}
 	}
+	for _, label := range censusBucketLabels {
+		if got := testutil.ToFloat64(rec.evictedEntriesByAge.WithLabelValues("last_read", label, "unknown")); got != 0 {
+			t.Errorf("evictedEntriesByAge last_read %s = %v, want 0", label, got)
+		}
+	}
 	if rows[0].ResidentUnknownBytesByClass[class] != 0 || rows[0].ResidentBytesByClass[class] != 50 {
 		t.Errorf("resident unknown/total = %d/%d, want 0/50",
 			rows[0].ResidentUnknownBytesByClass[class], rows[0].ResidentBytesByClass[class])

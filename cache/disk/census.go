@@ -425,7 +425,6 @@ func (r *censusRecorder) OnEvict(key string, value lruItem) {
 	if now > value.addedAt {
 		createdAge = now - value.addedAt
 	}
-	neverRead := value.accessState == itemStateNew
 	lastReadIdx := censusBucketIdx(lastReadAge)
 	createdIdx := censusBucketIdx(createdAge)
 
@@ -455,16 +454,15 @@ func (r *censusRecorder) OnEvict(key string, value lruItem) {
 	r.mu.Unlock()
 
 	sz := float64(value.sizeOnDisk)
-	// Never-read entries have no last read: they are counted in the
-	// never-read counter and the created-age buckets only, so the
-	// last_read series stays a pure harm signal (bytes someone actually
-	// used, evicted anyway). This also gives thrash alerts built-in
-	// restart tolerance: boot-scanned entries look never-read until first
-	// touched, so a roll cannot fabricate still-live evictions.
-	if neverRead {
+	// Only touched entries have a last read, so the last_read series stays
+	// a pure harm signal (bytes someone actually used, evicted anyway) and
+	// a roll cannot fabricate still-live evictions out of boot-scanned
+	// entries; those count in the created-age buckets only.
+	switch value.accessState {
+	case itemStateNew:
 		r.evictedNeverReadBytes.WithLabelValues(tool).Add(sz)
 		r.evictedNeverReadEntries.WithLabelValues(tool).Inc()
-	} else {
+	case itemStateTouched:
 		r.evictedBytesByAge.WithLabelValues("last_read", censusBucketLabels[lastReadIdx], tool).Add(sz)
 		r.evictedEntriesByAge.WithLabelValues("last_read", censusBucketLabels[lastReadIdx], tool).Inc()
 	}
