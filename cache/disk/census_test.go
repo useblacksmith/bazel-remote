@@ -417,6 +417,15 @@ func TestCensusBootScannedIsUnknownNotNeverRead(t *testing.T) {
 	if got := testutil.ToFloat64(rec.evictedNeverReadEntries.WithLabelValues("unknown")); got != 0 {
 		t.Errorf("evictedNeverReadEntries = %v, want 0", got)
 	}
+	// Nor as read: its lastAccess is file atime, not a hit.
+	if rows[0].EvictedLiveBytes != 0 {
+		t.Errorf("EvictedLiveBytes = %d, want 0", rows[0].EvictedLiveBytes)
+	}
+	for i, v := range rows[0].EvictedByLastReadAge {
+		if v != 0 {
+			t.Errorf("EvictedByLastReadAge[%d] = %d, want 0", i, v)
+		}
+	}
 	if rows[0].ResidentUnknownBytesByClass[class] != 0 || rows[0].ResidentBytesByClass[class] != 50 {
 		t.Errorf("resident unknown/total = %d/%d, want 0/50",
 			rows[0].ResidentUnknownBytesByClass[class], rows[0].ResidentBytesByClass[class])

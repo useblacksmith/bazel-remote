@@ -436,13 +436,16 @@ func (r *censusRecorder) OnEvict(key string, value lruItem) {
 	acc.residentEntries--
 	acc.evictedBytes += value.sizeOnDisk
 	acc.evictedEntries++
-	if neverRead {
+	switch value.accessState {
+	case itemStateNew:
 		acc.evictedNeverReadByes += value.sizeOnDisk
-	} else {
+	case itemStateTouched:
 		if lastReadAge < censusLiveThreshold {
 			acc.evictedLiveBytes += value.sizeOnDisk
 		}
 		acc.evictedByLastReadAge[lastReadIdx] += value.sizeOnDisk
+		// itemStateBootScanned: lastAccess is file atime (frozen at creation on
+		// noatime mounts), not a read, so the entry has no last-read history.
 	}
 	acc.evictedByCreatedAge[createdIdx] += value.sizeOnDisk
 	acc.removeResident(class, value.sizeOnDisk, value.accessState)
