@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
@@ -362,7 +363,8 @@ var incompleteFilesRemoved = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Files the boot scan removed because they were still marked in progress (partially written, or stored as received and not yet verified) when the previous process exited.",
 })
 
-func (c *diskCache) scanDir() (scanResult, error) {
+func (c *diskCache) scanDir(bootAccess *accessStateIndex) (scanResult, error) {
+	var restored atomic.Int64
 
 	numWorkers := runtime.NumCPU()
 	if numWorkers < 4 {
@@ -529,6 +531,15 @@ func (c *diskCache) scanDir() (scanResult, error) {
 					if item[n].lastAccess < item[n].addedAt {
 						item[n].lastAccess = item[n].addedAt
 					}
+					// The previous process's read history, when it left
+					// one, beats file timestamps: real state for the
+					// census and real recency for the LRU order.
+					if rec, ok := bootAccess.lookup(metadata[n].lookupKey, item[n].addedAt); ok {
+						item[n].lastAccess = rec.lastAccess
+						item[n].accessState = rec.state
+						metadata[n].ts = time.Unix(int64(rec.lastAccess), 0)
+						restored.Add(1)
+					}
 
 					n++
 				}
@@ -559,6 +570,9 @@ func (c *diskCache) scanDir() (scanResult, error) {
 
 			if !de.IsDir() {
 				if strings.ToLower(name) == lowercaseDSStoreFile {
+					continue
+				}
+				if rootRel == "" && (name == accessStateFileName || name == accessStateTempName) {
 					continue
 				}
 
@@ -632,6 +646,11 @@ func (c *diskCache) scanDir() (scanResult, error) {
 			if strings.ToLower(name) == lowercaseDSStoreFile {
 				continue
 			}
+			// consumeAccessState deletes these before the scan; if the
+			// unlink failed they are still only advisory, never fatal.
+			if name == accessStateFileName || name == accessStateTempName {
+				continue
+			}
 
 			return scanResult{}, fmt.Errorf("unexpected file: %s", name)
 		}
@@ -665,6 +684,9 @@ func (c *diskCache) scanDir() (scanResult, error) {
 
 	<-received
 
+	if bootAccess != nil {
+		log.Printf("Restored access state for %d index entries", restored.Load())
+	}
 	return finalScanResult, nil
 }
 
@@ -674,7 +696,7 @@ func (c *diskCache) scanDir() (scanResult, error) {
 func (c *diskCache) loadExistingFiles(maxSizeBytes int64, cc CacheConfig) error {
 	log.Printf("Loading existing files in %s.\n", c.dir)
 
-	result, err := c.scanDir()
+	result, err := c.scanDir(consumeAccessState(c.dir))
 	if err != nil {
 		log.Printf("Failed to scan cache dir: %s", err.Error())
 		return err
