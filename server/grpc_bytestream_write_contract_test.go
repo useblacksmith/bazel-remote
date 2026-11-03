@@ -58,6 +58,10 @@ func (c *consumptionTrackingCache) Contains(ctx context.Context, kind cache.Entr
 	return false, -1
 }
 
+func (c *consumptionTrackingCache) ContainsStrict(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64, error) {
+	return false, -1, nil
+}
+
 func (c *consumptionTrackingCache) Get(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64) (io.ReadCloser, int64, error) {
 	panic("not used by Write")
 }

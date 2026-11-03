@@ -128,10 +128,15 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	var rc io.ReadCloser
 	var foundSize int64
 
-	if cmp == casblob.Zstandard {
-		rc, foundSize, err = s.cache.GetZstd(ctx, hash, size, req.ReadOffset)
-	} else {
-		rc, foundSize, err = s.cache.Get(ctx, cache.CAS, hash, size, req.ReadOffset)
+	for _, readCtx := range cache.ReadContexts(ctx) {
+		if cmp == casblob.Zstandard {
+			rc, foundSize, err = s.cache.GetZstd(readCtx, hash, size, req.ReadOffset)
+		} else {
+			rc, foundSize, err = s.cache.Get(readCtx, cache.CAS, hash, size, req.ReadOffset)
+		}
+		if err != nil || rc != nil {
+			break
+		}
 	}
 
 	if rc != nil {
