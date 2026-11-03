@@ -545,3 +545,35 @@ func TestTrustScopeACImmutableFailsClosedWhenBackendLookupFails(t *testing.T) {
 		t.Fatalf("plain write must not consult the backend: %v", err)
 	}
 }
+
+func TestTrustScopeDeinlineWritesToStampedPrefix(t *testing.T) {
+	s, c := trustScopeServer(t, true)
+	stdout := []byte("trusted stdout that main stored inline")
+	sum := sha256.Sum256(stdout)
+	stdoutDigest := &pb.Digest{Hash: hex.EncodeToString(sum[:]), SizeBytes: int64(len(stdout))}
+	_, acHash := testutils.RandomDataAndHash(32)
+	acDigest := &pb.Digest{Hash: acHash, SizeBytes: 32}
+	// Stored directly so the inlined stdout exists in no CAS scope, as after
+	// an eviction: de-inlining must then write it somewhere.
+	acData, err := proto.Marshal(&pb.ActionResult{StdoutRaw: stdout})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put(mainCtx(), cache.AC, acHash, int64(len(acData)), bytes.NewReader(acData)); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetActionResult(prCtx(), &pb.GetActionResultRequest{ActionDigest: acDigest, InlineStdout: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StdoutDigest == nil || got.StdoutDigest.Hash != stdoutDigest.Hash {
+		t.Fatalf("stdout was not de-inlined: %v", got)
+	}
+	if found, _ := c.Contains(cache.WithoutFallbackStoragePrefixes(prCtx()), cache.CAS, stdoutDigest.Hash, stdoutDigest.SizeBytes); !found {
+		t.Fatal("de-inlined blob must be written to the stamped (untrusted) prefix")
+	}
+	if found, _ := c.Contains(mainCtx(), cache.CAS, stdoutDigest.Hash, stdoutDigest.SizeBytes); found {
+		t.Fatal("an untrusted request must never write into the trusted prefix")
+	}
+}

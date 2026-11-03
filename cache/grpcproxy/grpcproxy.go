@@ -277,9 +277,9 @@ func withOutgoingStoragePrefix(ctx context.Context) context.Context {
 		return ctx
 	}
 	ctx = ensureOutgoingMetadataValue(ctx, cache.StoragePrefixGRPCMetadataKey, prefix)
-	if fallbacks := cache.FallbackStoragePrefixesFromContext(ctx); len(fallbacks) > 0 {
-		ctx = ensureOutgoingMetadataValue(ctx, cache.FallbackPrefixesGRPCMetadataKey, strings.Join(fallbacks, ","))
-	}
+	// Read fallbacks are not forwarded: the server already tries each scope in
+	// turn, and a downstream hit under a fallback would otherwise be stored
+	// locally under the stamped key.
 	if cache.ACImmutableFromContext(ctx) {
 		ctx = ensureOutgoingMetadataValue(ctx, cache.ACImmutableGRPCMetadataKey, "1")
 	}
