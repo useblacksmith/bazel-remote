@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"strings"
@@ -73,10 +74,17 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 	if !s.depsCheck {
 		logPrefix = "GRPC AC GET NODEPSCHECK"
 
-		rdr, sizeBytes, err := s.cache.Get(ctx, cache.AC, req.ActionDigest.Hash, unknownActionResultSize, 0)
-		if err != nil {
-			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
-			return nil, status.Error(gRPCErrCode(err, codes.Unknown), err.Error())
+		var rdr io.ReadCloser
+		var sizeBytes int64
+		for _, readCtx := range cache.ReadContexts(ctx) {
+			rdr, sizeBytes, err = s.cache.Get(readCtx, cache.AC, req.ActionDigest.Hash, unknownActionResultSize, 0)
+			if err != nil {
+				s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
+				return nil, status.Error(gRPCErrCode(err, codes.Unknown), err.Error())
+			}
+			if rdr != nil && sizeBytes > 0 {
+				break
+			}
 		}
 		if rdr == nil || sizeBytes <= 0 {
 			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, "NOT FOUND")
@@ -109,10 +117,18 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 		return result, nil
 	}
 
-	result, _, err := s.cache.GetValidatedActionResult(ctx, req.ActionDigest.Hash)
-	if err != nil {
-		s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
-		return nil, status.Error(gRPCErrCode(err, codes.Unknown), err.Error())
+	var result *pb.ActionResult
+	for _, readCtx := range cache.ReadContexts(ctx) {
+		result, _, err = s.cache.GetValidatedActionResult(readCtx, req.ActionDigest.Hash)
+		if err != nil {
+			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
+			return nil, status.Error(gRPCErrCode(err, codes.Unknown), err.Error())
+		}
+		if result != nil {
+			// Inlined blobs must come from the prefix the result was found under.
+			ctx = readCtx
+			break
+		}
 	}
 
 	if result == nil {
@@ -263,6 +279,26 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 		return nil, errEmptyActionResult
 	}
 
+	if cache.ACImmutableFromContext(ctx) {
+		lock := &s.acCreateLocks[acCreateLockIndex(cache.LookupKeyForContext(ctx, cache.AC, req.ActionDigest.Hash))]
+		lock.Lock()
+		defer lock.Unlock()
+		exists, _, err := s.cache.ContainsStrict(cache.WithoutFallbackStoragePrefixes(ctx), cache.AC, req.ActionDigest.Hash, -1)
+		if err != nil {
+			// Fail closed: without a definite answer a create-only write
+			// could replace a result that exists in the backend but was
+			// evicted locally.
+			s.logErrorPrintf(err, "%s %s create-only existence check failed: %s", logPrefix, req.ActionDigest.Hash, err)
+			return nil, status.Errorf(codes.Unavailable,
+				"%s: cannot verify whether the action result exists; create-only write refused", req.ActionDigest.Hash)
+		}
+		if exists {
+			s.accessLogger.Printf("%s %s ALREADY EXISTS", logPrefix, req.ActionDigest.Hash)
+			return nil, status.Errorf(codes.AlreadyExists,
+				"%s already exists in AC and the request forbids overwrites", req.ActionDigest.Hash)
+		}
+	}
+
 	err = s.cache.Put(ctx, cache.AC, req.ActionDigest.Hash,
 		int64(len(data)), bytes.NewReader(data))
 	if err != nil && err != io.EOF {
@@ -383,4 +419,10 @@ func addWorkerMetadataGRPC(ctx context.Context, ar *pb.ActionResult) {
 	}
 
 	ar.ExecutionMetadata.Worker = worker
+}
+
+func acCreateLockIndex(key string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % 256)
 }

@@ -21,6 +21,11 @@ type MetricsLabels struct {
 	// per-node cache churn: "did evictions on node X slow anyone down"
 	// becomes a query instead of an investigation.
 	L1Member string
+
+	// TrustScope is the trust-scope suffix of the stamped storage prefix
+	// ("main", "pr"; empty for unscoped namespaces) so hit rates can be
+	// read per scope.
+	TrustScope string
 }
 
 // WithMetricsLabels attaches caller-owned metrics labels to a request context.

@@ -9,6 +9,7 @@ go_library(
         "metrics_context.go",
         "s3_backend.go",
         "storage_prefix.go",
+        "trust_scope.go",
         "trust_rejection.go",
     ],
     importpath = "github.com/buchgr/bazel-remote/v2/cache",
