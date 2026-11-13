@@ -2154,3 +2154,72 @@ func TestResultFromProxyTooLargeToReserve(t *testing.T) {
 
 	close(fakeProxy.getEvents)
 }
+
+func TestPantsNamespaceStoresCASUncompressed(t *testing.T) {
+	cacheDir := tempDir(t)
+	defer os.RemoveAll(cacheDir)
+
+	testCacheI, err := New(cacheDir, 1024*1024, WithStorageMode("zstd"), WithAccessLogger(testutils.NewSilentLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testCache := testCacheI.(*diskCache)
+
+	body := strings.Repeat("cache-me-", 4096)
+	sum := sha256.Sum256([]byte(body))
+	hash := hex.EncodeToString(sum[:])
+	size := int64(len(body))
+
+	for _, tc := range []struct {
+		prefix     string
+		wantStored casblob.CompressionType
+	}{
+		{prefix: "production/42/987654/v0/pants/", wantStored: casblob.Identity},
+		{prefix: "production/42/987654/v0/bazel/", wantStored: casblob.Zstandard},
+	} {
+		t.Run(tc.prefix, func(t *testing.T) {
+			ctx := cache.WithStoragePrefix(context.Background(), tc.prefix)
+			if err := testCache.Put(ctx, cache.CAS, hash, size, strings.NewReader(body)); err != nil {
+				t.Fatal(err)
+			}
+
+			var blobPath string
+			prefixDir := filepath.Join(cacheDir, cache.StoragePrefixID(tc.prefix))
+			err := filepath.WalkDir(prefixDir, func(p string, d os.DirEntry, err error) error {
+				if err == nil && !d.IsDir() && strings.Contains(d.Name(), hash) {
+					blobPath = p
+				}
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if blobPath == "" {
+				t.Fatalf("no blob file for %s under %s", hash, prefixDir)
+			}
+			stored, err := os.ReadFile(blobPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := casblob.CompressionType(stored[16]); got != tc.wantStored {
+				t.Fatalf("compression byte = %d, want %d", got, tc.wantStored)
+			}
+
+			rdr, _, err := testCache.Get(ctx, cache.CAS, hash, size, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rdr == nil {
+				t.Fatal("expected a CAS hit")
+			}
+			defer rdr.Close()
+			got, err := io.ReadAll(rdr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != body {
+				t.Fatal("read back different bytes than were stored")
+			}
+		})
+	}
+}
