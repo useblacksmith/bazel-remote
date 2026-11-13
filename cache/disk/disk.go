@@ -551,6 +551,15 @@ func (c *diskCache) put(ctx context.Context, kind cache.EntryKind, hash string, 
 	return nil
 }
 
+// storesUncompressed reports whether the request's tenant namespace keeps
+// its CAS blobs as identity casblobs in zstd storage mode. Pants only speaks
+// identity on the wire and its blobs are small, so encoding them on write and
+// decoding them on every read costs CPU without saving meaningful disk.
+func storesUncompressed(ctx context.Context) bool {
+	prefix, ok := cache.StoragePrefixFromContext(ctx)
+	return ok && toolForPrefix(prefix) == "pants"
+}
+
 func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cache.EntryKind, hash string, size int64, f *os.File) (int64, error) {
 	closeFile := true
 	defer func() {
@@ -563,7 +572,11 @@ func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cac
 	var sizeOnDisk int64
 
 	if kind == cache.CAS && c.storageMode != casblob.Identity {
-		sizeOnDisk, err = casblob.WriteAndClose(c.zstd, r, f, c.storageMode, hash, size)
+		compression := c.storageMode
+		if storesUncompressed(ctx) {
+			compression = casblob.Identity
+		}
+		sizeOnDisk, err = casblob.WriteAndClose(c.zstd, r, f, compression, hash, size)
 		if err != nil {
 			return -1, annotate.Err(ctx, "Failed to write compressed CAS blob to disk", err)
 		}
