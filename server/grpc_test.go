@@ -810,7 +810,7 @@ func TestGrpcByteStream(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bsrResp, err := bsrc.Recv()
+	_, err = bsrc.Recv()
 	if err == nil {
 		t.Fatal("Expected NotFound")
 	}
@@ -878,6 +878,7 @@ func TestGrpcByteStream(t *testing.T) {
 
 	downloadedBlob := make([]byte, 0, len(testBlob))
 
+	var bsrResp *bytestream.ReadResponse
 	for {
 		bsrResp, err = bsrc.Recv()
 		if err == io.EOF {
